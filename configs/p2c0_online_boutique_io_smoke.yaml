@@ -1,0 +1,44 @@
+project_mode: single_vm_pseudo_distributed
+phase: P2C-0
+system: google_online_boutique
+kubernetes:
+  cluster_name: proberca-ob
+  context: kind-proberca-ob
+  namespace: online-boutique
+experiment:
+  experiment_id: ob_io_rediscart_smoke_001
+  target_service: redis-cart
+  target_metric: io.write_bytes
+  target_fault_type: storage I/O
+  symptom_service: frontend
+  output_dir: data/p2_online_boutique/io_rediscart_smoke_001
+  frontend_url: http://127.0.0.1:8080
+  requests_before: 20
+  requests_during: 40
+  requests_after: 20
+  request_timeout_sec: 3
+fault_injection:
+  method: pod_exec_dd_write_pressure
+  target_service: redis-cart
+  target_deployment: redis-cart
+  target_container: redis
+  temp_file: /tmp/proberca_io_stress.bin
+  block_size: 1M
+  block_count: 64
+  duration_sec: 60
+  cleanup_after_fault: true
+metrics:
+  collect_cadvisor_fs: true
+  collect_frontend_request_latency: true
+  collect_pod_disk_free: true
+disabled_for_this_step:
+  - p1_rca_pipeline
+  - prometheus
+  - beyla
+  - clickhouse
+  - cpu_fault
+  - network_fault
+  - lock_fault
+  - multi_fault_accuracy
+  - adaptive_sampling_bandit
+  - optional_drift

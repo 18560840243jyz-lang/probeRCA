@@ -1,0 +1,27 @@
+project_mode: single_vm_pseudo_distributed
+window_size_sec: 10
+baseline_windows: 30
+faulty_windows: 30
+top_k: 5
+enabled_modules:
+  - robust_normalization
+  - stable_propagation
+  - sparse_inversion
+  - semantic_evidence
+  - path_explanation
+disabled_modules:
+  - real_ebpf
+  - kubernetes
+  - prometheus
+  - beyla
+  - clickhouse
+  - bandit
+  - optional_drift
+  - shapley
+  - ui
+  - gnn
+  - transformer
+  - llm
+storage:
+  format: jsonl
+  base_dir: data/p0_single_vm

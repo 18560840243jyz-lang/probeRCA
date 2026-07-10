@@ -1,0 +1,34 @@
+{
+  "g1_passed": true,
+  "decision": "G1_PASS",
+  "reasons": [],
+  "failed_checks": [],
+  "key_metrics": {
+    "label_leakage_passed": true,
+    "multi_seed_mean_service_hit_at_1": 1.0,
+    "multi_seed_min_service_hit_at_1": 1.0,
+    "multi_seed_mean_metric_hit_at_1": 1.0,
+    "multi_seed_min_metric_hit_at_1": 1.0,
+    "full_metric_hit_at_1": 1.0,
+    "no_semantic_metric_hit_at_1": 0.0,
+    "audit_passed": true,
+    "noise_runs": [
+      {
+        "noise_std": 0.02,
+        "metric_hit_at_1": 1.0
+      },
+      {
+        "noise_std": 0.05,
+        "metric_hit_at_1": 1.0
+      },
+      {
+        "noise_std": 0.1,
+        "metric_hit_at_1": 1.0
+      },
+      {
+        "noise_std": 0.2,
+        "metric_hit_at_1": 1.0
+      }
+    ]
+  }
+}

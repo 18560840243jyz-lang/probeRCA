@@ -1,0 +1,52 @@
+project_mode: single_vm_pseudo_distributed
+phase: P2A-3R
+system: google_online_boutique
+kubernetes:
+  cluster_name: proberca-ob
+  context: kind-proberca-ob
+  namespace: online-boutique
+repeat_experiment:
+  experiment_group_id: ob_cpu_paymentservice_repeated_controlled_001
+  repeats: 5
+  sleep_between_repeats_sec: 60
+  base_output_dir: data/p2_online_boutique/cpu_paymentservice_repeated_controlled
+  base_fault_config: configs/p2a1r_online_boutique_cpu_fault_cadvisor.yaml
+  controlled_fault_overrides:
+    cpu_limit_during_fault: "25m"
+    memory_limit_during_fault: "128Mi"
+    window_size_sec: 5
+    baseline_windows: 14
+    faulty_windows: 16
+    recovery_windows: 6
+    requests_per_window: 40
+    pre_repeat_cooldown_sec: 30
+    post_restore_cooldown_sec: 45
+    require_pre_repeat_target_throttling_below_usec: 10000
+target:
+  service: paymentservice
+  metric: cpu.throttled_usec
+  fault_type: CPU throttling
+  symptom_service: frontend
+quality_requirements:
+  require_fault_injection_succeeded: true
+  require_restore_succeeded: true
+  require_cadvisor_metrics_available: true
+  require_root_service_metric_coverage_passed: true
+  require_paymentservice_throttled_metric_present: true
+  require_frontend_latency_metric_present: true
+evaluation_thresholds:
+  service_hit_at_1_min: 1.0
+  metric_hit_at_1_mean_min: 0.8
+  metric_hit_at_3_mean_min: 1.0
+  root_type_accuracy_mean_min: 1.0
+  path_fidelity_mean_min: 0.8
+disabled_for_this_step:
+  - network_fault
+  - io_fault
+  - lock_fault
+  - multi_fault_accuracy
+  - prometheus
+  - beyla
+  - clickhouse
+  - adaptive_sampling_bandit
+  - optional_drift

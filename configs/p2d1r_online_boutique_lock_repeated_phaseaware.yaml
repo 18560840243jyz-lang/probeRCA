@@ -1,0 +1,73 @@
+project_mode: single_vm_pseudo_distributed
+phase: P2D-1R
+system: google_online_boutique
+kubernetes:
+  cluster_name: proberca-ob
+  context: kind-proberca-ob
+  namespace: online-boutique
+repeat_experiment:
+  experiment_group_id: ob_lock_cartservice_repeated_phaseaware_001
+  repeats: 5
+  sleep_between_repeats_sec: 60
+  base_output_dir: data/p2_online_boutique/lock_cartservice_repeated_phaseaware
+target:
+  service: cartservice
+  metric: lock.futex_wait_ms
+  fault_type: lock contention
+  symptom_service: frontend
+fault_injection:
+  method: cartservice_sidecar_phaseaware_python_lockstress
+  target_deployment: cartservice
+  sidecar_name: proberca-lockstress
+  sidecar_image: python:3.11-alpine
+  workers: 16
+  lock_hold_ms: 2
+  lock_iterations_per_worker: 100000
+  restore_after_fault: true
+experiment:
+  window_size_sec: 5
+  baseline_windows: 12
+  faulty_windows: 12
+  recovery_windows: 4
+  frontend_url: http://127.0.0.1:8080
+  requests_per_window: 50
+  request_timeout_sec: 5
+  post_restore_cooldown_sec: 60
+  require_frontend_recovery_p99_below_ms: 500
+metrics:
+  collect_phaseaware_sidecar_lock_logs: true
+  collect_frontend_request_latency: true
+  collect_kubectl_state: true
+  require_baseline_lock_metrics: true
+  require_faulty_lock_metrics: true
+quality_requirements:
+  require_sidecar_injected: true
+  require_sidecar_removed: true
+  require_lock_metrics_available: true
+  require_baseline_lock_metric_present: true
+  require_faulty_lock_metric_present: true
+  require_lock_contention_count_positive: true
+  require_lock_wait_sum_positive: true
+  require_frontend_latency_metric_present: true
+  require_service_graph_present: true
+evaluation_thresholds:
+  repeats_completed_min: 5
+  repeats_successful_quality_min: 5
+  repeats_successful_rca_min: 5
+  service_hit_at_1_mean_min: 0.8
+  metric_hit_at_3_mean_min: 0.8
+  root_type_accuracy_mean_min: 0.8
+  path_fidelity_mean_min: 0.8
+limitations:
+  - sidecar_lock_contention_not_original_cartservice_code_bug
+  - baseline_lock_metrics_are_real_idle_sidecar_measurements
+disabled_for_this_step:
+  - cpu_fault
+  - network_fault
+  - io_fault
+  - multi_fault_accuracy
+  - prometheus
+  - beyla
+  - clickhouse
+  - adaptive_sampling_bandit
+  - optional_drift

@@ -1,0 +1,45 @@
+project_mode: single_vm_pseudo_distributed
+phase: P2A-1R
+system: google_online_boutique
+kubernetes:
+  cluster_name: proberca-ob
+  context: kind-proberca-ob
+  namespace: online-boutique
+experiment:
+  experiment_id: ob_cpu_paymentservice_001_cadvisor
+  target_service: paymentservice
+  target_metric: cpu.throttled_usec
+  target_fault_type: CPU throttling
+  symptom_service: frontend
+  window_size_sec: 5
+  baseline_windows: 12
+  faulty_windows: 12
+  recovery_windows: 4
+  output_dir: data/p2_online_boutique/cpu_paymentservice_001_cadvisor
+fault_injection:
+  method: kubernetes_resource_limit
+  target_deployment: paymentservice
+  target_container: server
+  cpu_limit_during_fault: "50m"
+  memory_limit_during_fault: "128Mi"
+  restore_after_fault: true
+traffic:
+  frontend_url: http://127.0.0.1:8080
+  requests_per_window: 20
+  request_timeout_sec: 3
+metrics:
+  collect_kubelet_summary: true
+  collect_cadvisor_metrics: true
+  collect_crictl_stats: false
+  require_root_service_cpu_metrics: true
+  require_throttling_metric: true
+disabled_for_this_step:
+  - p1_rca_pipeline
+  - prometheus
+  - beyla
+  - clickhouse
+  - network_fault
+  - io_fault
+  - lock_fault
+  - adaptive_sampling_bandit
+  - optional_drift

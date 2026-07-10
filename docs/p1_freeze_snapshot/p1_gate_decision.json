@@ -1,0 +1,17 @@
+{
+  "p1_gate_passed": true,
+  "decision": "P1_PASS",
+  "failed_checks": [],
+  "reasons": [],
+  "key_metrics": {
+    "multi_seed_min_service_hit_at_1": 1.0,
+    "multi_seed_mean_metric_hit_at_1": 0.925,
+    "multi_seed_min_metric_hit_at_3": 0.75,
+    "multi_seed_mean_metric_mrr": 0.9550000000000001,
+    "multi_seed_min_root_type_accuracy": 1.0,
+    "multi_seed_min_path_fidelity": 1.0,
+    "observed_ratio_mean": 0.6137192234848485,
+    "observed_ratio_min": 0.6124289772727273,
+    "observed_ratio_max": 0.6152107007575758
+  }
+}

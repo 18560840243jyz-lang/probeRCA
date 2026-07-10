@@ -1,0 +1,53 @@
+project_mode: single_vm_pseudo_distributed
+phase: P1
+base_config: configs/p0_single_vm.yaml
+window_size_sec: 10
+baseline_windows: 30
+faulty_windows: 30
+top_k: 5
+observation:
+  always_on_metrics:
+    - request.rps
+    - request.error_rate
+    - request.p50_latency_ms
+    - request.p95_latency_ms
+    - request.p99_latency_ms
+    - request.in_flight
+    - cpu.usage
+    - memory.usage
+  fine_metrics:
+    - cpu.throttled_usec
+    - cpu.pressure
+    - memory.pressure
+    - net.rtt_ms
+    - net.retrans
+    - io.bio_latency_ms
+    - io.queue_depth
+    - lock.futex_wait_ms
+  normal_sampling_rate: 0.10
+  soft_alert_sampling_rate: 0.40
+  hard_alert_sampling_rate: 1.00
+  min_sampling_probability: 0.05
+  soft_alert_z_threshold: 3.0
+  hard_alert_z_threshold: 6.0
+  hard_alert_consecutive_windows: 2
+enabled_modules:
+  - adaptive_observation_simulator
+  - sampling_probability_logging
+  - observation_mask
+disabled_modules:
+  - real_ebpf
+  - kubernetes
+  - prometheus
+  - beyla
+  - clickhouse
+  - bandit
+  - optional_drift
+  - shapley
+  - ui
+  - gnn
+  - transformer
+  - llm
+storage:
+  format: jsonl
+  base_dir: data/p1_single_vm

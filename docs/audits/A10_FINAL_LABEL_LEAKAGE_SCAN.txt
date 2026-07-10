@@ -1,0 +1,126 @@
+{
+  "final_label_leakage_risk_new_pipeline": "LOW",
+  "suspicious_count": 0,
+  "allowed_count": 205,
+  "known_window_dependency_count": 10,
+  "suspicious_locations": [],
+  "known_window_dependency_locations": [
+    {
+      "file": "proberca/adapters/online_boutique/blind_evidence.py",
+      "line": 27,
+      "terms": [
+        "start_ts",
+        "end_ts"
+      ],
+      "text": "ALLOWED_INCIDENT_KEYS = {\"incident_id\", \"start_ts\", \"end_ts\", \"symptom_service\"}",
+      "function_context": "",
+      "category": "A1/A2 window-aware blind evidence limitation"
+    },
+    {
+      "file": "proberca/adapters/online_boutique/blind_evidence.py",
+      "line": 77,
+      "terms": [
+        "start_ts",
+        "end_ts"
+      ],
+      "text": "if \"start_ts\" not in window or \"end_ts\" not in window:",
+      "function_context": "def load_incident_windows(path: str) -> list[dict[str, Any]]:",
+      "category": "A1/A2 window-aware blind evidence limitation"
+    },
+    {
+      "file": "proberca/adapters/online_boutique/blind_evidence.py",
+      "line": 78,
+      "terms": [
+        "start_ts",
+        "end_ts"
+      ],
+      "text": "raise ValueError(\"incident window requires start_ts and end_ts\")",
+      "function_context": "def load_incident_windows(path: str) -> list[dict[str, Any]]:",
+      "category": "A1/A2 window-aware blind evidence limitation"
+    },
+    {
+      "file": "proberca/adapters/online_boutique/blind_evidence.py",
+      "line": 122,
+      "terms": [
+        "start_ts",
+        "end_ts"
+      ],
+      "text": "metrics: list[dict[str, Any]], start_ts: float, end_ts: float",
+      "function_context": "def compute_baseline_faulty_lift(",
+      "category": "A1/A2 window-aware blind evidence limitation"
+    },
+    {
+      "file": "proberca/adapters/online_boutique/blind_evidence.py",
+      "line": 141,
+      "terms": [
+        "start_ts"
+      ],
+      "text": "if ts < start_ts:",
+      "function_context": "def compute_baseline_faulty_lift(",
+      "category": "A1/A2 window-aware blind evidence limitation"
+    },
+    {
+      "file": "proberca/adapters/online_boutique/blind_evidence.py",
+      "line": 143,
+      "terms": [
+        "start_ts",
+        "end_ts"
+      ],
+      "text": "elif start_ts <= ts <= end_ts:",
+      "function_context": "def compute_baseline_faulty_lift(",
+      "category": "A1/A2 window-aware blind evidence limitation"
+    },
+    {
+      "file": "proberca/adapters/online_boutique/blind_evidence.py",
+      "line": 248,
+      "terms": [
+        "start_ts"
+      ],
+      "text": "start_ts = float(window[\"start_ts\"])",
+      "function_context": "def generate_blind_evidence(",
+      "category": "A1/A2 window-aware blind evidence limitation"
+    },
+    {
+      "file": "proberca/adapters/online_boutique/blind_evidence.py",
+      "line": 249,
+      "terms": [
+        "end_ts"
+      ],
+      "text": "end_ts = float(window[\"end_ts\"])",
+      "function_context": "def generate_blind_evidence(",
+      "category": "A1/A2 window-aware blind evidence limitation"
+    },
+    {
+      "file": "proberca/adapters/online_boutique/blind_evidence.py",
+      "line": 251,
+      "terms": [
+        "start_ts",
+        "end_ts"
+      ],
+      "text": "for record in compute_baseline_faulty_lift(metrics, start_ts, end_ts):",
+      "function_context": "def generate_blind_evidence(",
+      "category": "A1/A2 window-aware blind evidence limitation"
+    },
+    {
+      "file": "proberca/cli/run_p2_blind_rerun.py",
+      "line": 29,
+      "terms": [
+        "start_ts",
+        "end_ts"
+      ],
+      "text": "print(\"注意：当前是 A2 Blind P2 Rerun。使用已有真实 raw metrics 和 blind evidence，不重新注入故障。当前仍使用 incident start_ts/end_ts 作为 alert window，A3 才实现真正 Alert Gate。\")",
+      "function_context": "def main() -> int:",
+      "category": "A2 window-aware rerun limitation"
+    }
+  ],
+  "allowed_locations_summary": {
+    "total_allowed_locations": 205,
+    "categories": [
+      "A2 evaluation/summary metric field",
+      "legacy_or_non_A1_A10_cli_not_part_of_new_blind_pipeline",
+      "post_hoc_debug_evaluation",
+      "safety/metadata/documentation/forbidden-list",
+      "timestamp_or_alert_window_field_not_root_label"
+    ]
+  }
+}

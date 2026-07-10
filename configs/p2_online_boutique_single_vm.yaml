@@ -1,0 +1,52 @@
+project_mode: single_vm_pseudo_distributed
+phase: P2A-0
+system: google_online_boutique
+deployment:
+  type: kind
+  cluster_name: proberca-ob
+  namespace: online-boutique
+  repo_dir: external/microservices-demo
+  repo_url: https://github.com/GoogleCloudPlatform/microservices-demo.git
+  manifest_candidates:
+    - release/kubernetes-manifests.yaml
+    - kubernetes-manifests
+  frontend_service_candidates:
+    - frontend-external
+    - frontend
+  local_frontend_port: 8080
+services:
+  - frontend
+  - checkoutservice
+  - paymentservice
+  - cartservice
+  - productcatalogservice
+  - recommendationservice
+  - shippingservice
+  - currencyservice
+  - emailservice
+  - adservice
+  - redis-cart
+fault_plan_next_step:
+  cpu:
+    target_service: paymentservice
+    target_metric: cpu.throttled_usec
+  network:
+    target_service: shippingservice
+    target_metric: net.retrans
+  io:
+    target_service: redis-cart
+    target_metric: io.bio_latency_ms
+  lock:
+    target_service: cartservice
+    target_metric: lock.futex_wait_ms
+outputs:
+  base_dir: data/p2_online_boutique/deploy_smoke
+disabled_for_this_step:
+  - real_fault_injection
+  - metrics_collection
+  - p1_rca_pipeline
+  - prometheus
+  - beyla
+  - clickhouse
+  - adaptive_sampling_bandit
+  - optional_drift

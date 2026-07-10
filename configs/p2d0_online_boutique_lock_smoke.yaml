@@ -1,0 +1,52 @@
+project_mode: single_vm_pseudo_distributed
+phase: P2D-0
+system: google_online_boutique
+
+kubernetes:
+  cluster_name: proberca-ob
+  context: kind-proberca-ob
+  namespace: online-boutique
+
+experiment:
+  experiment_id: ob_lock_cartservice_smoke_001
+  target_service: cartservice
+  target_metric: lock.futex_wait_ms
+  target_fault_type: lock contention
+  symptom_service: frontend
+  output_dir: data/p2_online_boutique/lock_cartservice_smoke_001
+  frontend_url: http://127.0.0.1:8080
+  requests_before: 20
+  requests_during: 40
+  requests_after: 20
+  request_timeout_sec: 3
+
+fault_injection:
+  method: cartservice_sidecar_python_lockstress
+  target_deployment: cartservice
+  sidecar_name: proberca-lockstress
+  sidecar_image: python:3.11-alpine
+  duration_sec: 60
+  workers: 16
+  lock_hold_ms: 2
+  lock_iterations_per_worker: 100000
+  restore_after_fault: true
+
+metrics:
+  collect_sidecar_lock_logs: true
+  collect_frontend_request_latency: true
+  collect_kubectl_state: true
+
+limitations:
+  - sidecar_lock_contention_not_original_cartservice_code_bug
+
+disabled_for_this_step:
+  - p1_rca_pipeline
+  - prometheus
+  - beyla
+  - clickhouse
+  - cpu_fault
+  - network_fault
+  - io_fault
+  - multi_fault_accuracy
+  - adaptive_sampling_bandit
+  - optional_drift

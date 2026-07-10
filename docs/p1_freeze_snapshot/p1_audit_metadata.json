@@ -1,0 +1,379 @@
+{
+  "output_dir": "data/p1_single_vm/audit_full",
+  "quick": false,
+  "seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    7,
+    11,
+    13,
+    17,
+    19
+  ],
+  "multi_seed_dir": "data/p1_single_vm/audit_full/multi_seed",
+  "cleanup_enabled": true,
+  "label_scan": {
+    "label_leakage_passed": true,
+    "suspicious_files": [],
+    "suspicious_lines": []
+  },
+  "multi_seed_results": {
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      7,
+      11,
+      13,
+      17,
+      19
+    ],
+    "per_seed": [
+      {
+        "seed": 1,
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_1",
+        "service_hit_at_1": 1.0,
+        "service_hit_at_3": 1.0,
+        "metric_hit_at_1": 1.0,
+        "metric_hit_at_3": 1.0,
+        "metric_mrr": 1.0,
+        "root_type_accuracy": 1.0,
+        "path_fidelity": 1.0,
+        "observed_ratio": 0.614263731060606
+      },
+      {
+        "seed": 2,
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_2",
+        "service_hit_at_1": 1.0,
+        "service_hit_at_3": 1.0,
+        "metric_hit_at_1": 1.0,
+        "metric_hit_at_3": 1.0,
+        "metric_mrr": 1.0,
+        "root_type_accuracy": 1.0,
+        "path_fidelity": 1.0,
+        "observed_ratio": 0.6144176136363636
+      },
+      {
+        "seed": 3,
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_3",
+        "service_hit_at_1": 1.0,
+        "service_hit_at_3": 1.0,
+        "metric_hit_at_1": 0.75,
+        "metric_hit_at_3": 0.75,
+        "metric_mrr": 0.8,
+        "root_type_accuracy": 1.0,
+        "path_fidelity": 1.0,
+        "observed_ratio": 0.6134943181818182
+      },
+      {
+        "seed": 4,
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_4",
+        "service_hit_at_1": 1.0,
+        "service_hit_at_3": 1.0,
+        "metric_hit_at_1": 1.0,
+        "metric_hit_at_3": 1.0,
+        "metric_mrr": 1.0,
+        "root_type_accuracy": 1.0,
+        "path_fidelity": 1.0,
+        "observed_ratio": 0.6135416666666667
+      },
+      {
+        "seed": 5,
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_5",
+        "service_hit_at_1": 1.0,
+        "service_hit_at_3": 1.0,
+        "metric_hit_at_1": 1.0,
+        "metric_hit_at_3": 1.0,
+        "metric_mrr": 1.0,
+        "root_type_accuracy": 1.0,
+        "path_fidelity": 1.0,
+        "observed_ratio": 0.6152107007575758
+      },
+      {
+        "seed": 7,
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_7",
+        "service_hit_at_1": 1.0,
+        "service_hit_at_3": 1.0,
+        "metric_hit_at_1": 0.75,
+        "metric_hit_at_3": 1.0,
+        "metric_mrr": 0.875,
+        "root_type_accuracy": 1.0,
+        "path_fidelity": 1.0,
+        "observed_ratio": 0.6132457386363637
+      },
+      {
+        "seed": 11,
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_11",
+        "service_hit_at_1": 1.0,
+        "service_hit_at_3": 1.0,
+        "metric_hit_at_1": 1.0,
+        "metric_hit_at_3": 1.0,
+        "metric_mrr": 1.0,
+        "root_type_accuracy": 1.0,
+        "path_fidelity": 1.0,
+        "observed_ratio": 0.6124289772727273
+      },
+      {
+        "seed": 13,
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_13",
+        "service_hit_at_1": 1.0,
+        "service_hit_at_3": 1.0,
+        "metric_hit_at_1": 1.0,
+        "metric_hit_at_3": 1.0,
+        "metric_mrr": 1.0,
+        "root_type_accuracy": 1.0,
+        "path_fidelity": 1.0,
+        "observed_ratio": 0.6133996212121212
+      },
+      {
+        "seed": 17,
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_17",
+        "service_hit_at_1": 1.0,
+        "service_hit_at_3": 1.0,
+        "metric_hit_at_1": 0.75,
+        "metric_hit_at_3": 1.0,
+        "metric_mrr": 0.875,
+        "root_type_accuracy": 1.0,
+        "path_fidelity": 1.0,
+        "observed_ratio": 0.6138494318181819
+      },
+      {
+        "seed": 19,
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_19",
+        "service_hit_at_1": 1.0,
+        "service_hit_at_3": 1.0,
+        "metric_hit_at_1": 1.0,
+        "metric_hit_at_3": 1.0,
+        "metric_mrr": 1.0,
+        "root_type_accuracy": 1.0,
+        "path_fidelity": 1.0,
+        "observed_ratio": 0.6133404356060606
+      }
+    ],
+    "aggregate": {
+      "service_hit_at_1": {
+        "mean": 1.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "service_hit_at_3": {
+        "mean": 1.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "metric_hit_at_1": {
+        "mean": 0.925,
+        "min": 0.75,
+        "max": 1.0
+      },
+      "metric_hit_at_3": {
+        "mean": 0.975,
+        "min": 0.75,
+        "max": 1.0
+      },
+      "metric_mrr": {
+        "mean": 0.9550000000000001,
+        "min": 0.8,
+        "max": 1.0
+      },
+      "root_type_accuracy": {
+        "mean": 1.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "path_fidelity": {
+        "mean": 1.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "observed_ratio": {
+        "mean": 0.6137192234848485,
+        "min": 0.6124289772727273,
+        "max": 0.6152107007575758
+      }
+    },
+    "cleanup_reports": [
+      {
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_1",
+        "deleted_files": [
+          "data/p1_single_vm/audit_full/multi_seed/seed_1/sampling_log.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_1/robust_stats.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_1/ipw_sparse_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_1/observation_mask.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_1/ipw_path_explanations.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_1/ipw_stable_propagation_model.json",
+          "data/p1_single_vm/audit_full/multi_seed/seed_1/observed_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_1/normalized_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_1/ipw_stable_residuals.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_1/ipw_semantic_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_1/metrics.jsonl"
+        ],
+        "bytes_deleted": 121415508
+      },
+      {
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_2",
+        "deleted_files": [
+          "data/p1_single_vm/audit_full/multi_seed/seed_2/sampling_log.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_2/robust_stats.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_2/ipw_sparse_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_2/observation_mask.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_2/ipw_path_explanations.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_2/ipw_stable_propagation_model.json",
+          "data/p1_single_vm/audit_full/multi_seed/seed_2/observed_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_2/normalized_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_2/ipw_stable_residuals.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_2/ipw_semantic_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_2/metrics.jsonl"
+        ],
+        "bytes_deleted": 121418941
+      },
+      {
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_3",
+        "deleted_files": [
+          "data/p1_single_vm/audit_full/multi_seed/seed_3/sampling_log.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_3/robust_stats.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_3/ipw_sparse_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_3/observation_mask.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_3/ipw_path_explanations.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_3/ipw_stable_propagation_model.json",
+          "data/p1_single_vm/audit_full/multi_seed/seed_3/observed_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_3/normalized_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_3/ipw_stable_residuals.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_3/ipw_semantic_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_3/metrics.jsonl"
+        ],
+        "bytes_deleted": 121359126
+      },
+      {
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_4",
+        "deleted_files": [
+          "data/p1_single_vm/audit_full/multi_seed/seed_4/sampling_log.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_4/robust_stats.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_4/ipw_sparse_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_4/observation_mask.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_4/ipw_path_explanations.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_4/ipw_stable_propagation_model.json",
+          "data/p1_single_vm/audit_full/multi_seed/seed_4/observed_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_4/normalized_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_4/ipw_stable_residuals.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_4/ipw_semantic_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_4/metrics.jsonl"
+        ],
+        "bytes_deleted": 121354321
+      },
+      {
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_5",
+        "deleted_files": [
+          "data/p1_single_vm/audit_full/multi_seed/seed_5/sampling_log.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_5/robust_stats.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_5/ipw_sparse_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_5/observation_mask.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_5/ipw_path_explanations.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_5/ipw_stable_propagation_model.json",
+          "data/p1_single_vm/audit_full/multi_seed/seed_5/observed_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_5/normalized_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_5/ipw_stable_residuals.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_5/ipw_semantic_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_5/metrics.jsonl"
+        ],
+        "bytes_deleted": 121436958
+      },
+      {
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_7",
+        "deleted_files": [
+          "data/p1_single_vm/audit_full/multi_seed/seed_7/sampling_log.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_7/robust_stats.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_7/ipw_sparse_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_7/observation_mask.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_7/ipw_path_explanations.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_7/ipw_stable_propagation_model.json",
+          "data/p1_single_vm/audit_full/multi_seed/seed_7/observed_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_7/normalized_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_7/ipw_stable_residuals.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_7/ipw_semantic_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_7/metrics.jsonl"
+        ],
+        "bytes_deleted": 121257374
+      },
+      {
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_11",
+        "deleted_files": [
+          "data/p1_single_vm/audit_full/multi_seed/seed_11/sampling_log.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_11/robust_stats.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_11/ipw_sparse_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_11/observation_mask.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_11/ipw_path_explanations.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_11/ipw_stable_propagation_model.json",
+          "data/p1_single_vm/audit_full/multi_seed/seed_11/observed_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_11/normalized_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_11/ipw_stable_residuals.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_11/ipw_semantic_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_11/metrics.jsonl"
+        ],
+        "bytes_deleted": 121270407
+      },
+      {
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_13",
+        "deleted_files": [
+          "data/p1_single_vm/audit_full/multi_seed/seed_13/sampling_log.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_13/robust_stats.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_13/ipw_sparse_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_13/observation_mask.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_13/ipw_path_explanations.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_13/ipw_stable_propagation_model.json",
+          "data/p1_single_vm/audit_full/multi_seed/seed_13/observed_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_13/normalized_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_13/ipw_stable_residuals.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_13/ipw_semantic_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_13/metrics.jsonl"
+        ],
+        "bytes_deleted": 121336043
+      },
+      {
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_17",
+        "deleted_files": [
+          "data/p1_single_vm/audit_full/multi_seed/seed_17/sampling_log.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_17/robust_stats.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_17/ipw_sparse_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_17/observation_mask.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_17/ipw_path_explanations.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_17/ipw_stable_propagation_model.json",
+          "data/p1_single_vm/audit_full/multi_seed/seed_17/observed_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_17/normalized_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_17/ipw_stable_residuals.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_17/ipw_semantic_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_17/metrics.jsonl"
+        ],
+        "bytes_deleted": 121339069
+      },
+      {
+        "run_dir": "data/p1_single_vm/audit_full/multi_seed/seed_19",
+        "deleted_files": [
+          "data/p1_single_vm/audit_full/multi_seed/seed_19/sampling_log.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_19/robust_stats.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_19/ipw_sparse_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_19/observation_mask.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_19/ipw_path_explanations.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_19/ipw_stable_propagation_model.json",
+          "data/p1_single_vm/audit_full/multi_seed/seed_19/observed_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_19/normalized_metrics.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_19/ipw_stable_residuals.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_19/ipw_semantic_interventions.jsonl",
+          "data/p1_single_vm/audit_full/multi_seed/seed_19/metrics.jsonl"
+        ],
+        "bytes_deleted": 121356361
+      }
+    ]
+  },
+  "observation_audit": {
+    "observed_ratio_mean": 0.6137192234848485,
+    "observed_ratio_min": 0.6124289772727273,
+    "observed_ratio_max": 0.6152107007575758,
+    "observation_audit_passed": true
+  }
+}

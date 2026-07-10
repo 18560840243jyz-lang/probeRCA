@@ -1,0 +1,114 @@
+{
+  "label_leakage_passed": true,
+  "suspicious_files": [],
+  "suspicious_lines": [],
+  "multi_seed_mean_service_hit_at_1": 1.0,
+  "multi_seed_min_service_hit_at_1": 1.0,
+  "multi_seed_mean_metric_hit_at_1": 1.0,
+  "multi_seed_min_metric_hit_at_1": 1.0,
+  "full_vs_no_semantic": {
+    "input_dir": "data/p0_single_vm/demo",
+    "output_dir": "data/p0_single_vm/audit_full_fix/semantic_ablation",
+    "full": {
+      "service_hit_at_1": 1.0,
+      "service_hit_at_3": 1.0,
+      "metric_hit_at_1": 1.0,
+      "metric_hit_at_3": 1.0,
+      "root_type_accuracy": 1.0,
+      "path_fidelity": 1.0
+    },
+    "no_semantic_evidence": {
+      "service_hit_at_1": 0.75,
+      "service_hit_at_3": 1.0,
+      "metric_hit_at_1": 0.0,
+      "metric_hit_at_3": 1.0,
+      "root_type_accuracy": 0.25,
+      "path_fidelity": 1.0
+    },
+    "delta_metric_hit_at_1": 1.0,
+    "delta_service_hit_at_1": 0.25
+  },
+  "noise_sensitivity": {
+    "noise_stds": [
+      0.02,
+      0.05,
+      0.1,
+      0.2
+    ],
+    "runs": [
+      {
+        "noise_std": 0.02,
+        "output_dir": "data/p0_single_vm/audit_full_fix/noise_sensitivity/noise_0.02",
+        "service_hit_at_1": 1.0,
+        "service_hit_at_3": 1.0,
+        "metric_hit_at_1": 1.0,
+        "metric_hit_at_3": 1.0,
+        "root_type_accuracy": 1.0,
+        "path_fidelity": 1.0
+      },
+      {
+        "noise_std": 0.05,
+        "output_dir": "data/p0_single_vm/audit_full_fix/noise_sensitivity/noise_0.05",
+        "service_hit_at_1": 1.0,
+        "service_hit_at_3": 1.0,
+        "metric_hit_at_1": 1.0,
+        "metric_hit_at_3": 1.0,
+        "root_type_accuracy": 1.0,
+        "path_fidelity": 1.0
+      },
+      {
+        "noise_std": 0.1,
+        "output_dir": "data/p0_single_vm/audit_full_fix/noise_sensitivity/noise_0.1",
+        "service_hit_at_1": 1.0,
+        "service_hit_at_3": 1.0,
+        "metric_hit_at_1": 1.0,
+        "metric_hit_at_3": 1.0,
+        "root_type_accuracy": 1.0,
+        "path_fidelity": 1.0
+      },
+      {
+        "noise_std": 0.2,
+        "output_dir": "data/p0_single_vm/audit_full_fix/noise_sensitivity/noise_0.2",
+        "service_hit_at_1": 1.0,
+        "service_hit_at_3": 1.0,
+        "metric_hit_at_1": 1.0,
+        "metric_hit_at_3": 1.0,
+        "root_type_accuracy": 1.0,
+        "path_fidelity": 1.0
+      }
+    ],
+    "aggregate": {
+      "service_hit_at_1": {
+        "mean": 1.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "service_hit_at_3": {
+        "mean": 1.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "metric_hit_at_1": {
+        "mean": 1.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "metric_hit_at_3": {
+        "mean": 1.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "root_type_accuracy": {
+        "mean": 1.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "path_fidelity": {
+        "mean": 1.0,
+        "min": 1.0,
+        "max": 1.0
+      }
+    }
+  },
+  "audit_passed": true
+}

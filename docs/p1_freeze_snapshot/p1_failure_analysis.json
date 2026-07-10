@@ -1,0 +1,209 @@
+{
+  "failed_seeds_metric_hit_at_1": [
+    3,
+    7,
+    17
+  ],
+  "failed_incidents_metric_top1": [
+    {
+      "seed": 17,
+      "failure_patterns": [
+        "metric_top1_failure"
+      ],
+      "incident_id": "inc-002-network_delay",
+      "true_root_service_debug": "shippingservice",
+      "predicted_top1_service": "shippingservice",
+      "service_rank_debug": 1,
+      "true_root_metric_debug": "shippingservice.net.retrans",
+      "predicted_top1_metric": "shippingservice.net.rtt_ms",
+      "metric_rank_debug": 2,
+      "true_root_type_debug": "network instability",
+      "predicted_root_type": "network",
+      "path_intersects_injected_path_debug": true
+    },
+    {
+      "seed": 3,
+      "failure_patterns": [
+        "metric_top1_failure"
+      ],
+      "incident_id": "inc-001-cpu_throttle",
+      "true_root_service_debug": "paymentservice",
+      "predicted_top1_service": "paymentservice",
+      "service_rank_debug": 1,
+      "true_root_metric_debug": "paymentservice.cpu.throttled_usec",
+      "predicted_top1_metric": "paymentservice.cpu.pressure",
+      "metric_rank_debug": 5,
+      "true_root_type_debug": "CPU throttling",
+      "predicted_root_type": "CPU",
+      "path_intersects_injected_path_debug": true
+    },
+    {
+      "seed": 7,
+      "failure_patterns": [
+        "metric_top1_failure"
+      ],
+      "incident_id": "inc-002-network_delay",
+      "true_root_service_debug": "shippingservice",
+      "predicted_top1_service": "shippingservice",
+      "service_rank_debug": 1,
+      "true_root_metric_debug": "shippingservice.net.retrans",
+      "predicted_top1_metric": "shippingservice.net.rtt_ms",
+      "metric_rank_debug": 2,
+      "true_root_type_debug": "network instability",
+      "predicted_root_type": "network",
+      "path_intersects_injected_path_debug": true
+    }
+  ],
+  "per_seed_metrics": [
+    {
+      "seed": 1,
+      "service_hit_at_1": 1.0,
+      "metric_hit_at_1": 1.0,
+      "metric_hit_at_3": 1.0,
+      "metric_mrr": 1.0,
+      "root_type_accuracy": 1.0,
+      "path_fidelity": 1.0,
+      "observed_ratio": 0.614263731060606
+    },
+    {
+      "seed": 2,
+      "service_hit_at_1": 1.0,
+      "metric_hit_at_1": 1.0,
+      "metric_hit_at_3": 1.0,
+      "metric_mrr": 1.0,
+      "root_type_accuracy": 1.0,
+      "path_fidelity": 1.0,
+      "observed_ratio": 0.6144176136363636
+    },
+    {
+      "seed": 3,
+      "service_hit_at_1": 1.0,
+      "metric_hit_at_1": 0.75,
+      "metric_hit_at_3": 0.75,
+      "metric_mrr": 0.8,
+      "root_type_accuracy": 1.0,
+      "path_fidelity": 1.0,
+      "observed_ratio": 0.6134943181818182
+    },
+    {
+      "seed": 4,
+      "service_hit_at_1": 1.0,
+      "metric_hit_at_1": 1.0,
+      "metric_hit_at_3": 1.0,
+      "metric_mrr": 1.0,
+      "root_type_accuracy": 1.0,
+      "path_fidelity": 1.0,
+      "observed_ratio": 0.6135416666666667
+    },
+    {
+      "seed": 5,
+      "service_hit_at_1": 1.0,
+      "metric_hit_at_1": 1.0,
+      "metric_hit_at_3": 1.0,
+      "metric_mrr": 1.0,
+      "root_type_accuracy": 1.0,
+      "path_fidelity": 1.0,
+      "observed_ratio": 0.6152107007575758
+    },
+    {
+      "seed": 7,
+      "service_hit_at_1": 1.0,
+      "metric_hit_at_1": 0.75,
+      "metric_hit_at_3": 1.0,
+      "metric_mrr": 0.875,
+      "root_type_accuracy": 1.0,
+      "path_fidelity": 1.0,
+      "observed_ratio": 0.6132457386363637
+    },
+    {
+      "seed": 11,
+      "service_hit_at_1": 1.0,
+      "metric_hit_at_1": 1.0,
+      "metric_hit_at_3": 1.0,
+      "metric_mrr": 1.0,
+      "root_type_accuracy": 1.0,
+      "path_fidelity": 1.0,
+      "observed_ratio": 0.6124289772727273
+    },
+    {
+      "seed": 13,
+      "service_hit_at_1": 1.0,
+      "metric_hit_at_1": 1.0,
+      "metric_hit_at_3": 1.0,
+      "metric_mrr": 1.0,
+      "root_type_accuracy": 1.0,
+      "path_fidelity": 1.0,
+      "observed_ratio": 0.6133996212121212
+    },
+    {
+      "seed": 17,
+      "service_hit_at_1": 1.0,
+      "metric_hit_at_1": 0.75,
+      "metric_hit_at_3": 1.0,
+      "metric_mrr": 0.875,
+      "root_type_accuracy": 1.0,
+      "path_fidelity": 1.0,
+      "observed_ratio": 0.6138494318181819
+    },
+    {
+      "seed": 19,
+      "service_hit_at_1": 1.0,
+      "metric_hit_at_1": 1.0,
+      "metric_hit_at_3": 1.0,
+      "metric_mrr": 1.0,
+      "root_type_accuracy": 1.0,
+      "path_fidelity": 1.0,
+      "observed_ratio": 0.6133404356060606
+    }
+  ],
+  "per_incident_failures": [
+    {
+      "seed": 17,
+      "failure_patterns": [
+        "metric_top1_failure"
+      ],
+      "incident_id": "inc-002-network_delay",
+      "true_root_service_debug": "shippingservice",
+      "predicted_top1_service": "shippingservice",
+      "service_rank_debug": 1,
+      "true_root_metric_debug": "shippingservice.net.retrans",
+      "predicted_top1_metric": "shippingservice.net.rtt_ms",
+      "metric_rank_debug": 2,
+      "true_root_type_debug": "network instability",
+      "predicted_root_type": "network",
+      "path_intersects_injected_path_debug": true
+    },
+    {
+      "seed": 3,
+      "failure_patterns": [
+        "metric_top1_failure"
+      ],
+      "incident_id": "inc-001-cpu_throttle",
+      "true_root_service_debug": "paymentservice",
+      "predicted_top1_service": "paymentservice",
+      "service_rank_debug": 1,
+      "true_root_metric_debug": "paymentservice.cpu.throttled_usec",
+      "predicted_top1_metric": "paymentservice.cpu.pressure",
+      "metric_rank_debug": 5,
+      "true_root_type_debug": "CPU throttling",
+      "predicted_root_type": "CPU",
+      "path_intersects_injected_path_debug": true
+    },
+    {
+      "seed": 7,
+      "failure_patterns": [
+        "metric_top1_failure"
+      ],
+      "incident_id": "inc-002-network_delay",
+      "true_root_service_debug": "shippingservice",
+      "predicted_top1_service": "shippingservice",
+      "service_rank_debug": 1,
+      "true_root_metric_debug": "shippingservice.net.retrans",
+      "predicted_top1_metric": "shippingservice.net.rtt_ms",
+      "metric_rank_debug": 2,
+      "true_root_type_debug": "network instability",
+      "predicted_root_type": "network",
+      "path_intersects_injected_path_debug": true
+    }
+  ]
+}

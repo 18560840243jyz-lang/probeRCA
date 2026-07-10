@@ -1,0 +1,48 @@
+# Python
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Generated data and large experiment outputs
+/data/
+/artifacts/
+/outputs/
+/output/
+/runs/
+/results/
+/logs/
+*.log
+*.parquet
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+
+# External repositories
+/external/
+
+# Temporary files
+*.tmp
+*.swp
+.DS_Store
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# Keep small test fixtures versioned
+!tests/fixtures/
+!tests/fixtures/**

@@ -1,0 +1,65 @@
+project_mode: single_vm_pseudo_distributed
+phase: P2B-1
+system: google_online_boutique
+kubernetes:
+  cluster_name: proberca-ob
+  context: kind-proberca-ob
+  namespace: online-boutique
+kind_node_container: proberca-ob-control-plane
+repeat_experiment:
+  experiment_group_id: ob_network_shippingservice_repeated_001
+  repeats: 5
+  sleep_between_repeats_sec: 45
+  base_output_dir: data/p2_online_boutique/network_shippingservice_repeated
+target:
+  service: shippingservice
+  metric: net.retrans
+  fault_type: network instability
+  symptom_service: frontend
+fault_injection:
+  method: tc_netem_in_pod_netns
+  target_service: shippingservice
+  device: eth0
+  delay_ms: 300
+  jitter_ms: 80
+  loss_percent: 5
+  duration_sec: 80
+  restore_after_fault: true
+experiment:
+  window_size_sec: 5
+  baseline_windows: 12
+  faulty_windows: 12
+  recovery_windows: 4
+  frontend_url: http://127.0.0.1:8080
+  requests_per_window: 50
+  request_timeout_sec: 5
+metrics:
+  collect_proc_net_snmp: true
+  collect_ss_rtt: true
+  collect_tc_qdisc: true
+  collect_frontend_request_latency: true
+  collect_cadvisor_cpu_memory: true
+quality_requirements:
+  require_netem_applied: true
+  require_netem_restored: true
+  require_shippingservice_network_metric_present: true
+  require_frontend_latency_metric_present: true
+  require_service_graph_present: true
+evaluation_thresholds:
+  repeats_completed_min: 5
+  repeats_successful_quality_min: 5
+  repeats_successful_rca_min: 5
+  service_hit_at_1_mean_min: 0.8
+  metric_hit_at_3_mean_min: 0.8
+  root_type_accuracy_mean_min: 0.8
+  path_fidelity_mean_min: 0.8
+disabled_for_this_step:
+  - cpu_fault
+  - io_fault
+  - lock_fault
+  - multi_fault_accuracy
+  - prometheus
+  - beyla
+  - clickhouse
+  - adaptive_sampling_bandit
+  - optional_drift
