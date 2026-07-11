@@ -212,6 +212,15 @@ def _score_map(name: str, value: Any) -> None:
         _probability(f"{name}[{key!r}]", score)
 
 
+def _anomaly_score_map(name: str, value: Any) -> None:
+    if not isinstance(value, dict):
+        raise TypeError(f"{name} must be a dictionary")
+    for key, score in value.items():
+        _required_string(f"{name} key", key)
+        if _finite_number(f"{name}[{key!r}]", score) < 0:
+            raise ValueError(f"{name} anomaly scores must be non-negative")
+
+
 def _json_value(name: str, value: Any) -> None:
     if value is None or isinstance(value, (str, bool, int)):
         return
@@ -626,8 +635,8 @@ class AlertEvent(StrictRecord):
             raise ValueError(f"invalid alert state {self.state!r}")
         _string_list("trigger_services", self.trigger_services)
         _string_list("trigger_edges", self.trigger_edges)
-        _score_map("service_scores", self.service_scores)
-        _score_map("edge_scores", self.edge_scores)
+        _anomaly_score_map("service_scores", self.service_scores)
+        _anomaly_score_map("edge_scores", self.edge_scores)
         _required_string("reason", self.reason)
         for name in ("frozen_baseline", "frozen_service_model", "frozen_metric_model"):
             if not isinstance(getattr(self, name), bool):

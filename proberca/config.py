@@ -502,6 +502,188 @@ class MetricAggregationSpec:
 
 
 @dataclass(frozen=True)
+class MetricSignalSpec:
+    """Exact anomaly semantics for one configured aggregation output."""
+
+    record_type: str
+    metric_family: str | None
+    metric_name: str
+    protocol: str | None
+    transform: str
+    polarity: str
+    rare_event_threshold: float | None
+    direct_hard: bool
+    z_cap: float
+    aggregation_output_id: str
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "MetricSignalSpec":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "MetricSignalSpec")
+        result = cls(**values)
+        result.validate()
+        return result
+
+    def validate(self) -> None:
+        if self.record_type not in {"node_metric", "edge_metric"}:
+            raise ValueError("signal record_type must be node_metric or edge_metric")
+        _optional_nonempty_string("metric_name", self.metric_name)
+        _optional_nonempty_string("aggregation_output_id", self.aggregation_output_id)
+        _optional_nonempty_string("metric_family", self.metric_family)
+        _optional_nonempty_string("protocol", self.protocol)
+        if self.record_type == "node_metric":
+            if self.metric_family not in NODE_METRIC_FAMILIES or self.protocol is not None:
+                raise ValueError("node signal requires metric_family and no protocol")
+        elif self.metric_family is not None:
+            raise ValueError("edge signal must not declare a node metric_family")
+        if self.transform not in {"identity", "log1p"}:
+            raise ValueError("signal transform must be identity or log1p")
+        if self.polarity not in {"increase_bad", "decrease_bad"}:
+            raise ValueError("signal polarity must be increase_bad or decrease_bad")
+        if self.rare_event_threshold is not None:
+            _finite("rare_event_threshold", self.rare_event_threshold)
+        if not isinstance(self.direct_hard, bool):
+            raise TypeError("direct_hard must be a boolean")
+        if _finite("z_cap", self.z_cap) <= 0:
+            raise ValueError("z_cap must be positive")
+
+    def to_dict(self) -> dict:
+        self.validate()
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class BaselineConfig:
+    healthy_history_sec: int
+    min_healthy_windows: int
+    min_scale: float
+    z_cap: float
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "BaselineConfig":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "BaselineConfig")
+        result = cls(**values)
+        _positive_int("healthy_history_sec", result.healthy_history_sec)
+        _positive_int("min_healthy_windows", result.min_healthy_windows)
+        if result.min_healthy_windows > result.healthy_history_sec:
+            raise ValueError("min_healthy_windows cannot exceed healthy_history_sec")
+        if _finite("min_scale", result.min_scale) <= 0 or _finite("z_cap", result.z_cap) <= 0:
+            raise ValueError("min_scale and z_cap must be positive")
+        return result
+
+
+@dataclass(frozen=True)
+class WindowConfig:
+    window_sec: int
+    allowed_lateness_sec: int
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "WindowConfig":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "WindowConfig")
+        result = cls(**values)
+        _positive_int("window_sec", result.window_sec)
+        if isinstance(result.allowed_lateness_sec, bool) or not isinstance(result.allowed_lateness_sec, int):
+            raise TypeError("allowed_lateness_sec must be an integer")
+        if result.allowed_lateness_sec < 0:
+            raise ValueError("allowed_lateness_sec must be non-negative")
+        return result
+
+
+@dataclass(frozen=True)
+class ScoreConfig:
+    family_weights: dict[str, float]
+    allow_partial_families: bool
+    edge_weight: float
+    edge_business_impact_threshold: float
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "ScoreConfig":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "ScoreConfig")
+        result = cls(**values)
+        if set(result.family_weights) != set(NODE_METRIC_FAMILIES):
+            raise ValueError("family_weights must define every node metric family exactly once")
+        weights = {name: _finite(f"family_weights.{name}", value) for name, value in result.family_weights.items()}
+        if any(value < 0 for value in weights.values()) or not math.isclose(sum(weights.values()), 1.0, abs_tol=1e-9):
+            raise ValueError("family weights must be non-negative and sum to 1")
+        if not isinstance(result.allow_partial_families, bool):
+            raise TypeError("allow_partial_families must be a boolean")
+        if _finite("edge_weight", result.edge_weight) < 0:
+            raise ValueError("edge_weight must be non-negative")
+        if _finite("edge_business_impact_threshold", result.edge_business_impact_threshold) < 0:
+            raise ValueError("edge_business_impact_threshold must be non-negative")
+        return result
+
+
+@dataclass(frozen=True)
+class CompositeAlertRule:
+    rule_id: str
+    target: str
+    all_of: list[str]
+    any_of: list[str]
+    threshold: float
+    consecutive_windows: int
+    resulting_level: str
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "CompositeAlertRule":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "CompositeAlertRule")
+        result = cls(**values)
+        _optional_nonempty_string("rule_id", result.rule_id)
+        if "::" in result.rule_id:
+            raise ValueError("composite rule_id must not contain the internal separator")
+        if result.target not in {"same_service", "same_edge"}:
+            raise ValueError("composite target must be same_service or same_edge")
+        for name in ("all_of", "any_of"):
+            selectors = getattr(result, name)
+            if not isinstance(selectors, list) or any(not isinstance(item, str) or not item for item in selectors):
+                raise ValueError(f"{name} must be a list of non-empty exact metric IDs")
+            if len(selectors) != len(set(selectors)):
+                raise ValueError(f"{name} contains duplicate selectors")
+        if bool(result.all_of) == bool(result.any_of):
+            raise ValueError("exactly one of all_of or any_of must be configured")
+        if set(result.all_of) & set(result.any_of):
+            raise ValueError("composite selectors must not overlap")
+        if _finite("composite threshold", result.threshold) < 0:
+            raise ValueError("composite threshold must be non-negative")
+        _positive_int("composite consecutive_windows", result.consecutive_windows)
+        if result.resulting_level not in {"soft", "hard"}:
+            raise ValueError("composite resulting_level must be soft or hard")
+        return result
+
+
+@dataclass(frozen=True)
+class AlertStateConfig:
+    healthy_threshold: float
+    soft_threshold: float
+    soft_consecutive_windows: int
+    hard_threshold: float
+    hard_consecutive_windows: int
+    recovery_threshold: float
+    recovery_windows: int
+    recovery_cooldown_sec: int
+    edge_business_impact_threshold: float
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "AlertStateConfig":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "AlertStateConfig")
+        result = cls(**values)
+        thresholds = [
+            _finite("recovery_threshold", result.recovery_threshold),
+            _finite("healthy_threshold", result.healthy_threshold),
+            _finite("soft_threshold", result.soft_threshold),
+            _finite("hard_threshold", result.hard_threshold),
+        ]
+        if thresholds[0] < 0 or not thresholds[0] < thresholds[1] < thresholds[2] < thresholds[3]:
+            raise ValueError("alert thresholds must satisfy 0 <= recovery < healthy < soft < hard")
+        for name in ("soft_consecutive_windows", "hard_consecutive_windows", "recovery_windows"):
+            _positive_int(name, getattr(result, name))
+        if isinstance(result.recovery_cooldown_sec, bool) or not isinstance(result.recovery_cooldown_sec, int) or result.recovery_cooldown_sec < 0:
+            raise ValueError("recovery_cooldown_sec must be a non-negative integer")
+        if _finite("edge_business_impact_threshold", result.edge_business_impact_threshold) < 0:
+            raise ValueError("edge_business_impact_threshold must be non-negative")
+        return result
+
+
+@dataclass(frozen=True)
 class ProbeRCAConfig:
     window_sec: int
     healthy_history_sec: int
