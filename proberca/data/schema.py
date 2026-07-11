@@ -1198,6 +1198,72 @@ class EdgeAnomalyRecord(StrictRecord):
             raise ValueError("baseline_config_fingerprint must be lowercase SHA-256")
 
 
+@dataclass(frozen=True)
+class EvidenceObservationRecord(StrictRecord):
+    schema_version: str
+    evidence_id: str
+    timestamp_ns: int
+    evidence_window_start_ns: int
+    evidence_window_end_ns: int
+    analysis_cutoff_ns: int
+    cluster_id: str
+    namespace: str
+    target_type: str
+    target_id: str
+    channel_id: str
+    source_type: str
+    normalized_strength: float
+    observation_quality: float
+    reliability_weight: float
+    source_record_ids: list[str]
+    source_object_ids: list[str]
+    independent_from_residual: bool
+    provenance: dict[str, Any]
+    config_fingerprint: str
+    record_type: str = field(default="evidence_observation", init=False)
+
+    def __post_init__(self) -> None:
+        _schema_version(self.schema_version)
+        _fixed_record_type(self.record_type, "evidence_observation")
+        for name in ("evidence_id", "target_id", "channel_id"):
+            _required_string(name, getattr(self, name))
+        for name in ("cluster_id", "namespace"):
+            _identity_component(name, getattr(self, name))
+        for name in ("timestamp_ns", "evidence_window_start_ns", "evidence_window_end_ns",
+                     "analysis_cutoff_ns"):
+            _integer(name, getattr(self, name))
+        if not self.evidence_window_start_ns <= self.timestamp_ns < self.evidence_window_end_ns:
+            raise ValueError("evidence timestamp must be inside its half-open evidence window")
+        if self.timestamp_ns > self.analysis_cutoff_ns:
+            raise ValueError("evidence timestamp must not exceed analysis_cutoff_ns")
+        if self.target_type not in {"node", "shock"}:
+            raise ValueError("evidence target_type must be node or shock")
+        if self.source_type not in {
+            "node_metric", "edge_metric", "burst_event", "profiler", "topology",
+            "external_observer",
+        }:
+            raise ValueError("invalid evidence source_type")
+        for name in ("normalized_strength", "observation_quality", "reliability_weight"):
+            object.__setattr__(self, name, _probability(name, getattr(self, name)))
+        _string_list("source_record_ids", self.source_record_ids)
+        if not self.source_record_ids or len(self.source_record_ids) != len(set(self.source_record_ids)):
+            raise ValueError("source_record_ids must be non-empty and unique")
+        _string_list("source_object_ids", self.source_object_ids)
+        if len(self.source_object_ids) != len(set(self.source_object_ids)):
+            raise ValueError("source_object_ids must be unique")
+        object.__setattr__(self, "source_record_ids", sorted(self.source_record_ids))
+        object.__setattr__(self, "source_object_ids", sorted(self.source_object_ids))
+        if not isinstance(self.independent_from_residual, bool):
+            raise TypeError("independent_from_residual must be boolean")
+        if not isinstance(self.provenance, dict) or not self.provenance.get("calibration_id"):
+            raise ValueError("evidence provenance requires a calibration_id")
+        _json_value("evidence provenance", self.provenance)
+        if len(self.config_fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in self.config_fingerprint
+        ):
+            raise ValueError("evidence config_fingerprint must be lowercase SHA-256")
+
+
 def json_key(value: Any) -> str:
     import json
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -1215,6 +1281,7 @@ STRICT_RECORD_TYPES: dict[str, type[StrictRecord]] = {
     "service_state": ServiceStateRecord,
     "node_anomaly": NodeAnomalyRecord,
     "edge_anomaly": EdgeAnomalyRecord,
+    "evidence_observation": EvidenceObservationRecord,
 }
 
 

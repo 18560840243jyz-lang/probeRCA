@@ -502,6 +502,82 @@ class PropagationDictionaryConfig:
         return result
 
 
+@dataclass(frozen=True)
+class EvidenceConfig:
+    max_age_windows: int = 30
+    min_observation_quality: float = 0.0
+    require_independent_from_residual: bool = True
+    channel_aggregation: str = "max_then_noisy_or"
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "EvidenceConfig":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "evidence")
+        result = cls(**values)
+        if isinstance(result.max_age_windows, bool) or not isinstance(result.max_age_windows, int) \
+                or result.max_age_windows < 0:
+            raise ValueError("evidence.max_age_windows must be a non-negative integer")
+        object.__setattr__(result, "min_observation_quality", _probability(
+            "evidence.min_observation_quality", result.min_observation_quality
+        ))
+        if result.require_independent_from_residual is not True:
+            raise ValueError("circular evidence protection cannot be disabled")
+        if result.channel_aggregation != "max_then_noisy_or":
+            raise ValueError("evidence.channel_aggregation must be max_then_noisy_or")
+        return result
+
+
+@dataclass(frozen=True)
+class QualityConfig:
+    quality_weight_floor: float = 0.2
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "QualityConfig":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "quality")
+        result = cls(**values)
+        floor = _probability("quality.quality_weight_floor", result.quality_weight_floor)
+        if floor <= 0:
+            raise ValueError("quality_weight_floor must be in (0, 1]")
+        object.__setattr__(result, "quality_weight_floor", floor)
+        return result
+
+
+@dataclass(frozen=True)
+class PenaltyConfig:
+    residual_scale_floor: float = 0.1
+    c_u: float = 1.0
+    c_delta: float = 1.0
+    c_xi: float = 1.0
+    eta_v: float = 1.0
+    eta_p: float = 1.0
+    eta_s: float = 1.0
+    rho_v: float = 1.0
+    rho_p: float = 1.0
+    rho_s: float = 1.0
+    rho_m: float = 1.0
+    group_ratio_u: float = 0.0
+    group_ratio_delta: float = 0.0
+    group_ratio_xi: float = 0.0
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "PenaltyConfig":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "penalties")
+        result = cls(**values)
+        for name in ("residual_scale_floor", "c_u", "c_delta", "c_xi"):
+            value = _finite(f"penalties.{name}", getattr(result, name))
+            if value <= 0:
+                raise ValueError(f"penalties.{name} must be positive")
+            object.__setattr__(result, name, value)
+        for name in (
+            "eta_v", "eta_p", "eta_s", "rho_v", "rho_p", "rho_s", "rho_m",
+            "group_ratio_u", "group_ratio_delta", "group_ratio_xi",
+        ):
+            value = _finite(f"penalties.{name}", getattr(result, name))
+            if value < 0:
+                raise ValueError(f"penalties.{name} must be non-negative")
+            object.__setattr__(result, name, value)
+        return result
+
+
 AGGREGATION_METHODS = frozenset(
     {
         "sum",
@@ -998,6 +1074,9 @@ class ProbeRCAConfig:
     residual: ResidualConfig = field(default_factory=ResidualConfig)
     propagation_dictionary: PropagationDictionaryConfig = field(default_factory=PropagationDictionaryConfig)
     shock_projection_templates: list[ShockProjectionTemplate] = field(default_factory=list)
+    evidence: EvidenceConfig = field(default_factory=EvidenceConfig)
+    quality: QualityConfig = field(default_factory=QualityConfig)
+    penalties: PenaltyConfig = field(default_factory=PenaltyConfig)
 
     @classmethod
     def from_dict(cls, payload: dict) -> "ProbeRCAConfig":
@@ -1015,6 +1094,7 @@ class ProbeRCAConfig:
         optional = {
             "impact_derivation_rules", "rca_metric_families", "residual",
             "propagation_dictionary", "shock_projection_templates",
+            "evidence", "quality", "penalties",
         }
         if not isinstance(payload, dict):
             raise TypeError("ProbeRCAConfig must be a dictionary")
@@ -1028,6 +1108,9 @@ class ProbeRCAConfig:
         values.setdefault("residual", asdict(ResidualConfig()))
         values.setdefault("propagation_dictionary", asdict(PropagationDictionaryConfig()))
         values.setdefault("shock_projection_templates", [])
+        values.setdefault("evidence", asdict(EvidenceConfig()))
+        values.setdefault("quality", asdict(QualityConfig()))
+        values.setdefault("penalties", asdict(PenaltyConfig()))
         _positive_int("window_sec", values["window_sec"])
         _positive_int("healthy_history_sec", values["healthy_history_sec"])
         templates_payload = values["shock_templates"]
@@ -1083,6 +1166,12 @@ class ProbeRCAConfig:
                 else PropagationDictionaryConfig.from_dict(values["propagation_dictionary"])
             ),
             shock_projection_templates=projection_templates,
+            evidence=(values["evidence"] if isinstance(values["evidence"], EvidenceConfig)
+                      else EvidenceConfig.from_dict(values["evidence"])),
+            quality=(values["quality"] if isinstance(values["quality"], QualityConfig)
+                     else QualityConfig.from_dict(values["quality"])),
+            penalties=(values["penalties"] if isinstance(values["penalties"], PenaltyConfig)
+                       else PenaltyConfig.from_dict(values["penalties"])),
         )
 
     def to_dict(self) -> dict:
