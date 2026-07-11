@@ -1022,6 +1022,57 @@ class CandidateSubgraph(StrictRecord):
             raise ValueError("config_fingerprint must be lowercase SHA-256")
 
 
+@dataclass(frozen=True)
+class ServiceStateRecord(StrictRecord):
+    schema_version: str
+    timestamp_ns: int
+    window_start_ns: int
+    window_end_ns: int
+    cluster_id: str
+    namespace: str
+    service_name: str
+    service_id: str
+    value: float
+    baseline_ready: bool
+    family_coverage: dict[str, bool]
+    missing_families: list[str]
+    observation_quality: float
+    source_alert_state: str
+    config_fingerprint: str
+    record_type: str = field(default="service_state", init=False)
+
+    def __post_init__(self) -> None:
+        _schema_version(self.schema_version)
+        _fixed_record_type(self.record_type, "service_state")
+        for name in ("timestamp_ns", "window_start_ns", "window_end_ns"):
+            _integer(name, getattr(self, name))
+        if not self.window_start_ns < self.window_end_ns or self.timestamp_ns != self.window_end_ns:
+            raise ValueError("service state timestamp must equal the end of a non-empty window")
+        for name in ("cluster_id", "namespace", "service_name"):
+            _identity_component(name, getattr(self, name))
+        expected_id = f"{self.cluster_id}::{self.namespace}::{self.service_name}"
+        if self.service_id != expected_id:
+            raise ValueError(f"service_id must equal {expected_id!r}")
+        object.__setattr__(self, "value", _finite_number("value", self.value))
+        if not isinstance(self.baseline_ready, bool):
+            raise TypeError("baseline_ready must be boolean")
+        if not isinstance(self.family_coverage, dict):
+            raise TypeError("family_coverage must be a dictionary")
+        for family, covered in self.family_coverage.items():
+            _required_string("family_coverage key", family)
+            if not isinstance(covered, bool):
+                raise TypeError("family_coverage values must be boolean")
+        _string_list("missing_families", self.missing_families)
+        if len(self.missing_families) != len(set(self.missing_families)):
+            raise ValueError("missing_families contains duplicates")
+        object.__setattr__(self, "missing_families", sorted(self.missing_families))
+        object.__setattr__(self, "observation_quality", _probability("observation_quality", self.observation_quality))
+        if self.source_alert_state not in {"healthy", "soft", "hard", "recovery", "edge_anomaly"}:
+            raise ValueError("invalid source_alert_state")
+        if len(self.config_fingerprint) != 64 or any(character not in "0123456789abcdef" for character in self.config_fingerprint):
+            raise ValueError("config_fingerprint must be lowercase SHA-256")
+
+
 def json_key(value: Any) -> str:
     import json
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -1036,6 +1087,7 @@ STRICT_RECORD_TYPES: dict[str, type[StrictRecord]] = {
     "incident_label": IncidentLabel,
     "rca_report": RCAReport,
     "candidate_subgraph": CandidateSubgraph,
+    "service_state": ServiceStateRecord,
 }
 
 

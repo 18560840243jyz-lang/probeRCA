@@ -84,10 +84,30 @@ class PropagationConfig:
     metric_lags: list[int]
     rls_forgetting_factor: float
     metric_ridge: float
+    rls_initial_covariance: float = 100.0
+    service_min_updates: int = 30
+    service_min_observation_quality: float = 0.0
+    service_max_gap_windows: int = 3
+    topology_reconfigure_min_updates: int = 1
+    include_self_history: bool = True
+    include_impact_parents: bool = True
+    include_host_parents: bool = True
+    include_resource_parents: bool = True
 
     @classmethod
     def from_dict(cls, payload: dict) -> "PropagationConfig":
-        values = _strict_dict(payload, {field.name for field in cls.__dataclass_fields__.values()}, "propagation")
+        required = {"service_lags", "metric_lags", "rls_forgetting_factor", "metric_ridge"}
+        allowed = set(cls.__dataclass_fields__)
+        if not isinstance(payload, dict):
+            raise TypeError("propagation must be a dictionary")
+        unknown = sorted(set(payload) - allowed)
+        missing = sorted(required - set(payload))
+        if unknown or missing:
+            raise ValueError(f"propagation invalid fields; unknown={unknown}, missing={missing}")
+        values = dict(payload)
+        for name, dataclass_field in cls.__dataclass_fields__.items():
+            if name not in values and dataclass_field.default is not MISSING:
+                values[name] = dataclass_field.default
         result = cls(**values)
         for name in ("service_lags", "metric_lags"):
             lags = getattr(result, name)
@@ -105,6 +125,25 @@ class PropagationConfig:
         if ridge <= 0.0:
             raise ValueError("propagation.metric_ridge must be positive")
         object.__setattr__(result, "metric_ridge", ridge)
+        covariance = _finite("propagation.rls_initial_covariance", result.rls_initial_covariance)
+        if covariance <= 0.0:
+            raise ValueError("propagation.rls_initial_covariance must be positive")
+        object.__setattr__(result, "rls_initial_covariance", covariance)
+        for name in ("service_min_updates", "service_max_gap_windows", "topology_reconfigure_min_updates"):
+            _positive_int(f"propagation.{name}", getattr(result, name))
+        object.__setattr__(
+            result,
+            "service_min_observation_quality",
+            _probability("propagation.service_min_observation_quality", result.service_min_observation_quality),
+        )
+        for name in ("include_self_history", "include_impact_parents", "include_host_parents",
+                     "include_resource_parents"):
+            if not isinstance(getattr(result, name), bool):
+                raise TypeError(f"propagation.{name} must be boolean")
+        if not result.include_self_history:
+            raise ValueError("propagation.include_self_history must be true")
+        object.__setattr__(result, "service_lags", sorted(result.service_lags))
+        object.__setattr__(result, "metric_lags", sorted(result.metric_lags))
         return result
 
 
