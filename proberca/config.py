@@ -79,6 +79,60 @@ class AlertConfig:
 
 
 @dataclass(frozen=True)
+class MetricParentRule:
+    rule_id: str
+    enabled: bool
+    target_family: str
+    target_metric_names: list[str] | None
+    relation_type: str
+    parent_family: str
+    parent_metric_names: list[str] | None
+    lags: list[int]
+    require_signal_spec: bool
+    provenance_label: str
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "MetricParentRule":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "MetricParentRule")
+        result = cls(**values)
+        result.validate()
+        return result
+
+    def validate(self, max_lag: int | None = None) -> None:
+        for name in ("rule_id", "target_family", "parent_family", "provenance_label"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"MetricParentRule.{name} must be a non-empty string")
+        if self.target_family not in NODE_METRIC_FAMILIES or self.parent_family not in NODE_METRIC_FAMILIES:
+            raise ValueError("MetricParentRule family must be a configured node metric family")
+        if not isinstance(self.enabled, bool) or not isinstance(self.require_signal_spec, bool):
+            raise TypeError("MetricParentRule flags must be boolean")
+        if self.relation_type not in {"self_history", "same_service", "impact", "host", "resource"}:
+            raise ValueError("MetricParentRule relation_type is invalid")
+        for name in ("target_metric_names", "parent_metric_names"):
+            value = getattr(self, name)
+            if value is not None:
+                if not isinstance(value, list) or not value or any(
+                    not isinstance(item, str) or not item.strip() for item in value
+                ):
+                    raise ValueError(f"MetricParentRule.{name} must be null or non-empty exact names")
+                if value != sorted(set(value)):
+                    raise ValueError(f"MetricParentRule.{name} must be sorted and unique")
+        if not isinstance(self.lags, list) or not self.lags:
+            raise ValueError("MetricParentRule.lags must not be empty")
+        if any(isinstance(lag, bool) or not isinstance(lag, int) or lag <= 0 for lag in self.lags):
+            raise ValueError("MetricParentRule lags must be positive integers")
+        if self.lags != sorted(set(self.lags)):
+            raise ValueError("MetricParentRule lags must be sorted and unique")
+        if max_lag is not None and any(lag > max_lag for lag in self.lags):
+            raise ValueError("MetricParentRule lag exceeds configured metric_lags")
+
+    def to_dict(self) -> dict:
+        self.validate()
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class PropagationConfig:
     service_lags: list[int]
     metric_lags: list[int]
@@ -93,6 +147,14 @@ class PropagationConfig:
     include_impact_parents: bool = True
     include_host_parents: bool = True
     include_resource_parents: bool = True
+    metric_history_sec: int = 600
+    metric_min_training_rows: int = 60
+    metric_min_observation_quality: float = 0.8
+    metric_max_condition_number: float = 1e8
+    metric_max_gap_windows: int = 5
+    metric_model_cache_size: int = 8
+    metric_include_self_history: bool = True
+    metric_parent_rules: list[MetricParentRule] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, payload: dict) -> "PropagationConfig":
@@ -108,6 +170,13 @@ class PropagationConfig:
         for name, dataclass_field in cls.__dataclass_fields__.items():
             if name not in values and dataclass_field.default is not MISSING:
                 values[name] = dataclass_field.default
+        raw_rules = values.get("metric_parent_rules", [])
+        if not isinstance(raw_rules, list):
+            raise TypeError("propagation.metric_parent_rules must be a list")
+        values["metric_parent_rules"] = [
+            item if isinstance(item, MetricParentRule) else MetricParentRule.from_dict(item)
+            for item in raw_rules
+        ]
         result = cls(**values)
         for name in ("service_lags", "metric_lags"):
             lags = getattr(result, name)
@@ -144,6 +213,26 @@ class PropagationConfig:
             raise ValueError("propagation.include_self_history must be true")
         object.__setattr__(result, "service_lags", sorted(result.service_lags))
         object.__setattr__(result, "metric_lags", sorted(result.metric_lags))
+        for name in ("metric_history_sec", "metric_min_training_rows", "metric_max_gap_windows",
+                     "metric_model_cache_size"):
+            _positive_int(f"propagation.{name}", getattr(result, name))
+        if result.metric_history_sec < max(result.metric_lags):
+            raise ValueError("propagation.metric_history_sec must cover metric_lags")
+        if result.metric_min_training_rows <= max(result.metric_lags):
+            raise ValueError("propagation.metric_min_training_rows must exceed the maximum metric lag")
+        object.__setattr__(result, "metric_min_observation_quality", _probability(
+            "propagation.metric_min_observation_quality", result.metric_min_observation_quality
+        ))
+        condition = _finite("propagation.metric_max_condition_number", result.metric_max_condition_number)
+        if condition <= 1.0:
+            raise ValueError("propagation.metric_max_condition_number must be greater than 1")
+        object.__setattr__(result, "metric_max_condition_number", condition)
+        if not isinstance(result.metric_include_self_history, bool) or not result.metric_include_self_history:
+            raise ValueError("propagation.metric_include_self_history must be true")
+        if len({item.rule_id for item in result.metric_parent_rules}) != len(result.metric_parent_rules):
+            raise ValueError("propagation.metric_parent_rules contains duplicate rule_id")
+        for item in result.metric_parent_rules:
+            item.validate(max(result.metric_lags))
         return result
 
 

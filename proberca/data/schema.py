@@ -1073,6 +1073,61 @@ class ServiceStateRecord(StrictRecord):
             raise ValueError("config_fingerprint must be lowercase SHA-256")
 
 
+@dataclass(frozen=True)
+class NodeAnomalyRecord(StrictRecord):
+    schema_version: str
+    timestamp_ns: int
+    window_start_ns: int
+    window_end_ns: int
+    cluster_id: str
+    namespace: str
+    service_name: str
+    service_id: str
+    node_id: str
+    metric_family: str
+    metric_name: str
+    signed_z: float
+    anomaly_score: float
+    baseline_ready: bool
+    observation_quality: float
+    source_alert_state: str
+    source_metric_record_id: str
+    baseline_config_fingerprint: str
+    signal_spec_id: str
+    record_type: str = field(default="node_anomaly", init=False)
+
+    def __post_init__(self) -> None:
+        _schema_version(self.schema_version)
+        _fixed_record_type(self.record_type, "node_anomaly")
+        for name in ("timestamp_ns", "window_start_ns", "window_end_ns"):
+            _integer(name, getattr(self, name))
+        if not self.window_start_ns < self.window_end_ns or self.timestamp_ns != self.window_end_ns:
+            raise ValueError("node anomaly timestamp must equal a non-empty window end")
+        for name in ("cluster_id", "namespace", "service_name"):
+            _identity_component(name, getattr(self, name))
+        for name in ("metric_family", "metric_name", "source_metric_record_id", "signal_spec_id"):
+            _required_string(name, getattr(self, name))
+        expected_service = f"{self.cluster_id}::{self.namespace}::{self.service_name}"
+        expected_node = f"{expected_service}::{self.metric_name}"
+        if self.service_id != expected_service or self.node_id != expected_node:
+            raise ValueError("node anomaly stable identities conflict with their components")
+        object.__setattr__(self, "signed_z", _finite_number("signed_z", self.signed_z))
+        object.__setattr__(self, "anomaly_score", _finite_number("anomaly_score", self.anomaly_score))
+        if self.anomaly_score < 0:
+            raise ValueError("anomaly_score must be non-negative")
+        if not isinstance(self.baseline_ready, bool):
+            raise TypeError("baseline_ready must be boolean")
+        object.__setattr__(self, "observation_quality", _probability(
+            "observation_quality", self.observation_quality
+        ))
+        if self.source_alert_state not in {"healthy", "soft", "hard", "recovery", "edge_anomaly"}:
+            raise ValueError("invalid source_alert_state")
+        if len(self.baseline_config_fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in self.baseline_config_fingerprint
+        ):
+            raise ValueError("baseline_config_fingerprint must be lowercase SHA-256")
+
+
 def json_key(value: Any) -> str:
     import json
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -1088,6 +1143,7 @@ STRICT_RECORD_TYPES: dict[str, type[StrictRecord]] = {
     "rca_report": RCAReport,
     "candidate_subgraph": CandidateSubgraph,
     "service_state": ServiceStateRecord,
+    "node_anomaly": NodeAnomalyRecord,
 }
 
 
