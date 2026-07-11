@@ -547,12 +547,53 @@ class TopologyEdge(StrictRecord):
     src_service: str
     dst_service: str
     relation_type: str
+    src_namespace: str | None = None
+    dst_namespace: str | None = None
+    protocol: str | None = None
+    resource_type: str | None = None
+    resource_id: str | None = None
+    directed: bool | None = None
 
     def __post_init__(self) -> None:
         _identity_component("src_service", self.src_service)
         _identity_component("dst_service", self.dst_service)
         if self.relation_type not in {"call", "impact", "host", "resource"}:
             raise ValueError(f"invalid relation_type {self.relation_type!r}")
+        for name in ("src_namespace", "dst_namespace", "protocol", "resource_type", "resource_id"):
+            _optional_string(name, getattr(self, name))
+        if self.directed is not None and not isinstance(self.directed, bool):
+            raise TypeError("directed must be a boolean or None")
+        effective_direction = self.directed
+        if effective_direction is None:
+            effective_direction = self.relation_type in {"call", "impact"}
+            object.__setattr__(self, "directed", effective_direction)
+        if self.relation_type in {"call", "impact"} and not effective_direction:
+            raise ValueError("call and impact relations must be directed")
+
+
+@dataclass(frozen=True)
+class ServiceNodePlacement(StrictRecord):
+    namespace: str
+    service_name: str
+    node_name: str
+    pod_uid: str | None
+
+    def __post_init__(self) -> None:
+        for name in ("namespace", "service_name", "node_name"):
+            _identity_component(name, getattr(self, name))
+        _optional_string("pod_uid", self.pod_uid)
+
+
+@dataclass(frozen=True)
+class ServiceResourceBinding(StrictRecord):
+    namespace: str
+    service_name: str
+    resource_type: str
+    resource_id: str
+
+    def __post_init__(self) -> None:
+        for name in ("namespace", "service_name", "resource_type", "resource_id"):
+            _identity_component(name, getattr(self, name))
 
 
 @dataclass(frozen=True)
@@ -566,12 +607,16 @@ class TopologySnapshot(StrictRecord):
     call_edges: list[TopologyEdge]
     host_edges: list[TopologyEdge]
     resource_edges: list[TopologyEdge]
+    service_nodes: list[ServiceNodePlacement] = field(default_factory=list)
+    service_resources: list[ServiceResourceBinding] = field(default_factory=list)
     record_type: str = field(default="topology_snapshot", init=False)
 
     _nested_list_fields = {
         "call_edges": TopologyEdge,
         "host_edges": TopologyEdge,
         "resource_edges": TopologyEdge,
+        "service_nodes": ServiceNodePlacement,
+        "service_resources": ServiceResourceBinding,
     }
 
     def __post_init__(self) -> None:
@@ -586,9 +631,14 @@ class TopologySnapshot(StrictRecord):
         _string_list("services", self.services)
         if len(self.services) != len(set(self.services)):
             raise ValueError("services must not contain duplicates")
-        service_names = {service.rsplit("::", 1)[-1] for service in self.services}
-        if len(service_names) != len(self.services):
-            raise ValueError("services must have unique service names")
+        service_ids: set[str] = set()
+        service_name_index: dict[str, list[str]] = {}
+        for service in self.services:
+            parts = service.split("::")
+            if len(parts) != 2 or any(not part for part in parts):
+                raise ValueError("topology services must use namespace::service_name")
+            service_ids.add(service)
+            service_name_index.setdefault(parts[1], []).append(service)
         for name in ("call_edges", "host_edges", "resource_edges"):
             edges = getattr(self, name)
             if not isinstance(edges, list) or any(not isinstance(edge, TopologyEdge) for edge in edges):
@@ -600,14 +650,36 @@ class TopologySnapshot(StrictRecord):
         if any(edge.relation_type != "resource" for edge in self.resource_edges):
             raise ValueError("resource_edges may only contain resource relations")
         all_edges = [*self.call_edges, *self.host_edges, *self.resource_edges]
-        identities = [(edge.src_service, edge.dst_service, edge.relation_type) for edge in all_edges]
+        identities = [(
+            edge.src_namespace, edge.src_service, edge.dst_namespace, edge.dst_service,
+            edge.relation_type, edge.protocol, edge.resource_type, edge.resource_id,
+        ) for edge in all_edges]
         if len(identities) != len(set(identities)):
             raise ValueError("topology edges must not contain duplicates")
+        def endpoint(namespace: str | None, service_name: str) -> str:
+            if namespace is not None:
+                return f"{namespace}::{service_name}"
+            matches = service_name_index.get(service_name, [])
+            if len(matches) != 1:
+                raise ValueError("topology edge endpoint namespace is ambiguous")
+            return matches[0]
         for edge in all_edges:
-            if edge.src_service not in service_names or edge.dst_service not in service_names:
+            src_id = endpoint(edge.src_namespace, edge.src_service)
+            dst_id = endpoint(edge.dst_namespace, edge.dst_service)
+            if src_id not in service_ids or dst_id not in service_ids:
                 raise ValueError("topology edge endpoint is not present in services")
-            if edge.src_service == edge.dst_service:
+            if src_id == dst_id:
                 raise ValueError("topology self-loops are not allowed by this contract")
+        for placement in self.service_nodes:
+            if f"{placement.namespace}::{placement.service_name}" not in service_ids:
+                raise ValueError("service node placement references an unknown service")
+        if len(self.service_nodes) != len(set(self.service_nodes)):
+            raise ValueError("service node placements must not contain duplicates")
+        for binding in self.service_resources:
+            if f"{binding.namespace}::{binding.service_name}" not in service_ids:
+                raise ValueError("service resource binding references an unknown service")
+        if len(self.service_resources) != len(set(self.service_resources)):
+            raise ValueError("service resource bindings must not contain duplicates")
 
 
 @dataclass(frozen=True)
@@ -788,6 +860,173 @@ class RCAReport(StrictRecord):
                 _probability(f"quality.{name}", self.quality[name])
 
 
+CANDIDATE_OBJECT_TYPES = frozenset({"service", "node_metric", "physical_edge", "edge_metric", "shock"})
+CANDIDATE_REASON_CODES = frozenset({
+    "trigger_service", "trigger_edge_endpoint", "impact_ancestor", "call_descendant",
+    "cohost", "shared_resource", "configured_metric", "observed_edge_metric",
+})
+
+
+@dataclass(frozen=True)
+class CandidateProvenance(StrictRecord):
+    object_id: str
+    object_type: str
+    reason_code: str
+    source_object_id: str
+    hop_count: int
+    relation_path: list[str]
+    relation_ids: list[str]
+    snapshot_id: str
+    alert_id: str
+    detail: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        for name in ("object_id", "source_object_id", "snapshot_id", "alert_id"):
+            _required_string(name, getattr(self, name))
+        if self.object_type not in CANDIDATE_OBJECT_TYPES:
+            raise ValueError("invalid candidate provenance object_type")
+        if self.reason_code not in CANDIDATE_REASON_CODES:
+            raise ValueError("invalid candidate provenance reason_code")
+        _integer("hop_count", self.hop_count)
+        _string_list("relation_path", self.relation_path)
+        _string_list("relation_ids", self.relation_ids)
+        if self.reason_code in {"trigger_service", "trigger_edge_endpoint", "configured_metric", "observed_edge_metric"} and self.hop_count != 0:
+            raise ValueError("direct candidate provenance must have hop_count=0")
+        if self.reason_code in {"impact_ancestor", "call_descendant"}:
+            if len(self.relation_ids) != self.hop_count or len(self.relation_path) != self.hop_count + 1:
+                raise ValueError("path provenance length conflicts with hop_count")
+        if self.reason_code == "cohost" and not self.detail.get("shared_node"):
+            raise ValueError("cohost provenance requires shared_node")
+        if self.reason_code == "shared_resource" and (
+            not self.detail.get("resource_type") or not self.detail.get("resource_id")
+        ):
+            raise ValueError("shared_resource provenance requires resource type and ID")
+        _json_value("candidate provenance detail", self.detail)
+
+
+@dataclass(frozen=True)
+class CandidateSubgraph(StrictRecord):
+    schema_version: str
+    candidate_id: str
+    cluster_id: str
+    namespace_scope: list[str]
+    alert_id: str
+    alert_state: str
+    alert_timestamp_ns: int
+    topology_snapshot_id: str
+    topology_valid_from_ns: int
+    topology_valid_to_ns: int
+    seed_services: list[str]
+    trigger_edges: list[str]
+    candidate_services: list[str]
+    candidate_node_ids: list[str]
+    candidate_edge_metric_ids: list[str]
+    candidate_shock_ids: list[str]
+    call_edges: list[dict[str, Any]]
+    impact_edges: list[dict[str, Any]]
+    host_relations: list[dict[str, Any]]
+    resource_relations: list[dict[str, Any]]
+    physical_edges: list[dict[str, Any]]
+    provenance: list[CandidateProvenance]
+    missing_node_metrics: list[str]
+    missing_edge_metrics: list[str]
+    rca_eligible: bool
+    quality_issues: list[dict[str, Any]]
+    config_fingerprint: str
+    service_count: int
+    node_metric_count: int
+    physical_edge_count: int
+    shock_count: int
+    build_latency_ms: float
+    record_type: str = field(default="candidate_subgraph", init=False)
+
+    _nested_list_fields = {"provenance": CandidateProvenance}
+
+    def __post_init__(self) -> None:
+        _fixed_record_type(self.record_type, "candidate_subgraph")
+        _schema_version(self.schema_version)
+        for name in ("candidate_id", "cluster_id", "alert_id", "topology_snapshot_id", "config_fingerprint"):
+            _required_string(name, getattr(self, name))
+        _integer("alert_timestamp_ns", self.alert_timestamp_ns)
+        _integer("topology_valid_from_ns", self.topology_valid_from_ns)
+        _integer("topology_valid_to_ns", self.topology_valid_to_ns)
+        if not self.topology_valid_from_ns <= self.alert_timestamp_ns < self.topology_valid_to_ns:
+            raise ValueError("candidate alert timestamp is outside topology validity")
+        if self.alert_state not in {"soft", "hard", "edge_anomaly"}:
+            raise ValueError("candidate_subgraph requires soft, hard, or edge_anomaly alert")
+        if self.rca_eligible != (self.alert_state == "hard"):
+            raise ValueError("candidate rca_eligible conflicts with alert_state")
+        if not isinstance(self.rca_eligible, bool):
+            raise TypeError("rca_eligible must be a boolean")
+        list_names = (
+            "namespace_scope", "seed_services", "trigger_edges", "candidate_services",
+            "candidate_node_ids", "candidate_edge_metric_ids", "candidate_shock_ids",
+            "missing_node_metrics", "missing_edge_metrics",
+        )
+        for name in list_names:
+            values = getattr(self, name)
+            _string_list(name, values)
+            if len(values) != len(set(values)):
+                raise ValueError(f"{name} contains duplicates")
+            object.__setattr__(self, name, sorted(values))
+        if not set(self.seed_services) <= set(self.candidate_services):
+            raise ValueError("candidate seed service is absent from candidate_services")
+        for name in ("call_edges", "impact_edges", "host_relations", "resource_relations", "physical_edges", "quality_issues"):
+            values = getattr(self, name)
+            if not isinstance(values, list) or any(not isinstance(item, dict) for item in values):
+                raise TypeError(f"{name} must be a list of dictionaries")
+            _json_value(name, values)
+            key = "physical_edge_id" if name == "physical_edges" else "relation_id" if name != "quality_issues" else "reason_code"
+            object.__setattr__(self, name, sorted(values, key=lambda item: (str(item.get(key, "")), json_key(item))))
+            if name != "quality_issues":
+                identifiers = [item.get(key) for item in values]
+                if any(not isinstance(item, str) or not item for item in identifiers) or len(identifiers) != len(set(identifiers)):
+                    raise ValueError(f"{name} contains missing or duplicate stable IDs")
+        service_set = set(self.candidate_services)
+        for name in ("call_edges", "impact_edges", "host_relations", "resource_relations", "physical_edges"):
+            for relation in getattr(self, name):
+                if relation.get("src_service_id") not in service_set or relation.get("dst_service_id") not in service_set:
+                    raise ValueError(f"{name} contains an endpoint outside candidate_services")
+        for node_id in self.candidate_node_ids:
+            if "::".join(node_id.split("::")[:3]) not in service_set:
+                raise ValueError("candidate node metric points outside candidate_services")
+        physical_ids = {item.get("physical_edge_id") for item in self.physical_edges}
+        if not set(self.trigger_edges) <= physical_ids:
+            raise ValueError("candidate trigger edge has no physical edge")
+        if any(edge_id.rsplit("::", 1)[0] not in physical_ids for edge_id in self.candidate_edge_metric_ids):
+            raise ValueError("candidate edge metric has no physical edge")
+        if any(shock_id.split("::shock::", 1)[0] not in physical_ids for shock_id in self.candidate_shock_ids):
+            raise ValueError("candidate shock has no physical edge")
+        if len(self.provenance) != len(set(json_key(item.to_dict()) for item in self.provenance)):
+            raise ValueError("candidate provenance contains duplicates")
+        object.__setattr__(self, "provenance", sorted(
+            self.provenance,
+            key=lambda item: (item.object_id, item.hop_count, item.reason_code,
+                              tuple(item.relation_ids), item.source_object_id, json_key(item.detail)),
+        ))
+        required_objects = set(self.candidate_services) | set(self.candidate_node_ids) | physical_ids | set(self.candidate_edge_metric_ids) | set(self.candidate_shock_ids)
+        provenance_objects = {item.object_id for item in self.provenance}
+        if not required_objects <= provenance_objects:
+            raise ValueError("candidate object is missing structured provenance")
+        for name, expected in (("service_count", len(self.candidate_services)),
+                               ("node_metric_count", len(self.candidate_node_ids)),
+                               ("physical_edge_count", len(self.physical_edges)),
+                               ("shock_count", len(self.candidate_shock_ids))):
+            _integer(name, getattr(self, name))
+            if getattr(self, name) != expected:
+                raise ValueError(f"{name} does not match candidate content")
+        object.__setattr__(self, "build_latency_ms", _finite_number("build_latency_ms", self.build_latency_ms))
+        if self.build_latency_ms < 0:
+            raise ValueError("build_latency_ms must be non-negative")
+        if len(self.config_fingerprint) != 64 or any(character not in "0123456789abcdef" for character in self.config_fingerprint):
+            raise ValueError("config_fingerprint must be lowercase SHA-256")
+
+
+def json_key(value: Any) -> str:
+    import json
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
 STRICT_RECORD_TYPES: dict[str, type[StrictRecord]] = {
     "node_metric": NodeMetricRecord,
     "edge_metric": EdgeMetricRecord,
@@ -796,6 +1035,7 @@ STRICT_RECORD_TYPES: dict[str, type[StrictRecord]] = {
     "alert_event": AlertEvent,
     "incident_label": IncidentLabel,
     "rca_report": RCAReport,
+    "candidate_subgraph": CandidateSubgraph,
 }
 
 

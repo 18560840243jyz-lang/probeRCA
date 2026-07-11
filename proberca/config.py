@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import MISSING, asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -114,16 +114,72 @@ class CandidateGraphConfig:
     downstream_hops: int
     include_cohost: bool
     include_shared_resource: bool
+    allow_cross_namespace: bool = False
+    allowed_namespaces: list[str] = field(default_factory=list)
+    max_candidate_services: int = 100
+    max_candidate_node_metrics: int = 1000
+    max_candidate_physical_edges: int = 500
+    fail_on_candidate_overflow: bool = True
+    include_trigger_edge_endpoints: bool = True
+    include_all_provenance_paths: bool = True
+    max_provenance_paths_per_object: int = 20
 
     @classmethod
     def from_dict(cls, payload: dict) -> "CandidateGraphConfig":
-        values = _strict_dict(payload, {field.name for field in cls.__dataclass_fields__.values()}, "candidate_graph")
+        required = {"upstream_hops", "downstream_hops", "include_cohost", "include_shared_resource"}
+        allowed = set(cls.__dataclass_fields__)
+        if not isinstance(payload, dict):
+            raise TypeError("candidate_graph must be a dictionary")
+        unknown = sorted(set(payload) - allowed)
+        missing = sorted(required - set(payload))
+        if unknown or missing:
+            raise ValueError(f"candidate_graph invalid fields; unknown={unknown}, missing={missing}")
+        values = dict(payload)
+        for name, dataclass_field in cls.__dataclass_fields__.items():
+            if name not in values:
+                values[name] = dataclass_field.default_factory() if dataclass_field.default_factory is not MISSING else dataclass_field.default
         result = cls(**values)
         _positive_int("candidate_graph.upstream_hops", result.upstream_hops)
         _positive_int("candidate_graph.downstream_hops", result.downstream_hops)
-        for name in ("include_cohost", "include_shared_resource"):
+        for name in ("include_cohost", "include_shared_resource", "allow_cross_namespace",
+                     "fail_on_candidate_overflow", "include_trigger_edge_endpoints",
+                     "include_all_provenance_paths"):
             if not isinstance(getattr(result, name), bool):
                 raise TypeError(f"candidate_graph.{name} must be a boolean")
+        if not isinstance(result.allowed_namespaces, list) or any(not isinstance(item, str) or not item for item in result.allowed_namespaces):
+            raise ValueError("candidate_graph.allowed_namespaces must contain non-empty strings")
+        if len(result.allowed_namespaces) != len(set(result.allowed_namespaces)):
+            raise ValueError("candidate_graph.allowed_namespaces contains duplicates")
+        for name in ("max_candidate_services", "max_candidate_node_metrics",
+                     "max_candidate_physical_edges", "max_provenance_paths_per_object"):
+            _positive_int(f"candidate_graph.{name}", getattr(result, name))
+        return result
+
+
+@dataclass(frozen=True)
+class ImpactDerivationRule:
+    rule_id: str
+    source_relation_type: str
+    protocol: str | None
+    direction: str
+    enabled: bool
+    provenance_label: str
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "ImpactDerivationRule":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "ImpactDerivationRule")
+        result = cls(**values)
+        for name in ("rule_id", "source_relation_type", "provenance_label"):
+            _optional_nonempty_string(name, getattr(result, name))
+        _optional_nonempty_string("protocol", result.protocol)
+        if result.source_relation_type != "call":
+            raise ValueError("impact derivation currently accepts only explicit call relations")
+        if result.direction not in {"forward", "reverse", "bidirectional", "none"}:
+            raise ValueError("invalid impact derivation direction")
+        if not isinstance(result.enabled, bool):
+            raise TypeError("impact derivation enabled must be a boolean")
+        if "::" in result.rule_id:
+            raise ValueError("impact rule_id contains an ambiguous separator")
         return result
 
 
@@ -694,6 +750,8 @@ class ProbeRCAConfig:
     solver: SolverConfig
     confidence: ConfidenceConfig
     shock_templates: dict[str, ShockTemplateConfig]
+    impact_derivation_rules: list[ImpactDerivationRule] = field(default_factory=list)
+    rca_metric_families: list[str] = field(default_factory=lambda: sorted(NODE_METRIC_FAMILIES))
 
     @classmethod
     def from_dict(cls, payload: dict) -> "ProbeRCAConfig":
@@ -708,7 +766,16 @@ class ProbeRCAConfig:
             "confidence",
             "shock_templates",
         }
-        values = _strict_dict(payload, required, "ProbeRCAConfig")
+        optional = {"impact_derivation_rules", "rca_metric_families"}
+        if not isinstance(payload, dict):
+            raise TypeError("ProbeRCAConfig must be a dictionary")
+        unknown = sorted(set(payload) - required - optional)
+        missing = sorted(required - set(payload))
+        if unknown or missing:
+            raise ValueError(f"ProbeRCAConfig invalid fields; unknown={unknown}, missing={missing}")
+        values = dict(payload)
+        values.setdefault("impact_derivation_rules", [])
+        values.setdefault("rca_metric_families", sorted(NODE_METRIC_FAMILIES))
         _positive_int("window_sec", values["window_sec"])
         _positive_int("healthy_history_sec", values["healthy_history_sec"])
         templates_payload = values["shock_templates"]
@@ -723,6 +790,18 @@ class ProbeRCAConfig:
             templates[metric_name] = ShockTemplateConfig.from_dict(
                 template, f"shock_templates.{metric_name}"
             )
+        rules_payload = values["impact_derivation_rules"]
+        if not isinstance(rules_payload, list):
+            raise TypeError("impact_derivation_rules must be a list")
+        rules = [item if isinstance(item, ImpactDerivationRule) else ImpactDerivationRule.from_dict(item)
+                 for item in rules_payload]
+        if len({item.rule_id for item in rules}) != len(rules):
+            raise ValueError("impact_derivation_rules contains duplicate rule_id")
+        families = values["rca_metric_families"]
+        if not isinstance(families, list) or not families or any(item not in NODE_METRIC_FAMILIES for item in families):
+            raise ValueError("rca_metric_families must contain configured node metric families")
+        if len(families) != len(set(families)):
+            raise ValueError("rca_metric_families contains duplicates")
         return cls(
             window_sec=values["window_sec"],
             healthy_history_sec=values["healthy_history_sec"],
@@ -733,6 +812,8 @@ class ProbeRCAConfig:
             solver=SolverConfig.from_dict(values["solver"]),
             confidence=ConfidenceConfig.from_dict(values["confidence"]),
             shock_templates=templates,
+            impact_derivation_rules=rules,
+            rca_metric_families=list(families),
         )
 
     def to_dict(self) -> dict:
