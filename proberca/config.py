@@ -332,10 +332,31 @@ class SolverConfig:
     method: str
     max_iterations: int
     tolerance: float
+    objective_tolerance: float = 1e-8
+    gradient_mapping_tolerance: float = 1e-6
+    backtracking_factor: float = 2.0
+    max_backtracking_steps: int = 50
+    initial_lipschitz: float = 1.0
+    lipschitz_floor: float = 1e-12
+    monotone: bool = True
+    adaptive_restart: bool = True
+    minimum_iterations: int = 2
+    convergence_patience: int = 2
+    warm_start_enabled: bool = True
+    strict_convergence: bool = True
+    diagnostic_zero_tolerance: float = 1e-12
 
     @classmethod
     def from_dict(cls, payload: dict) -> "SolverConfig":
-        values = _strict_dict(payload, {"method", "max_iterations", "tolerance"}, "solver")
+        required = {"method", "max_iterations", "tolerance"}
+        allowed = set(cls.__dataclass_fields__)
+        if not isinstance(payload, dict):
+            raise TypeError("solver must be a mapping")
+        unknown = set(payload) - allowed
+        missing = required - set(payload)
+        if unknown or missing:
+            raise ValueError(f"solver fields mismatch; missing={sorted(missing)}, unknown={sorted(unknown)}")
+        values = dict(payload)
         result = cls(**values)
         if result.method != "fista":
             raise ValueError("solver.method must be 'fista'; fallback is not allowed")
@@ -344,6 +365,31 @@ class SolverConfig:
         if tolerance <= 0.0:
             raise ValueError("solver.tolerance must be positive")
         object.__setattr__(result, "tolerance", tolerance)
+        for name in (
+            "objective_tolerance", "gradient_mapping_tolerance", "backtracking_factor",
+            "initial_lipschitz", "lipschitz_floor",
+        ):
+            value = _finite(f"solver.{name}", getattr(result, name))
+            if value <= 0.0:
+                raise ValueError(f"solver.{name} must be positive")
+            object.__setattr__(result, name, value)
+        if result.backtracking_factor <= 1.0:
+            raise ValueError("solver.backtracking_factor must be greater than one")
+        for name in (
+            "max_backtracking_steps", "minimum_iterations", "convergence_patience",
+        ):
+            _positive_int(f"solver.{name}", getattr(result, name))
+        for name in ("monotone", "adaptive_restart", "warm_start_enabled", "strict_convergence"):
+            if type(getattr(result, name)) is not bool:
+                raise TypeError(f"solver.{name} must be boolean")
+        if not result.monotone or not result.adaptive_restart:
+            raise ValueError("solver monotone and adaptive_restart must both be true")
+        zero_tolerance = _finite(
+            "solver.diagnostic_zero_tolerance", result.diagnostic_zero_tolerance
+        )
+        if zero_tolerance < 0.0:
+            raise ValueError("solver.diagnostic_zero_tolerance must be non-negative")
+        object.__setattr__(result, "diagnostic_zero_tolerance", zero_tolerance)
         return result
 
 

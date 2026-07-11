@@ -70,6 +70,9 @@ class WeightedJointInversionProblem:
     timestamp_ns: int
     analysis_cutoff_ns: int
     signal_kind: str
+    node_variable_ids: list[str]
+    propagation_variable_ids: list[str]
+    shock_variable_ids: list[str]
     joint_residual: np.ndarray
     U: sparse.spmatrix
     X_prop: sparse.spmatrix
@@ -113,6 +116,14 @@ class WeightedJointInversionProblem:
             raise WeightedProblemDimensionError("formal weighted problem must be signed_z and solver eligible")
         n_rows = self.joint_residual.size
         n_u, n_delta, n_xi = self.U.shape[1], self.X_prop.shape[1], self.X_shock.shape[1]
+        for ids, size, name in (
+            (self.node_variable_ids, n_u, "node"),
+            (self.propagation_variable_ids, n_delta, "propagation"),
+            (self.shock_variable_ids, n_xi, "shock"),
+        ):
+            if len(ids) != size or len(ids) != len(set(ids)) \
+                    or any(not isinstance(item, str) or not item for item in ids):
+                raise WeightedProblemDimensionError(f"{name} variable IDs are inconsistent")
         arrays = (
             (self.node_evidence_h, n_u), (self.propagation_evidence_h, n_delta),
             (self.shock_evidence_h, n_xi), (self.node_incoming_prop_h, n_u),
@@ -183,6 +194,31 @@ def _problem_fingerprint(joint_system, W, node_h, propagation_h, shock_h, penalt
     })
 
 
+def validate_problem_fingerprint(problem: "WeightedJointInversionProblem") -> None:
+    """Recompute the persisted P7 fingerprint without changing any P7 numeric input."""
+    if not isinstance(problem, WeightedJointInversionProblem):
+        raise TypeError("problem must be WeightedJointInversionProblem")
+    computed = _fingerprint({
+        "p6_structure_fingerprint": problem.p6_structure_fingerprint,
+        "W": _sparse_payload(problem.W),
+        "node_h": problem.node_evidence_h.tolist(),
+        "propagation_h": problem.propagation_evidence_h.tolist(),
+        "shock_h": problem.shock_evidence_h.tolist(),
+        "lambda_u_effective": problem.lambda_u_effective.tolist(),
+        "lambda_delta_effective": problem.lambda_delta_effective.tolist(),
+        "lambda_xi_effective": problem.lambda_xi_effective.tolist(),
+        "node_groups": _group_payload(problem.node_groups),
+        "propagation_groups": _group_payload(problem.propagation_groups),
+        "shock_groups": _group_payload(problem.shock_groups),
+        "group_penalties": [problem.lambda_node_group, problem.lambda_propagation_group,
+                            problem.lambda_shock_group],
+        "config_fingerprint": problem.config_fingerprint,
+        "evidence_fingerprint": problem.evidence_fingerprint,
+    })
+    if computed != problem.problem_fingerprint:
+        raise WeightedProblemFingerprintError("weighted problem fingerprint mismatch")
+
+
 def build_weighted_joint_problem(joint_system, evidence_observations, topology_store,
                                  metric_model_training_timestamps, config,
                                  analysis_cutoff_ns):
@@ -231,7 +267,11 @@ def build_weighted_joint_problem(joint_system, evidence_observations, topology_s
         "1.0", "weighted_joint_inversion_problem", problem_id, joint_system.system_id,
         joint_system.alert_id, joint_system.candidate_id, joint_system.topology_snapshot_id,
         joint_system.metric_model_snapshot_id, joint_system.timestamp_ns, analysis_cutoff_ns,
-        joint_system.signal_kind, joint_system.joint_residual, joint_system.U,
+        joint_system.signal_kind,
+        [item.node_id for item in joint_system.node_variable_refs],
+        [item.propagation_id for item in joint_system.propagation_variable_refs],
+        [item.shock_id for item in joint_system.shock_variable_refs],
+        joint_system.joint_residual, joint_system.U,
         joint_system.X_prop, joint_system.X_shock, quality.W,
         evidence.node_h, propagation.propagation_h, evidence.shock_h,
         penalties.node_incoming_prop_h, penalties.node_projected_shock_h,
@@ -262,6 +302,9 @@ def save_weighted_joint_problem(path, problem):
         "metric_model_snapshot_id": problem.metric_model_snapshot_id,
         "timestamp_ns": problem.timestamp_ns, "analysis_cutoff_ns": problem.analysis_cutoff_ns,
         "signal_kind": problem.signal_kind,
+        "node_variable_ids": problem.node_variable_ids,
+        "propagation_variable_ids": problem.propagation_variable_ids,
+        "shock_variable_ids": problem.shock_variable_ids,
         "node_groups": _group_payload(problem.node_groups),
         "propagation_groups": _group_payload(problem.propagation_groups),
         "shock_groups": _group_payload(problem.shock_groups),
@@ -329,6 +372,8 @@ def load_weighted_joint_problem(path, joint_system, *, expected_config_fingerpri
             metadata["joint_system_id"], metadata["alert_id"], metadata["candidate_id"],
             metadata["topology_snapshot_id"], metadata["metric_model_snapshot_id"],
             metadata["timestamp_ns"], metadata["analysis_cutoff_ns"], metadata["signal_kind"],
+            metadata["node_variable_ids"], metadata["propagation_variable_ids"],
+            metadata["shock_variable_ids"],
             arrays["joint_residual"], joint_system.U, joint_system.X_prop,
             joint_system.X_shock, W, arrays["node_evidence_h"],
             arrays["propagation_evidence_h"], arrays["shock_evidence_h"],
