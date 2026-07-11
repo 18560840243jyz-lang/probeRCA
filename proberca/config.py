@@ -387,6 +387,121 @@ class ShockTemplateConfig:
         return result
 
 
+@dataclass(frozen=True)
+class ShockProjection:
+    endpoint_role: str
+    metric_family: str
+    metric_names: list[str] | None
+    raw_weight: float
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "ShockProjection":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "ShockProjection")
+        result = cls(**values)
+        if result.endpoint_role not in {"source", "target"}:
+            raise ValueError("shock projection endpoint_role must be source or target")
+        if result.metric_family not in NODE_METRIC_FAMILIES:
+            raise ValueError("shock projection metric_family is invalid")
+        if result.metric_names is not None:
+            if not isinstance(result.metric_names, list) or not result.metric_names or any(
+                not isinstance(item, str) or not item.strip() for item in result.metric_names
+            ):
+                raise ValueError("shock projection metric_names must be null or exact names")
+            if result.metric_names != sorted(set(result.metric_names)):
+                raise ValueError("shock projection metric_names must be sorted and unique")
+        weight = _finite("shock projection raw_weight", result.raw_weight)
+        if weight <= 0:
+            raise ValueError("shock projection raw_weight must be positive")
+        object.__setattr__(result, "raw_weight", weight)
+        return result
+
+
+@dataclass(frozen=True)
+class ShockProjectionTemplate:
+    template_id: str
+    enabled: bool
+    edge_metric_name: str
+    protocol: str | None
+    projections: list[ShockProjection]
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "ShockProjectionTemplate":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "ShockProjectionTemplate")
+        for name in ("template_id", "edge_metric_name"):
+            if not isinstance(values[name], str) or not values[name].strip():
+                raise ValueError(f"shock projection template {name} must be non-empty")
+        if any(token in values["edge_metric_name"] for token in ("::", "->")):
+            raise ValueError("shock projection template requires an exact metric name, not an ID")
+        if values["protocol"] is not None and (
+            not isinstance(values["protocol"], str) or not values["protocol"].strip()
+        ):
+            raise ValueError("shock projection protocol must be null or non-empty")
+        if not isinstance(values["enabled"], bool):
+            raise TypeError("shock projection enabled must be boolean")
+        raw = values["projections"]
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("shock projection template requires projections")
+        values["projections"] = [
+            item if isinstance(item, ShockProjection) else ShockProjection.from_dict(item)
+            for item in raw
+        ]
+        return cls(**values)
+
+
+@dataclass(frozen=True)
+class ResidualConfig:
+    signal_kind: str = "signed_z"
+    require_hard_alert: bool = True
+    require_rca_eligible: bool = True
+    require_global_metric_model_ready: bool = True
+    require_complete_node_rows: bool = True
+    require_complete_edge_rows: bool = True
+    max_joint_rows: int = 10000
+    max_propagation_variables: int = 50000
+    max_shock_variables: int = 10000
+    fail_on_overflow: bool = True
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "ResidualConfig":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "residual")
+        result = cls(**values)
+        if result.signal_kind != "signed_z":
+            raise ValueError("residual.signal_kind must be signed_z")
+        for name in (
+            "require_hard_alert", "require_rca_eligible",
+            "require_global_metric_model_ready", "require_complete_node_rows",
+            "require_complete_edge_rows", "fail_on_overflow",
+        ):
+            if not isinstance(getattr(result, name), bool):
+                raise TypeError(f"residual.{name} must be boolean")
+        for name in ("max_joint_rows", "max_propagation_variables", "max_shock_variables"):
+            _positive_int(f"residual.{name}", getattr(result, name))
+        if not result.fail_on_overflow:
+            raise ValueError("residual.fail_on_overflow must be true")
+        return result
+
+
+@dataclass(frozen=True)
+class PropagationDictionaryConfig:
+    allowed_relation_types: list[str] = field(
+        default_factory=lambda: ["same_service", "impact", "host", "resource"]
+    )
+    exclude_self_history: bool = True
+    exclude_call: bool = True
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "PropagationDictionaryConfig":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "propagation_dictionary")
+        result = cls(**values)
+        expected = {"same_service", "impact", "host", "resource"}
+        if set(result.allowed_relation_types) != expected or len(result.allowed_relation_types) != len(expected):
+            raise ValueError("propagation dictionary relation types must be the canonical four")
+        if not result.exclude_self_history or not result.exclude_call:
+            raise ValueError("propagation dictionary must exclude self_history and call")
+        object.__setattr__(result, "allowed_relation_types", sorted(result.allowed_relation_types))
+        return result
+
+
 AGGREGATION_METHODS = frozenset(
     {
         "sum",
@@ -880,6 +995,9 @@ class ProbeRCAConfig:
     shock_templates: dict[str, ShockTemplateConfig]
     impact_derivation_rules: list[ImpactDerivationRule] = field(default_factory=list)
     rca_metric_families: list[str] = field(default_factory=lambda: sorted(NODE_METRIC_FAMILIES))
+    residual: ResidualConfig = field(default_factory=ResidualConfig)
+    propagation_dictionary: PropagationDictionaryConfig = field(default_factory=PropagationDictionaryConfig)
+    shock_projection_templates: list[ShockProjectionTemplate] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, payload: dict) -> "ProbeRCAConfig":
@@ -894,7 +1012,10 @@ class ProbeRCAConfig:
             "confidence",
             "shock_templates",
         }
-        optional = {"impact_derivation_rules", "rca_metric_families"}
+        optional = {
+            "impact_derivation_rules", "rca_metric_families", "residual",
+            "propagation_dictionary", "shock_projection_templates",
+        }
         if not isinstance(payload, dict):
             raise TypeError("ProbeRCAConfig must be a dictionary")
         unknown = sorted(set(payload) - required - optional)
@@ -904,6 +1025,9 @@ class ProbeRCAConfig:
         values = dict(payload)
         values.setdefault("impact_derivation_rules", [])
         values.setdefault("rca_metric_families", sorted(NODE_METRIC_FAMILIES))
+        values.setdefault("residual", asdict(ResidualConfig()))
+        values.setdefault("propagation_dictionary", asdict(PropagationDictionaryConfig()))
+        values.setdefault("shock_projection_templates", [])
         _positive_int("window_sec", values["window_sec"])
         _positive_int("healthy_history_sec", values["healthy_history_sec"])
         templates_payload = values["shock_templates"]
@@ -930,6 +1054,15 @@ class ProbeRCAConfig:
             raise ValueError("rca_metric_families must contain configured node metric families")
         if len(families) != len(set(families)):
             raise ValueError("rca_metric_families contains duplicates")
+        projection_payload = values["shock_projection_templates"]
+        if not isinstance(projection_payload, list):
+            raise TypeError("shock_projection_templates must be a list")
+        projection_templates = [
+            item if isinstance(item, ShockProjectionTemplate) else ShockProjectionTemplate.from_dict(item)
+            for item in projection_payload
+        ]
+        if len({item.template_id for item in projection_templates}) != len(projection_templates):
+            raise ValueError("shock_projection_templates contains duplicate template_id")
         return cls(
             window_sec=values["window_sec"],
             healthy_history_sec=values["healthy_history_sec"],
@@ -942,6 +1075,14 @@ class ProbeRCAConfig:
             shock_templates=templates,
             impact_derivation_rules=rules,
             rca_metric_families=list(families),
+            residual=(values["residual"] if isinstance(values["residual"], ResidualConfig)
+                      else ResidualConfig.from_dict(values["residual"])),
+            propagation_dictionary=(
+                values["propagation_dictionary"]
+                if isinstance(values["propagation_dictionary"], PropagationDictionaryConfig)
+                else PropagationDictionaryConfig.from_dict(values["propagation_dictionary"])
+            ),
+            shock_projection_templates=projection_templates,
         )
 
     def to_dict(self) -> dict:

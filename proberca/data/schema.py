@@ -1094,6 +1094,7 @@ class NodeAnomalyRecord(StrictRecord):
     source_metric_record_id: str
     baseline_config_fingerprint: str
     signal_spec_id: str
+    signal_kind: str = "signed_z"
     record_type: str = field(default="node_anomaly", init=False)
 
     def __post_init__(self) -> None:
@@ -1122,6 +1123,75 @@ class NodeAnomalyRecord(StrictRecord):
         ))
         if self.source_alert_state not in {"healthy", "soft", "hard", "recovery", "edge_anomaly"}:
             raise ValueError("invalid source_alert_state")
+        if self.signal_kind != "signed_z":
+            raise ValueError("node anomaly signal_kind must be signed_z")
+        if len(self.baseline_config_fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in self.baseline_config_fingerprint
+        ):
+            raise ValueError("baseline_config_fingerprint must be lowercase SHA-256")
+
+
+@dataclass(frozen=True)
+class EdgeAnomalyRecord(StrictRecord):
+    schema_version: str
+    timestamp_ns: int
+    window_start_ns: int
+    window_end_ns: int
+    cluster_id: str
+    namespace: str
+    src_service: str
+    dst_service: str
+    protocol: str
+    edge_metric_id: str
+    shock_id: str | None
+    metric_name: str
+    signed_z: float
+    anomaly_score: float
+    baseline_ready: bool
+    observation_quality: float
+    source_metric_record_id: str
+    baseline_config_fingerprint: str
+    signal_spec_id: str
+    source_alert_state: str
+    signal_kind: str = "signed_z"
+    record_type: str = field(default="edge_anomaly", init=False)
+
+    def __post_init__(self) -> None:
+        _schema_version(self.schema_version)
+        _fixed_record_type(self.record_type, "edge_anomaly")
+        for name in ("timestamp_ns", "window_start_ns", "window_end_ns"):
+            _integer(name, getattr(self, name))
+        if not self.window_start_ns < self.window_end_ns or self.timestamp_ns != self.window_end_ns:
+            raise ValueError("edge anomaly timestamp must equal a non-empty window end")
+        for name in ("cluster_id", "namespace", "src_service", "dst_service", "protocol"):
+            _identity_component(name, getattr(self, name))
+        for name in ("metric_name", "source_metric_record_id", "signal_spec_id"):
+            _required_string(name, getattr(self, name))
+        expected = (
+            f"{self.cluster_id}::{self.namespace}::{self.src_service}->{self.dst_service}::"
+            f"{self.protocol}::{self.metric_name}"
+        )
+        if self.edge_metric_id != expected or self.source_metric_record_id != expected:
+            raise ValueError("edge anomaly stable identity conflicts with its components")
+        expected_shock = (
+            f"{self.cluster_id}::{self.namespace}::{self.src_service}->{self.dst_service}::"
+            f"{self.protocol}::shock::{self.metric_name}"
+        )
+        if self.shock_id is not None and self.shock_id != expected_shock:
+            raise ValueError("edge anomaly shock_id conflicts with its components")
+        object.__setattr__(self, "signed_z", _finite_number("signed_z", self.signed_z))
+        object.__setattr__(self, "anomaly_score", _finite_number("anomaly_score", self.anomaly_score))
+        if self.anomaly_score < 0:
+            raise ValueError("anomaly_score must be non-negative")
+        if not isinstance(self.baseline_ready, bool):
+            raise TypeError("baseline_ready must be boolean")
+        object.__setattr__(self, "observation_quality", _probability(
+            "observation_quality", self.observation_quality
+        ))
+        if self.source_alert_state not in {"healthy", "soft", "hard", "recovery", "edge_anomaly"}:
+            raise ValueError("invalid source_alert_state")
+        if self.signal_kind != "signed_z":
+            raise ValueError("edge anomaly signal_kind must be signed_z")
         if len(self.baseline_config_fingerprint) != 64 or any(
             character not in "0123456789abcdef" for character in self.baseline_config_fingerprint
         ):
@@ -1144,6 +1214,7 @@ STRICT_RECORD_TYPES: dict[str, type[StrictRecord]] = {
     "candidate_subgraph": CandidateSubgraph,
     "service_state": ServiceStateRecord,
     "node_anomaly": NodeAnomalyRecord,
+    "edge_anomaly": EdgeAnomalyRecord,
 }
 
 
