@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass, dataclass
-from typing import Any
+import ipaddress
+import math
+from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
+from typing import Any, ClassVar
+
+PROBERCA_SCHEMA_VERSION = "1.0"
 
 
 @dataclass
@@ -68,8 +72,850 @@ class RCAResult:
 def to_dict(record: Any) -> dict:
     """Convert a dataclass record or dictionary to a plain dictionary."""
 
+    if isinstance(record, StrictRecord):
+        return record.to_dict()
     if is_dataclass(record):
         return asdict(record)
     if isinstance(record, dict):
         return dict(record)
     raise TypeError(f"Unsupported record type for to_dict: {type(record).__name__}")
+
+
+NODE_METRIC_FAMILIES = frozenset({"request", "cpu", "memory", "io", "net_local", "lock"})
+BURST_EVENT_TYPES = frozenset(
+    {
+        "sched.runqueue_wait",
+        "sched.offcpu",
+        "block.latency",
+        "fs.read_latency",
+        "fs.write_latency",
+        "futex.wait",
+        "tcp.retransmit",
+        "tcp.rto",
+        "tcp.rtt",
+        "tcp.rst",
+        "tcp.connect_fail",
+        "dns.latency",
+        "dns.timeout",
+        "process.exec",
+        "process.exit",
+        "sidecar.queue",
+        "proxy.upstream_latency",
+    }
+)
+ALERT_STATES = frozenset({"healthy", "soft", "hard", "recovery", "edge_anomaly"})
+EDGE_SUBTYPES = frozenset({"propagated-edge", "exogenous-edge-shock"})
+METRIC_KINDS = frozenset({"gauge", "monotonic_counter", "delta_counter", "histogram_bucket", "quantile"})
+NODE_METRIC_SCOPES = frozenset({"pod", "service", "node"})
+EDGE_METRIC_SCOPES = frozenset({"flow", "pod_pair", "service_pair"})
+
+
+def _required_string(name: str, value: Any) -> None:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    if not value.strip():
+        raise ValueError(f"{name} must not be empty")
+
+
+def _optional_string(name: str, value: Any) -> None:
+    if value is not None:
+        _required_string(name, value)
+
+
+def _identity_component(name: str, value: str) -> None:
+    _required_string(name, value)
+    if "::" in value or "->" in value:
+        raise ValueError(f"{name} contains an ambiguous stable-ID separator")
+
+
+def _integer(name: str, value: Any, minimum: int = 0) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+
+
+def _finite_number(name: str, value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be numeric")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def _probability(name: str, value: Any) -> float:
+    result = _finite_number(name, value)
+    if not 0.0 <= result <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1]")
+    return result
+
+
+def _fixed_record_type(actual: Any, expected: str) -> None:
+    if actual != expected:
+        raise ValueError(f"record_type must be fixed as {expected!r}")
+
+
+def _metric_distribution_semantics(
+    metric_kind: Any,
+    histogram_upper_bound: Any,
+    histogram_is_inf_bucket: Any,
+    histogram_is_cumulative: Any,
+    quantile: Any,
+) -> tuple[float | None, float | None]:
+    if metric_kind not in METRIC_KINDS:
+        raise ValueError(f"invalid metric_kind {metric_kind!r}")
+    bound = None
+    quantile_value = None
+    if histogram_upper_bound is not None:
+        bound = _finite_number("histogram_upper_bound", histogram_upper_bound)
+    if quantile is not None:
+        quantile_value = _finite_number("quantile", quantile)
+
+    if not isinstance(histogram_is_inf_bucket, bool):
+        raise TypeError("histogram_is_inf_bucket must be a boolean")
+    if metric_kind == "histogram_bucket":
+        if histogram_is_inf_bucket and bound is not None:
+            raise ValueError("+Inf histogram buckets must not have a finite upper bound")
+        if not histogram_is_inf_bucket and bound is None:
+            raise ValueError("finite histogram buckets require histogram_upper_bound")
+        if histogram_is_cumulative is None:
+            raise ValueError("histogram_is_cumulative is required for histogram_bucket")
+        if not isinstance(histogram_is_cumulative, bool):
+            raise TypeError("histogram_is_cumulative must be a boolean for histogram_bucket")
+        if quantile is not None:
+            raise ValueError("quantile must be None for histogram_bucket")
+    elif metric_kind == "quantile":
+        if quantile_value is None or not 0.0 < quantile_value < 1.0:
+            raise ValueError("quantile must be in (0, 1) for quantile metrics")
+        if histogram_upper_bound is not None or histogram_is_inf_bucket or histogram_is_cumulative is not None:
+            raise ValueError("histogram fields must be None for quantile metrics")
+    elif histogram_is_inf_bucket or any(
+        value is not None for value in (histogram_upper_bound, histogram_is_cumulative, quantile)
+    ):
+        raise ValueError("distribution fields must be None for scalar metric kinds")
+    return bound, quantile_value
+
+
+def _string_list(name: str, value: Any) -> None:
+    if not isinstance(value, list):
+        raise TypeError(f"{name} must be a list")
+    for item in value:
+        _required_string(f"{name} item", item)
+
+
+def _score_map(name: str, value: Any) -> None:
+    if not isinstance(value, dict):
+        raise TypeError(f"{name} must be a dictionary")
+    for key, score in value.items():
+        _required_string(f"{name} key", key)
+        _probability(f"{name}[{key!r}]", score)
+
+
+def _json_value(name: str, value: Any) -> None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        _finite_number(name, value)
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _json_value(f"{name}[{index}]", item)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _required_string(f"{name} key", key)
+            _json_value(f"{name}.{key}", item)
+        return
+    raise TypeError(f"{name} contains a non-JSON value: {type(value).__name__}")
+
+
+class StrictRecord:
+    """Strict dataclass parsing shared by versioned ProbeRCA records."""
+
+    _nested_fields: ClassVar[dict[str, type["StrictRecord"]]] = {}
+    _nested_list_fields: ClassVar[dict[str, type["StrictRecord"]]] = {}
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]):
+        if not isinstance(payload, dict):
+            raise TypeError(f"{cls.__name__} payload must be a dictionary")
+        dataclass_fields = fields(cls)
+        expected = {dataclass_field.name for dataclass_field in dataclass_fields}
+        actual = set(payload)
+        unknown = sorted(actual - expected)
+        missing = sorted(expected - actual)
+        if unknown:
+            raise ValueError(f"{cls.__name__} unknown fields: {unknown}")
+        if missing:
+            raise ValueError(f"{cls.__name__} missing fields: {missing}")
+        values = dict(payload)
+        for dataclass_field in dataclass_fields:
+            if not dataclass_field.init:
+                if dataclass_field.default is MISSING:
+                    raise TypeError(f"{dataclass_field.name} has no fixed default")
+                if values[dataclass_field.name] != dataclass_field.default:
+                    raise ValueError(
+                        f"{cls.__name__} {dataclass_field.name} conflicts with its fixed value"
+                    )
+        for name, nested_type in cls._nested_fields.items():
+            value = values[name]
+            if isinstance(value, dict):
+                values[name] = nested_type.from_dict(value)
+            elif not isinstance(value, nested_type):
+                raise TypeError(f"{name} must be {nested_type.__name__}")
+        for name, nested_type in cls._nested_list_fields.items():
+            value = values[name]
+            if not isinstance(value, list):
+                raise TypeError(f"{name} must be a list")
+            values[name] = [
+                nested_type.from_dict(item) if isinstance(item, dict) else item for item in value
+            ]
+            if any(not isinstance(item, nested_type) for item in values[name]):
+                raise TypeError(f"{name} items must be {nested_type.__name__}")
+        return cls(
+            **{dataclass_field.name: values[dataclass_field.name]
+               for dataclass_field in dataclass_fields if dataclass_field.init}
+        )
+
+    def validate(self) -> None:
+        self.__post_init__()
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return asdict(self)
+
+
+def _schema_version(value: Any) -> None:
+    _required_string("schema_version", value)
+    if value != PROBERCA_SCHEMA_VERSION:
+        raise ValueError(
+            f"incompatible schema_version {value!r}; expected {PROBERCA_SCHEMA_VERSION!r}"
+        )
+
+
+@dataclass(frozen=True)
+class NodeMetricRecord(StrictRecord):
+    schema_version: str
+    timestamp_ns: int
+    window_sec: int
+    cluster_id: str
+    node_name: str | None
+    namespace: str
+    service_name: str
+    pod_uid: str | None
+    container_id: str | None
+    metric_family: str
+    metric_name: str
+    value: float
+    unit: str
+    sample_count: int
+    coverage: float
+    event_loss_rate: float
+    source: str
+    metric_kind: str
+    scope: str
+    histogram_upper_bound: float | None
+    histogram_is_inf_bucket: bool
+    histogram_is_cumulative: bool | None
+    quantile: float | None
+    record_type: str = field(default="node_metric", init=False)
+
+    def __post_init__(self) -> None:
+        _fixed_record_type(self.record_type, "node_metric")
+        _schema_version(self.schema_version)
+        _integer("timestamp_ns", self.timestamp_ns)
+        _integer("window_sec", self.window_sec, 1)
+        _identity_component("cluster_id", self.cluster_id)
+        _optional_string("node_name", self.node_name)
+        _identity_component("namespace", self.namespace)
+        _identity_component("service_name", self.service_name)
+        _optional_string("pod_uid", self.pod_uid)
+        _optional_string("container_id", self.container_id)
+        if self.metric_family not in NODE_METRIC_FAMILIES:
+            raise ValueError(f"invalid metric_family {self.metric_family!r}")
+        _identity_component("metric_name", self.metric_name)
+        object.__setattr__(self, "value", _finite_number("value", self.value))
+        _required_string("unit", self.unit)
+        _integer("sample_count", self.sample_count)
+        object.__setattr__(self, "coverage", _probability("coverage", self.coverage))
+        object.__setattr__(
+            self, "event_loss_rate", _probability("event_loss_rate", self.event_loss_rate)
+        )
+        _required_string("source", self.source)
+        if self.scope not in NODE_METRIC_SCOPES:
+            raise ValueError(f"invalid node metric scope {self.scope!r}")
+        if self.scope == "pod" and self.pod_uid is None:
+            raise ValueError("pod_uid is required for pod-scoped node metrics")
+        if self.scope == "node" and self.node_name is None:
+            raise ValueError("node_name is required for node-scoped node metrics")
+        bound, quantile_value = _metric_distribution_semantics(
+            self.metric_kind,
+            self.histogram_upper_bound,
+            self.histogram_is_inf_bucket,
+            self.histogram_is_cumulative,
+            self.quantile,
+        )
+        if self.metric_kind == "histogram_bucket" and self.value < 0:
+            raise ValueError("histogram bucket value is a count and must be non-negative")
+        object.__setattr__(self, "histogram_upper_bound", bound)
+        object.__setattr__(self, "quantile", quantile_value)
+
+    @property
+    def stable_id(self) -> str:
+        return f"{self.cluster_id}::{self.namespace}::{self.service_name}::{self.metric_name}"
+
+    @property
+    def series_id(self) -> str:
+        if self.scope == "pod":
+            resource = f"pod={self.pod_uid};container={self.container_id or '-'}"
+        elif self.scope == "node":
+            resource = f"node={self.node_name}"
+        else:
+            resource = "service"
+        return f"{self.stable_id}::scope={self.scope}::{resource}"
+
+
+@dataclass(frozen=True)
+class EdgeMetricRecord(StrictRecord):
+    schema_version: str
+    timestamp_ns: int
+    window_sec: int
+    cluster_id: str
+    namespace: str
+    src_service: str
+    dst_service: str
+    src_pod_uid: str | None
+    dst_pod_uid: str | None
+    src_node: str | None
+    dst_node: str | None
+    protocol: str
+    metric_name: str
+    value: float
+    unit: str
+    sample_count: int
+    coverage: float
+    event_loss_rate: float
+    source: str
+    metric_kind: str
+    scope: str
+    histogram_upper_bound: float | None
+    histogram_is_inf_bucket: bool
+    histogram_is_cumulative: bool | None
+    quantile: float | None
+    record_type: str = field(default="edge_metric", init=False)
+
+    def __post_init__(self) -> None:
+        _fixed_record_type(self.record_type, "edge_metric")
+        _schema_version(self.schema_version)
+        _integer("timestamp_ns", self.timestamp_ns)
+        _integer("window_sec", self.window_sec, 1)
+        for name in ("cluster_id", "namespace", "src_service", "dst_service", "protocol", "metric_name"):
+            _identity_component(name, getattr(self, name))
+        for name in ("src_pod_uid", "dst_pod_uid", "src_node", "dst_node"):
+            _optional_string(name, getattr(self, name))
+        object.__setattr__(self, "value", _finite_number("value", self.value))
+        _required_string("unit", self.unit)
+        _integer("sample_count", self.sample_count)
+        object.__setattr__(self, "coverage", _probability("coverage", self.coverage))
+        object.__setattr__(
+            self, "event_loss_rate", _probability("event_loss_rate", self.event_loss_rate)
+        )
+        _required_string("source", self.source)
+        if self.scope not in EDGE_METRIC_SCOPES:
+            raise ValueError(f"invalid edge metric scope {self.scope!r}")
+        bound, quantile_value = _metric_distribution_semantics(
+            self.metric_kind,
+            self.histogram_upper_bound,
+            self.histogram_is_inf_bucket,
+            self.histogram_is_cumulative,
+            self.quantile,
+        )
+        if self.metric_kind == "histogram_bucket" and self.value < 0:
+            raise ValueError("histogram bucket value is a count and must be non-negative")
+        object.__setattr__(self, "histogram_upper_bound", bound)
+        object.__setattr__(self, "quantile", quantile_value)
+
+    @property
+    def stable_id(self) -> str:
+        return (
+            f"{self.cluster_id}::{self.namespace}::{self.src_service}->{self.dst_service}::"
+            f"{self.protocol}::{self.metric_name}"
+        )
+
+    @property
+    def stable_shock_id(self) -> str:
+        return (
+            f"{self.cluster_id}::{self.namespace}::{self.src_service}->{self.dst_service}::"
+            f"{self.protocol}::shock::{self.metric_name}"
+        )
+
+    @property
+    def series_id(self) -> str:
+        if self.scope in {"flow", "pod_pair"}:
+            resource = f"pods={self.src_pod_uid or '-'}->{self.dst_pod_uid or '-'}"
+        else:
+            resource = "service_pair"
+        return f"{self.stable_id}::scope={self.scope}::{resource}"
+
+
+@dataclass(frozen=True)
+class BurstEventRecord(StrictRecord):
+    schema_version: str
+    event_id: str
+    timestamp_ns: int
+    event_type: str
+    pid: int | None
+    tid: int | None
+    cgroup_id: int | None
+    container_id: str | None
+    pod_uid: str | None
+    service_name: str | None
+    node_name: str | None
+    src_service: str | None
+    dst_service: str | None
+    src_ip: str | None
+    dst_ip: str | None
+    src_port: int | None
+    dst_port: int | None
+    protocol: str | None
+    value: float
+    unit: str
+    probe_mode: str
+    burst_id: str | None
+    lost_events: int
+    record_type: str = field(default="burst_event", init=False)
+
+    def __post_init__(self) -> None:
+        _fixed_record_type(self.record_type, "burst_event")
+        _schema_version(self.schema_version)
+        _required_string("event_id", self.event_id)
+        _integer("timestamp_ns", self.timestamp_ns)
+        if self.event_type not in BURST_EVENT_TYPES:
+            raise ValueError(f"invalid event_type {self.event_type!r}")
+        for name in ("pid", "tid", "cgroup_id"):
+            value = getattr(self, name)
+            if value is not None:
+                _integer(name, value)
+        for name in (
+            "container_id",
+            "pod_uid",
+            "service_name",
+            "node_name",
+            "src_service",
+            "dst_service",
+            "protocol",
+        ):
+            _optional_string(name, getattr(self, name))
+        for name in ("src_ip", "dst_ip"):
+            value = getattr(self, name)
+            if value is not None:
+                _required_string(name, value)
+                try:
+                    ipaddress.ip_address(value)
+                except ValueError as exc:
+                    raise ValueError(f"{name} must be a valid IP address") from exc
+        for name in ("src_port", "dst_port"):
+            value = getattr(self, name)
+            if value is not None:
+                _integer(name, value, 1)
+                if value > 65535:
+                    raise ValueError(f"{name} must be <= 65535")
+        object.__setattr__(self, "value", _finite_number("value", self.value))
+        _required_string("unit", self.unit)
+        if self.probe_mode not in {"always_on", "burst"}:
+            raise ValueError(f"invalid probe_mode {self.probe_mode!r}")
+        _optional_string("burst_id", self.burst_id)
+        if self.probe_mode == "burst" and self.burst_id is None:
+            raise ValueError("burst_id is required in burst mode")
+        if self.probe_mode == "always_on" and self.burst_id is not None:
+            raise ValueError("burst_id must be None in always_on mode")
+        _integer("lost_events", self.lost_events)
+
+
+@dataclass(frozen=True)
+class TopologyEdge(StrictRecord):
+    src_service: str
+    dst_service: str
+    relation_type: str
+
+    def __post_init__(self) -> None:
+        _identity_component("src_service", self.src_service)
+        _identity_component("dst_service", self.dst_service)
+        if self.relation_type not in {"call", "impact", "host", "resource"}:
+            raise ValueError(f"invalid relation_type {self.relation_type!r}")
+
+
+@dataclass(frozen=True)
+class TopologySnapshot(StrictRecord):
+    schema_version: str
+    snapshot_id: str
+    valid_from_ns: int
+    valid_to_ns: int
+    cluster_id: str
+    services: list[str]
+    call_edges: list[TopologyEdge]
+    host_edges: list[TopologyEdge]
+    resource_edges: list[TopologyEdge]
+    record_type: str = field(default="topology_snapshot", init=False)
+
+    _nested_list_fields = {
+        "call_edges": TopologyEdge,
+        "host_edges": TopologyEdge,
+        "resource_edges": TopologyEdge,
+    }
+
+    def __post_init__(self) -> None:
+        _fixed_record_type(self.record_type, "topology_snapshot")
+        _schema_version(self.schema_version)
+        _required_string("snapshot_id", self.snapshot_id)
+        _integer("valid_from_ns", self.valid_from_ns)
+        _integer("valid_to_ns", self.valid_to_ns)
+        if self.valid_to_ns <= self.valid_from_ns:
+            raise ValueError("valid_to_ns must be greater than valid_from_ns")
+        _identity_component("cluster_id", self.cluster_id)
+        _string_list("services", self.services)
+        if len(self.services) != len(set(self.services)):
+            raise ValueError("services must not contain duplicates")
+        service_names = {service.rsplit("::", 1)[-1] for service in self.services}
+        if len(service_names) != len(self.services):
+            raise ValueError("services must have unique service names")
+        for name in ("call_edges", "host_edges", "resource_edges"):
+            edges = getattr(self, name)
+            if not isinstance(edges, list) or any(not isinstance(edge, TopologyEdge) for edge in edges):
+                raise TypeError(f"{name} must be a list of TopologyEdge records")
+        if any(edge.relation_type not in {"call", "impact"} for edge in self.call_edges):
+            raise ValueError("call_edges may only contain call or impact relations")
+        if any(edge.relation_type != "host" for edge in self.host_edges):
+            raise ValueError("host_edges may only contain host relations")
+        if any(edge.relation_type != "resource" for edge in self.resource_edges):
+            raise ValueError("resource_edges may only contain resource relations")
+        all_edges = [*self.call_edges, *self.host_edges, *self.resource_edges]
+        identities = [(edge.src_service, edge.dst_service, edge.relation_type) for edge in all_edges]
+        if len(identities) != len(set(identities)):
+            raise ValueError("topology edges must not contain duplicates")
+        for edge in all_edges:
+            if edge.src_service not in service_names or edge.dst_service not in service_names:
+                raise ValueError("topology edge endpoint is not present in services")
+            if edge.src_service == edge.dst_service:
+                raise ValueError("topology self-loops are not allowed by this contract")
+
+
+@dataclass(frozen=True)
+class AlertEvent(StrictRecord):
+    schema_version: str
+    alert_id: str
+    timestamp_ns: int
+    state: str
+    trigger_services: list[str]
+    trigger_edges: list[str]
+    service_scores: dict[str, float]
+    edge_scores: dict[str, float]
+    reason: str
+    frozen_baseline: bool
+    frozen_service_model: bool
+    frozen_metric_model: bool
+    record_type: str = field(default="alert_event", init=False)
+
+    def __post_init__(self) -> None:
+        _fixed_record_type(self.record_type, "alert_event")
+        _schema_version(self.schema_version)
+        _required_string("alert_id", self.alert_id)
+        _integer("timestamp_ns", self.timestamp_ns)
+        if self.state not in ALERT_STATES:
+            raise ValueError(f"invalid alert state {self.state!r}")
+        _string_list("trigger_services", self.trigger_services)
+        _string_list("trigger_edges", self.trigger_edges)
+        _score_map("service_scores", self.service_scores)
+        _score_map("edge_scores", self.edge_scores)
+        _required_string("reason", self.reason)
+        for name in ("frozen_baseline", "frozen_service_model", "frozen_metric_model"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a boolean")
+
+
+@dataclass(frozen=True)
+class IncidentLabel(StrictRecord):
+    """Offline-only experiment truth. Online inference must not import this type."""
+
+    schema_version: str
+    incident_id: str
+    start_ns: int
+    end_ns: int
+    fault_mode: str
+    edge_subtype: str | None
+    root_service: str | None
+    root_metric: str | None
+    root_edge: str | None
+    injection_method: str
+    seed: int
+    record_type: str = field(default="incident_label", init=False)
+
+    def __post_init__(self) -> None:
+        _fixed_record_type(self.record_type, "incident_label")
+        _schema_version(self.schema_version)
+        _required_string("incident_id", self.incident_id)
+        _integer("start_ns", self.start_ns)
+        _integer("end_ns", self.end_ns)
+        if self.end_ns <= self.start_ns:
+            raise ValueError("end_ns must be greater than start_ns")
+        if self.fault_mode not in {"self", "edge"}:
+            raise ValueError(f"invalid fault_mode {self.fault_mode!r}")
+        _optional_string("edge_subtype", self.edge_subtype)
+        _optional_string("root_service", self.root_service)
+        _optional_string("root_metric", self.root_metric)
+        _optional_string("root_edge", self.root_edge)
+        if self.fault_mode == "self" and self.edge_subtype is not None:
+            raise ValueError("self incidents cannot have edge_subtype")
+        if self.fault_mode == "edge" and self.edge_subtype not in EDGE_SUBTYPES:
+            raise ValueError("edge incidents require a valid edge_subtype")
+        if self.fault_mode == "edge" and self.root_edge is None:
+            raise ValueError("edge incidents require root_edge")
+        _required_string("injection_method", self.injection_method)
+        _integer("seed", self.seed)
+
+
+@dataclass(frozen=True)
+class RootCause(StrictRecord):
+    kind: str
+    service_name: str | None
+    metric_name: str | None
+    edge_id: str | None
+    fault_mode: str
+    edge_subtype: str | None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"node", "edge", "ambiguous"}:
+            raise ValueError(f"invalid primary root kind {self.kind!r}")
+        for name in ("service_name", "metric_name", "edge_id", "edge_subtype"):
+            _optional_string(name, getattr(self, name))
+        if self.kind == "node":
+            if self.service_name is None or self.metric_name is None or self.edge_id is not None:
+                raise ValueError("node roots require service_name and metric_name only")
+            if self.fault_mode != "self" or self.edge_subtype is not None:
+                raise ValueError("node roots must use self fault mode")
+        elif self.kind == "edge":
+            if self.edge_id is None or self.service_name is not None or self.metric_name is not None:
+                raise ValueError("edge roots require edge_id only")
+            if self.edge_subtype not in EDGE_SUBTYPES or self.fault_mode != self.edge_subtype:
+                raise ValueError("edge root fault_mode and edge_subtype must match")
+        else:
+            if any(value is not None for value in (self.service_name, self.metric_name, self.edge_id, self.edge_subtype)):
+                raise ValueError("ambiguous roots cannot identify a node or edge")
+            if self.fault_mode != "ambiguous":
+                raise ValueError("ambiguous roots must use ambiguous fault mode")
+
+    @property
+    def object_type(self) -> str:
+        return self.kind
+
+
+def _validate_ranked_candidate(candidate: dict[str, Any]) -> None:
+    required = {"object_type", "node_id", "edge_id", "root_metric", "edge_subtype", "score", "role"}
+    if set(candidate) != required:
+        raise ValueError("ranked candidate fields are invalid")
+    object_type = candidate["object_type"]
+    if object_type not in {"node", "edge", "ambiguous"}:
+        raise ValueError("ranked candidate object_type is invalid")
+    for name in ("node_id", "edge_id", "root_metric", "edge_subtype"):
+        _optional_string(f"ranked_candidate.{name}", candidate[name])
+    _probability("ranked_candidate.score", candidate["score"])
+    if candidate["role"] != "root":
+        raise ValueError("propagated observations belong in symptoms, not ranked_candidates")
+    if object_type == "node":
+        if candidate["node_id"] is None or candidate["root_metric"] is None:
+            raise ValueError("node candidates require node_id and root_metric")
+        if candidate["edge_id"] is not None or candidate["edge_subtype"] is not None:
+            raise ValueError("node candidates cannot contain edge fields")
+    elif object_type == "edge":
+        if candidate["edge_id"] is None or candidate["edge_subtype"] not in EDGE_SUBTYPES:
+            raise ValueError("edge candidates require edge_id and edge_subtype")
+        if candidate["node_id"] is not None or candidate["root_metric"] is not None:
+            raise ValueError("edge candidates cannot contain node fields")
+    elif any(candidate[name] is not None for name in ("node_id", "edge_id", "root_metric", "edge_subtype")):
+        raise ValueError("ambiguous candidates cannot identify a node or edge")
+
+
+@dataclass(frozen=True)
+class RCAReport(StrictRecord):
+    schema_version: str
+    incident_id: str
+    generated_at_ns: int
+    alert: AlertEvent
+    primary_root: RootCause
+    ranked_candidates: list[dict[str, Any]]
+    symptoms: list[dict[str, Any]]
+    propagation_paths: list[dict[str, Any]]
+    evidence: list[dict[str, Any]]
+    quality: dict[str, Any]
+    runtime: dict[str, Any]
+    record_type: str = field(default="rca_report", init=False)
+
+    _nested_fields = {"alert": AlertEvent, "primary_root": RootCause}
+
+    def __post_init__(self) -> None:
+        _fixed_record_type(self.record_type, "rca_report")
+        _schema_version(self.schema_version)
+        _required_string("incident_id", self.incident_id)
+        _integer("generated_at_ns", self.generated_at_ns)
+        if not isinstance(self.alert, AlertEvent):
+            raise TypeError("alert must be an AlertEvent")
+        if not isinstance(self.primary_root, RootCause):
+            raise TypeError("primary_root must be a RootCause")
+        for name in ("ranked_candidates", "symptoms", "propagation_paths", "evidence"):
+            value = getattr(self, name)
+            if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+                raise TypeError(f"{name} must be a list of dictionaries")
+            _json_value(name, value)
+        for candidate in self.ranked_candidates:
+            _validate_ranked_candidate(candidate)
+        for name in ("quality", "runtime"):
+            value = getattr(self, name)
+            if not isinstance(value, dict):
+                raise TypeError(f"{name} must be a dictionary")
+            _json_value(name, value)
+        for name in ("coverage", "event_loss_rate"):
+            if name in self.quality:
+                _probability(f"quality.{name}", self.quality[name])
+
+
+STRICT_RECORD_TYPES: dict[str, type[StrictRecord]] = {
+    "node_metric": NodeMetricRecord,
+    "edge_metric": EdgeMetricRecord,
+    "burst_event": BurstEventRecord,
+    "topology_snapshot": TopologySnapshot,
+    "alert_event": AlertEvent,
+    "incident_label": IncidentLabel,
+    "rca_report": RCAReport,
+}
+
+
+@dataclass(frozen=True)
+class MetricSemantics:
+    metric_kind: str
+    scope: str
+    histogram_upper_bound: float | None
+    histogram_is_inf_bucket: bool
+    histogram_is_cumulative: bool | None
+    quantile: float | None
+
+    def __post_init__(self) -> None:
+        if self.scope not in NODE_METRIC_SCOPES:
+            raise ValueError("legacy node metric semantics require a valid node scope")
+        _metric_distribution_semantics(
+            self.metric_kind,
+            self.histogram_upper_bound,
+            self.histogram_is_inf_bucket,
+            self.histogram_is_cumulative,
+            self.quantile,
+        )
+
+
+@dataclass(frozen=True)
+class MetricRegistry:
+    entries: dict[str, MetricSemantics]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.entries, dict) or not self.entries:
+            raise ValueError("MetricRegistry entries must be a non-empty dictionary")
+        for metric_id, semantics in self.entries.items():
+            _required_string("metric registry ID", metric_id)
+            if not isinstance(semantics, MetricSemantics):
+                raise TypeError("MetricRegistry values must be MetricSemantics")
+
+    def require(self, metric_id: str) -> MetricSemantics:
+        try:
+            return self.entries[metric_id]
+        except KeyError as exc:
+            raise KeyError(f"metric semantics are not registered for {metric_id!r}") from exc
+
+
+def node_metric_from_legacy(
+    record: MetricRecord,
+    *,
+    schema_version: str,
+    window_sec: int,
+    cluster_id: str,
+    namespace: str,
+    metric_family: str,
+    unit: str,
+    sample_count: int,
+    coverage: float,
+    event_loss_rate: float,
+    metric_kind: str,
+    scope: str,
+    histogram_upper_bound: float | None,
+    histogram_is_inf_bucket: bool,
+    histogram_is_cumulative: bool | None,
+    quantile: float | None,
+) -> NodeMetricRecord:
+    """Explicitly convert the legacy P0 MetricRecord into the P1 node contract."""
+
+    if not isinstance(record, MetricRecord):
+        raise TypeError("record must be a MetricRecord")
+    timestamp = _finite_number("record.timestamp", record.timestamp)
+    value = _finite_number("record.value", record.value)
+    return NodeMetricRecord(
+        schema_version=schema_version,
+        timestamp_ns=int(timestamp * 1_000_000_000),
+        window_sec=window_sec,
+        cluster_id=cluster_id,
+        node_name=record.node,
+        namespace=namespace,
+        service_name=record.service,
+        pod_uid=record.instance,
+        container_id=None,
+        metric_family=metric_family,
+        metric_name=record.metric,
+        value=value,
+        unit=unit,
+        sample_count=sample_count,
+        coverage=coverage,
+        event_loss_rate=event_loss_rate,
+        source=record.source,
+        metric_kind=metric_kind,
+        scope=scope,
+        histogram_upper_bound=histogram_upper_bound,
+        histogram_is_inf_bucket=histogram_is_inf_bucket,
+        histogram_is_cumulative=histogram_is_cumulative,
+        quantile=quantile,
+    )
+
+
+def node_metric_from_registry(
+    record: MetricRecord,
+    *,
+    registry: MetricRegistry,
+    metric_id: str,
+    schema_version: str,
+    window_sec: int,
+    cluster_id: str,
+    namespace: str,
+    metric_family: str,
+    unit: str,
+    sample_count: int,
+    coverage: float,
+    event_loss_rate: float,
+) -> NodeMetricRecord:
+    """Convert legacy data using an exact registry entry, never name heuristics."""
+    if not isinstance(registry, MetricRegistry):
+        raise TypeError("registry must be a MetricRegistry")
+    semantics = registry.require(metric_id)
+    return node_metric_from_legacy(
+        record,
+        schema_version=schema_version,
+        window_sec=window_sec,
+        cluster_id=cluster_id,
+        namespace=namespace,
+        metric_family=metric_family,
+        unit=unit,
+        sample_count=sample_count,
+        coverage=coverage,
+        event_loss_rate=event_loss_rate,
+        metric_kind=semantics.metric_kind,
+        scope=semantics.scope,
+        histogram_upper_bound=semantics.histogram_upper_bound,
+        histogram_is_inf_bucket=semantics.histogram_is_inf_bucket,
+        histogram_is_cumulative=semantics.histogram_is_cumulative,
+        quantile=semantics.quantile,
+    )
