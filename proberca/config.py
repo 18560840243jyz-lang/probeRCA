@@ -1183,6 +1183,77 @@ class DiagnosisConfig:
 
 
 @dataclass(frozen=True)
+class OrchestrationConfig:
+    analysis_delay_windows: int = 0
+    evidence_window_windows: int = 0
+    allow_single_active_incident_only: bool = True
+    fail_on_concurrent_incident: bool = True
+    retain_intermediates: bool = False
+    checkpoint_every_windows: int = 0
+    strict_stage_identity: bool = True
+    continue_after_incident_failure: bool = True
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "OrchestrationConfig":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "orchestration")
+        result = cls(**values)
+        result.validate()
+        return result
+
+    def validate(self) -> None:
+        for name in ("analysis_delay_windows", "evidence_window_windows", "checkpoint_every_windows"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"orchestration.{name} must be a non-negative integer")
+        if self.evidence_window_windows > self.analysis_delay_windows:
+            raise ValueError("evidence_window_windows cannot exceed analysis_delay_windows")
+        for name in (
+            "allow_single_active_incident_only", "fail_on_concurrent_incident",
+            "retain_intermediates", "strict_stage_identity", "continue_after_incident_failure",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"orchestration.{name} must be boolean")
+        if not self.allow_single_active_incident_only or not self.fail_on_concurrent_incident:
+            raise ValueError("P10 requires one active incident per cluster with concurrent fail-fast")
+        if not self.strict_stage_identity:
+            raise ValueError("P10 requires strict stage identity")
+
+    def to_dict(self) -> dict:
+        self.validate()
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ReplayConfig:
+    strict_order: bool = True
+    allow_explicit_reorder: bool = False
+    parquet_batch_size: int = 1024
+    output_overwrite: bool = False
+    write_alerts: bool = True
+    write_failures: bool = True
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "ReplayConfig":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "replay")
+        result = cls(**values)
+        result.validate()
+        return result
+
+    def validate(self) -> None:
+        for name in ("strict_order", "allow_explicit_reorder", "output_overwrite",
+                     "write_alerts", "write_failures"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"replay.{name} must be boolean")
+        _positive_int("replay.parquet_batch_size", self.parquet_batch_size)
+        if self.strict_order == self.allow_explicit_reorder:
+            raise ValueError("exactly one of strict_order or allow_explicit_reorder must be enabled")
+
+    def to_dict(self) -> dict:
+        self.validate()
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class ProbeRCAConfig:
     window_sec: int
     healthy_history_sec: int
@@ -1202,6 +1273,17 @@ class ProbeRCAConfig:
     quality: QualityConfig = field(default_factory=QualityConfig)
     penalties: PenaltyConfig = field(default_factory=PenaltyConfig)
     diagnosis: DiagnosisConfig = field(default_factory=DiagnosisConfig)
+    orchestration: OrchestrationConfig = field(default_factory=OrchestrationConfig)
+    replay: ReplayConfig = field(default_factory=ReplayConfig)
+    aggregation_specs: dict[str, MetricAggregationSpec] = field(default_factory=dict)
+    metric_signal_specs: list[MetricSignalSpec] = field(default_factory=list)
+    baseline: BaselineConfig = field(default_factory=lambda: BaselineConfig(600, 300, 0.001, 6.0))
+    score: ScoreConfig = field(default_factory=lambda: ScoreConfig(
+        {"request": 0.4, "cpu": 0.12, "memory": 0.12, "io": 0.12,
+         "net_local": 0.12, "lock": 0.12}, False, 1.0, 1.0,
+    ))
+    alert_state: AlertStateConfig | None = None
+    composite_alert_rules: list[CompositeAlertRule] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, payload: dict) -> "ProbeRCAConfig":
@@ -1219,7 +1301,9 @@ class ProbeRCAConfig:
         optional = {
             "impact_derivation_rules", "rca_metric_families", "residual",
             "propagation_dictionary", "shock_projection_templates",
-            "evidence", "quality", "penalties", "diagnosis",
+            "evidence", "quality", "penalties", "diagnosis", "orchestration", "replay",
+            "aggregation_specs", "metric_signal_specs", "baseline", "score",
+            "alert_state", "composite_alert_rules",
         }
         if not isinstance(payload, dict):
             raise TypeError("ProbeRCAConfig must be a dictionary")
@@ -1237,6 +1321,23 @@ class ProbeRCAConfig:
         values.setdefault("quality", asdict(QualityConfig()))
         values.setdefault("penalties", asdict(PenaltyConfig()))
         values.setdefault("diagnosis", asdict(DiagnosisConfig()))
+        values.setdefault("orchestration", asdict(OrchestrationConfig()))
+        values.setdefault("replay", asdict(ReplayConfig()))
+        values.setdefault("aggregation_specs", {})
+        values.setdefault("metric_signal_specs", [])
+        values.setdefault("baseline", asdict(BaselineConfig(600, 300, 0.001, 6.0)))
+        values.setdefault("score", asdict(ScoreConfig(
+            {"request": 0.4, "cpu": 0.12, "memory": 0.12, "io": 0.12,
+             "net_local": 0.12, "lock": 0.12}, False, 1.0, 1.0,
+        )))
+        values.setdefault("alert_state", None)
+        values.setdefault("composite_alert_rules", [])
+        if not isinstance(values["aggregation_specs"], dict):
+            raise TypeError("aggregation_specs must map stable output IDs to specs")
+        if not isinstance(values["metric_signal_specs"], list):
+            raise TypeError("metric_signal_specs must be a list")
+        if not isinstance(values["composite_alert_rules"], list):
+            raise TypeError("composite_alert_rules must be a list")
         _positive_int("window_sec", values["window_sec"])
         _positive_int("healthy_history_sec", values["healthy_history_sec"])
         templates_payload = values["shock_templates"]
@@ -1300,6 +1401,34 @@ class ProbeRCAConfig:
                        else PenaltyConfig.from_dict(values["penalties"])),
             diagnosis=(values["diagnosis"] if isinstance(values["diagnosis"], DiagnosisConfig)
                        else DiagnosisConfig.from_dict(values["diagnosis"])),
+            orchestration=(
+                values["orchestration"] if isinstance(values["orchestration"], OrchestrationConfig)
+                else OrchestrationConfig.from_dict(values["orchestration"])
+            ),
+            replay=(values["replay"] if isinstance(values["replay"], ReplayConfig)
+                    else ReplayConfig.from_dict(values["replay"])),
+            aggregation_specs={
+                output_id: (item if isinstance(item, MetricAggregationSpec)
+                            else MetricAggregationSpec.from_dict(item))
+                for output_id, item in values["aggregation_specs"].items()
+            },
+            metric_signal_specs=[
+                item if isinstance(item, MetricSignalSpec) else MetricSignalSpec.from_dict(item)
+                for item in values["metric_signal_specs"]
+            ],
+            baseline=(values["baseline"] if isinstance(values["baseline"], BaselineConfig)
+                      else BaselineConfig.from_dict(values["baseline"])),
+            score=(values["score"] if isinstance(values["score"], ScoreConfig)
+                   else ScoreConfig.from_dict(values["score"])),
+            alert_state=(
+                values["alert_state"] if isinstance(values["alert_state"], AlertStateConfig)
+                else (AlertStateConfig.from_dict(values["alert_state"])
+                      if values["alert_state"] is not None else None)
+            ),
+            composite_alert_rules=[
+                item if isinstance(item, CompositeAlertRule) else CompositeAlertRule.from_dict(item)
+                for item in values["composite_alert_rules"]
+            ],
         )
 
     def to_dict(self) -> dict:

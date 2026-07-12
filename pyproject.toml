@@ -14,6 +14,9 @@ dependencies = [
   "pyarrow==24.0.*",
 ]
 
+[project.scripts]
+proberca-replay = "proberca.cli.replay:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

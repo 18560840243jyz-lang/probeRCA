@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import fields
 from pathlib import Path
-from typing import Iterable, Any
+from typing import Iterable, Any, Iterator
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -104,6 +104,21 @@ def read_records_jsonl(path: str | Path) -> list[StrictRecord]:
     return records
 
 
+def iter_records_jsonl(path: str | Path) -> Iterator[StrictRecord]:
+    """Stream strict record envelopes from JSONL without materializing the file."""
+    input_path = Path(path)
+    if not input_path.exists():
+        raise FileNotFoundError(f"JSONL file not found: {input_path}")
+    with input_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                yield _record_from_envelope(json.loads(line))
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise ValueError(f"invalid JSONL record at line {line_number}: {exc}") from exc
+
+
 def write_records_parquet(path: str | Path, records: Iterable[StrictRecord]) -> None:
     values = list(records)
     if not values:
@@ -170,3 +185,29 @@ def read_records_parquet(path: str | Path) -> list[StrictRecord]:
                 payload[name] = json.loads(payload[name])
         records.append(STRICT_RECORD_TYPES[record_type].from_dict(payload))
     return records
+
+
+def iter_records_parquet(path: str | Path, *, batch_size: int = 1024) -> Iterator[StrictRecord]:
+    """Stream strict records from ProbeRCA Parquet record batches."""
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("Parquet batch_size must be a positive integer")
+    parquet = pq.ParquetFile(Path(path))
+    metadata = parquet.schema_arrow.metadata or {}
+    if metadata.get(b"proberca_parquet_format") != PARQUET_FORMAT_VERSION.encode("ascii"):
+        raise ValueError("missing or incompatible ProbeRCA Parquet format metadata")
+    expected_fields = json.loads(metadata[b"proberca_fields"].decode("utf-8"))
+    composite_fields = set(json.loads(metadata[b"proberca_composite_fields"].decode("utf-8")))
+    if set(parquet.schema_arrow.names) != {"record_type", *expected_fields}:
+        raise ValueError("Parquet columns do not match declared ProbeRCA fields")
+    for batch in parquet.iter_batches(batch_size=batch_size):
+        for row in batch.to_pylist():
+            record_type = row.pop("record_type")
+            if record_type not in STRICT_RECORD_TYPES:
+                raise ValueError(f"unknown record_type {record_type!r}")
+            record_fields = {item.name for item in fields(STRICT_RECORD_TYPES[record_type])}
+            payload = {"record_type": record_type}
+            payload.update({name: row[name] for name in record_fields - {"record_type"}})
+            for name in (record_fields - {"record_type"}) & composite_fields:
+                if payload[name] is not None:
+                    payload[name] = json.loads(payload[name])
+            yield STRICT_RECORD_TYPES[record_type].from_dict(payload)
