@@ -764,12 +764,30 @@ class RootCause(StrictRecord):
     edge_id: str | None
     fault_mode: str
     edge_subtype: str | None
+    node_id: str | None = None
+    service_id: str | None = None
+    edge_kind: str | None = None
+    parent_service_id: str | None = None
+    target_service_id: str | None = None
+    relation_types: list[str] = field(default_factory=list)
+    physical_edge_id: str | None = None
+    src_service_id: str | None = None
+    dst_service_id: str | None = None
+    protocol: str | None = None
+    dominant_member: str | None = None
+    dominant_metric_name: str | None = None
+    ambiguity_reasons: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.kind not in {"node", "edge", "ambiguous"}:
             raise ValueError(f"invalid primary root kind {self.kind!r}")
-        for name in ("service_name", "metric_name", "edge_id", "edge_subtype"):
+        for name in ("service_name", "metric_name", "edge_id", "edge_subtype", "node_id",
+                     "service_id", "edge_kind", "parent_service_id", "target_service_id",
+                     "physical_edge_id", "src_service_id", "dst_service_id", "protocol",
+                     "dominant_member", "dominant_metric_name"):
             _optional_string(name, getattr(self, name))
+        _string_list("relation_types", self.relation_types)
+        _string_list("ambiguity_reasons", self.ambiguity_reasons)
         if self.kind == "node":
             if self.service_name is None or self.metric_name is None or self.edge_id is not None:
                 raise ValueError("node roots require service_name and metric_name only")
@@ -778,8 +796,8 @@ class RootCause(StrictRecord):
         elif self.kind == "edge":
             if self.edge_id is None or self.service_name is not None or self.metric_name is not None:
                 raise ValueError("edge roots require edge_id only")
-            if self.edge_subtype not in EDGE_SUBTYPES or self.fault_mode != self.edge_subtype:
-                raise ValueError("edge root fault_mode and edge_subtype must match")
+            if self.edge_subtype not in EDGE_SUBTYPES or self.fault_mode not in {"edge", self.edge_subtype}:
+                raise ValueError("edge root fault_mode must identify edge semantics")
         else:
             if any(value is not None for value in (self.service_name, self.metric_name, self.edge_id, self.edge_subtype)):
                 raise ValueError("ambiguous roots cannot identify a node or edge")
@@ -793,6 +811,27 @@ class RootCause(StrictRecord):
 
 def _validate_ranked_candidate(candidate: dict[str, Any]) -> None:
     required = {"object_type", "node_id", "edge_id", "root_metric", "edge_subtype", "score", "role"}
+    if "candidate_id" in candidate:
+        p9_required = {
+            "rank", "candidate_id", "object_type", "fault_mode", "edge_subtype",
+            "raw_solver_values", "contribution_energy", "counterfactual_status",
+            "delta_loss", "relative_delta_loss", "counterfactual_support", "margin",
+            "candidate_quality", "coherence", "lag_entropy", "best_path_score",
+            "identifiability", "confidence", "status", "member_variables",
+            "dominant_member", "provenance",
+        }
+        if not p9_required <= set(candidate):
+            raise ValueError("P9 ranked candidate fields are incomplete")
+        if candidate["object_type"] not in {"node", "edge"}:
+            raise ValueError("P9 ranked candidate object_type is invalid")
+        if candidate["fault_mode"] not in {"self", "edge"}:
+            raise ValueError("P9 ranked candidate fault_mode is invalid")
+        if candidate["object_type"] == "node" and candidate["edge_subtype"] is not None:
+            raise ValueError("P9 node candidate cannot have edge_subtype")
+        if candidate["object_type"] == "edge" and candidate["edge_subtype"] not in EDGE_SUBTYPES:
+            raise ValueError("P9 edge candidate requires a subtype")
+        _json_value("P9 ranked candidate", candidate)
+        return
     if set(candidate) != required:
         raise ValueError("ranked candidate fields are invalid")
     object_type = candidate["object_type"]
@@ -830,6 +869,14 @@ class RCAReport(StrictRecord):
     evidence: list[dict[str, Any]]
     quality: dict[str, Any]
     runtime: dict[str, Any]
+    cluster_id: str | None = None
+    namespace: str | None = None
+    weighted_problem_id: str | None = None
+    solver_result_id: str | None = None
+    diagnosis_result_id: str | None = None
+    counterfactual_solver_runs: list[str] = field(default_factory=list)
+    report_fingerprint: str | None = None
+    config_fingerprint: str | None = None
     record_type: str = field(default="rca_report", init=False)
 
     _nested_fields = {"alert": AlertEvent, "primary_root": RootCause}
@@ -855,6 +902,10 @@ class RCAReport(StrictRecord):
             if not isinstance(value, dict):
                 raise TypeError(f"{name} must be a dictionary")
             _json_value(name, value)
+        for name in ("cluster_id", "namespace", "weighted_problem_id", "solver_result_id",
+                     "diagnosis_result_id", "report_fingerprint", "config_fingerprint"):
+            _optional_string(name, getattr(self, name))
+        _string_list("counterfactual_solver_runs", self.counterfactual_solver_runs)
         for name in ("coverage", "event_loss_rate"):
             if name in self.quality:
                 _probability(f"quality.{name}", self.quality[name])

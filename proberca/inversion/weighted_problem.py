@@ -124,15 +124,22 @@ class WeightedJointInversionProblem:
             if len(ids) != size or len(ids) != len(set(ids)) \
                     or any(not isinstance(item, str) or not item for item in ids):
                 raise WeightedProblemDimensionError(f"{name} variable IDs are inconsistent")
+        if not isinstance(self.node_quality_weights, np.ndarray) \
+                or self.node_quality_weights.ndim != 1 \
+                or not np.isfinite(self.node_quality_weights).all():
+            raise WeightedProblemDimensionError("node quality weights must be a finite vector")
+        node_row_count = self.node_quality_weights.size
         arrays = (
             (self.node_evidence_h, n_u), (self.propagation_evidence_h, n_delta),
             (self.shock_evidence_h, n_xi), (self.node_incoming_prop_h, n_u),
-            (self.node_projected_shock_h, n_u), (self.node_quality_weights, n_u),
-            (self.edge_quality_weights, n_rows - n_u), (self.lambda_u_effective, n_u),
+            (self.node_projected_shock_h, n_u),
+            (self.edge_quality_weights, n_rows - node_row_count), (self.lambda_u_effective, n_u),
             (self.lambda_delta_effective, n_delta), (self.lambda_xi_effective, n_xi),
         )
         if not isinstance(self.joint_residual, np.ndarray) or not np.isfinite(self.joint_residual).all():
             raise WeightedProblemDimensionError("joint residual must remain a finite vector")
+        if node_row_count > n_rows:
+            raise WeightedProblemDimensionError("node quality row count exceeds residual rows")
         for values, size in arrays:
             if not isinstance(values, np.ndarray) or values.shape != (size,) or not np.isfinite(values).all():
                 raise WeightedProblemDimensionError("weighted problem array dimensions are inconsistent")
@@ -194,11 +201,11 @@ def _problem_fingerprint(joint_system, W, node_h, propagation_h, shock_h, penalt
     })
 
 
-def validate_problem_fingerprint(problem: "WeightedJointInversionProblem") -> None:
-    """Recompute the persisted P7 fingerprint without changing any P7 numeric input."""
+def compute_problem_fingerprint(problem: "WeightedJointInversionProblem") -> str:
+    """Compute the deterministic P7/P9 problem fingerprint from read-only inputs."""
     if not isinstance(problem, WeightedJointInversionProblem):
         raise TypeError("problem must be WeightedJointInversionProblem")
-    computed = _fingerprint({
+    return _fingerprint({
         "p6_structure_fingerprint": problem.p6_structure_fingerprint,
         "W": _sparse_payload(problem.W),
         "node_h": problem.node_evidence_h.tolist(),
@@ -215,6 +222,11 @@ def validate_problem_fingerprint(problem: "WeightedJointInversionProblem") -> No
         "config_fingerprint": problem.config_fingerprint,
         "evidence_fingerprint": problem.evidence_fingerprint,
     })
+
+
+def validate_problem_fingerprint(problem: "WeightedJointInversionProblem") -> None:
+    """Recompute the persisted fingerprint without changing any numeric input."""
+    computed = compute_problem_fingerprint(problem)
     if computed != problem.problem_fingerprint:
         raise WeightedProblemFingerprintError("weighted problem fingerprint mismatch")
 

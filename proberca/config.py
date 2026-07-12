@@ -1105,6 +1105,84 @@ class AlertStateConfig:
 
 
 @dataclass(frozen=True)
+class DiagnosisConfig:
+    diagnostic_zero_tolerance: float = 1e-12
+    max_active_candidates: int = 100
+    fail_on_candidate_overflow: bool = True
+    counterfactual_top_k: int = 10
+    require_primary_counterfactual: bool = True
+    counterfactual_min_relative_delta: float = 0.0
+    counterfactual_numerical_tolerance: float = 1e-8
+    symptom_anomaly_threshold: float = 1.0
+    propagated_explained_ratio_threshold: float = 0.5
+    include_root_node_as_symptom: bool = False
+    max_path_length: int = 5
+    max_paths_per_root: int = 10
+    path_length_penalty: float = 0.1
+    minimum_path_edge_support: float = 0.01
+    allow_service_level_fallback: bool = False
+    ident_cf_weight: float = 0.4
+    ident_path_weight: float = 0.3
+    ident_margin_weight: float = 0.3
+    ident_coherence_weight: float = 0.5
+    ident_lag_entropy_weight: float = 0.5
+    confidence_cf_weight: float = 0.3
+    confidence_margin_weight: float = 0.2
+    confidence_quality_weight: float = 0.2
+    confidence_identifiability_weight: float = 0.3
+    strong_identifiability_threshold: float = 0.7
+    minimum_identifiability_threshold: float = 0.3
+    minimum_relative_counterfactual_delta: float = 0.01
+    minimum_margin_for_root: float = 0.05
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "DiagnosisConfig":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "diagnosis")
+        result = cls(**values)
+        result.validate()
+        return result
+
+    def validate(self) -> None:
+        for name in ("diagnostic_zero_tolerance", "counterfactual_numerical_tolerance",
+                     "path_length_penalty"):
+            if _finite(f"diagnosis.{name}", getattr(self, name)) < 0:
+                raise ValueError(f"diagnosis.{name} must be non-negative")
+        for name in ("max_active_candidates", "counterfactual_top_k", "max_path_length",
+                     "max_paths_per_root"):
+            _positive_int(f"diagnosis.{name}", getattr(self, name))
+        if self.counterfactual_top_k > self.max_active_candidates:
+            raise ValueError("diagnosis.counterfactual_top_k cannot exceed max_active_candidates")
+        for name in ("fail_on_candidate_overflow", "require_primary_counterfactual",
+                     "include_root_node_as_symptom", "allow_service_level_fallback"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"diagnosis.{name} must be boolean")
+        probability_fields = (
+            "counterfactual_min_relative_delta", "symptom_anomaly_threshold",
+            "propagated_explained_ratio_threshold", "minimum_path_edge_support",
+            "strong_identifiability_threshold", "minimum_identifiability_threshold",
+            "minimum_relative_counterfactual_delta", "minimum_margin_for_root",
+        )
+        for name in probability_fields:
+            _probability(f"diagnosis.{name}", getattr(self, name))
+        if self.strong_identifiability_threshold < self.minimum_identifiability_threshold:
+            raise ValueError("strong identifiability must be >= minimum identifiability")
+        positive = (self.ident_cf_weight, self.ident_path_weight, self.ident_margin_weight)
+        uncertainty = (self.ident_coherence_weight, self.ident_lag_entropy_weight)
+        confidence = (self.confidence_cf_weight, self.confidence_margin_weight,
+                      self.confidence_quality_weight, self.confidence_identifiability_weight)
+        if any(_finite("diagnosis ident weight", value) < 0 for value in (*positive, *uncertainty)) \
+                or sum(positive) <= 0 or sum(uncertainty) <= 0:
+            raise ValueError("diagnosis identifiability weights must be non-negative with positive sums")
+        if any(_finite("diagnosis confidence weight", value) < 0 for value in confidence) \
+                or not math.isclose(sum(confidence), 1.0, abs_tol=1e-9):
+            raise ValueError("diagnosis confidence weights must be non-negative and sum to 1")
+
+    def to_dict(self) -> dict:
+        self.validate()
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class ProbeRCAConfig:
     window_sec: int
     healthy_history_sec: int
@@ -1123,6 +1201,7 @@ class ProbeRCAConfig:
     evidence: EvidenceConfig = field(default_factory=EvidenceConfig)
     quality: QualityConfig = field(default_factory=QualityConfig)
     penalties: PenaltyConfig = field(default_factory=PenaltyConfig)
+    diagnosis: DiagnosisConfig = field(default_factory=DiagnosisConfig)
 
     @classmethod
     def from_dict(cls, payload: dict) -> "ProbeRCAConfig":
@@ -1140,7 +1219,7 @@ class ProbeRCAConfig:
         optional = {
             "impact_derivation_rules", "rca_metric_families", "residual",
             "propagation_dictionary", "shock_projection_templates",
-            "evidence", "quality", "penalties",
+            "evidence", "quality", "penalties", "diagnosis",
         }
         if not isinstance(payload, dict):
             raise TypeError("ProbeRCAConfig must be a dictionary")
@@ -1157,6 +1236,7 @@ class ProbeRCAConfig:
         values.setdefault("evidence", asdict(EvidenceConfig()))
         values.setdefault("quality", asdict(QualityConfig()))
         values.setdefault("penalties", asdict(PenaltyConfig()))
+        values.setdefault("diagnosis", asdict(DiagnosisConfig()))
         _positive_int("window_sec", values["window_sec"])
         _positive_int("healthy_history_sec", values["healthy_history_sec"])
         templates_payload = values["shock_templates"]
@@ -1218,6 +1298,8 @@ class ProbeRCAConfig:
                      else QualityConfig.from_dict(values["quality"])),
             penalties=(values["penalties"] if isinstance(values["penalties"], PenaltyConfig)
                        else PenaltyConfig.from_dict(values["penalties"])),
+            diagnosis=(values["diagnosis"] if isinstance(values["diagnosis"], DiagnosisConfig)
+                       else DiagnosisConfig.from_dict(values["diagnosis"])),
         )
 
     def to_dict(self) -> dict:
