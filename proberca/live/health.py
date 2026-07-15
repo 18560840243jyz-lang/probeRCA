@@ -76,7 +76,23 @@ class LiveHealthState:
             "schema_version": str(schema_version),
             "image_digest": str(image_digest) if image_digest else None,
         }
+        self._probe_status_provider = None
         self._lock = threading.RLock()
+
+    def set_probe_status_provider(self, provider) -> None:
+        if provider is not None and not all(
+            callable(getattr(provider, name, None))
+            for name in ("status", "prometheus_metrics")
+        ):
+            raise TypeError("probe status provider contract is incomplete")
+        with self._lock:
+            self._probe_status_provider = provider
+
+    def _probe_snapshot(self):
+        if self._probe_status_provider is None:
+            return None
+        snapshot = self._probe_status_provider.status()
+        return snapshot.to_dict() if hasattr(snapshot, "to_dict") else dict(snapshot)
 
     def update(self, **values) -> None:
         unknown = set(values) - set(self.values)
@@ -212,6 +228,11 @@ class LiveHealthState:
             reasons.append("audit_write_failed")
         if self.values["fatal_error"] is not None:
             reasons.append("fatal_error")
+        probe = self._probe_snapshot()
+        if probe and probe.get("probe_state") == "UNAVAILABLE":
+            reasons.append("probe_unavailable")
+        if probe and probe.get("probe_state") == "FAILED":
+            reasons.append("probe_failed")
         return sorted(reasons)
 
     def status(self) -> dict:
@@ -224,6 +245,7 @@ class LiveHealthState:
                 "runtime": dict(sorted(self.runtime.items())),
                 "progress": dict(sorted(self.progress.items())),
                 "build": dict(self.build),
+                "burst_probe": self._probe_snapshot(),
             }
 
     def prometheus_metrics(self) -> str:
@@ -245,7 +267,10 @@ class LiveHealthState:
                 lines.extend((f"# HELP {metric} {help_text}",
                               f"# TYPE {metric} gauge",
                               f"{metric} {gauges[name]}"))
-            return "\n".join(lines) + "\n"
+            body = "\n".join(lines) + "\n"
+            if self._probe_status_provider is not None:
+                body += self._probe_status_provider.prometheus_metrics()
+            return body
 
 
 def probe_writable_directory(directory) -> bool:

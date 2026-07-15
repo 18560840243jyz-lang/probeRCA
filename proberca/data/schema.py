@@ -90,6 +90,9 @@ BURST_EVENT_TYPES = frozenset(
         "fs.read_latency",
         "fs.write_latency",
         "futex.wait",
+        "futex.wake",
+        "block.issue",
+        "block.complete",
         "tcp.retransmit",
         "tcp.rto",
         "tcp.rtt",
@@ -97,10 +100,15 @@ BURST_EVENT_TYPES = frozenset(
         "tcp.connect_fail",
         "dns.latency",
         "dns.timeout",
+        "dns.query",
+        "dns.response",
+        "process.fork",
         "process.exec",
         "process.exit",
+        "process.cgroup_migrate",
         "sidecar.queue",
         "proxy.upstream_latency",
+        "probe.loss",
     }
 )
 ALERT_STATES = frozenset({"healthy", "soft", "hard", "recovery", "edge_anomaly"})
@@ -493,6 +501,20 @@ class BurstEventRecord(StrictRecord):
     probe_mode: str
     burst_id: str | None
     lost_events: int
+    event_class: str = "unmapped"
+    quality: str = "unmapped"
+    mapping_status: str = "unmapped"
+    process_start_time_ns: int = 0
+    container_identity_fingerprint: str | None = None
+    pod_identity_fingerprint: str | None = None
+    source_cgroup_id: int | None = None
+    target_cgroup_id: int | None = None
+    direction: str = "unknown"
+    metric_family: str | None = None
+    probe_name: str | None = None
+    attach_epoch: int = 0
+    event_sequence: int = 0
+    cpu: int = 0
     record_type: str = field(default="burst_event", init=False)
 
     def __post_init__(self) -> None:
@@ -540,6 +562,28 @@ class BurstEventRecord(StrictRecord):
         if self.probe_mode == "always_on" and self.burst_id is not None:
             raise ValueError("burst_id must be None in always_on mode")
         _integer("lost_events", self.lost_events)
+        if self.event_class not in {"node", "edge", "unmapped", "control", "loss"}:
+            raise ValueError("invalid burst event_class")
+        if self.quality not in {"exact", "derived", "partial", "unmapped"}:
+            raise ValueError("invalid burst event quality")
+        if self.mapping_status not in {"mapped", "partial", "unmapped", "pid_reused"}:
+            raise ValueError("invalid burst event mapping_status")
+        _integer("process_start_time_ns", self.process_start_time_ns)
+        for name in ("container_identity_fingerprint", "pod_identity_fingerprint"):
+            value = getattr(self, name)
+            if value is not None and (len(value) != 64 or any(
+                    character not in "0123456789abcdef" for character in value)):
+                raise ValueError(f"{name} must be lowercase SHA-256")
+        for name in ("source_cgroup_id", "target_cgroup_id"):
+            value = getattr(self, name)
+            if value is not None:
+                _integer(name, value)
+        if self.direction not in {"unknown", "ingress", "egress"}:
+            raise ValueError("invalid burst event direction")
+        _optional_string("metric_family", self.metric_family)
+        _optional_string("probe_name", self.probe_name)
+        for name in ("attach_epoch", "event_sequence", "cpu"):
+            _integer(name, getattr(self, name))
 
 
 @dataclass(frozen=True)

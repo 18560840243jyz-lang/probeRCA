@@ -59,6 +59,7 @@ class ProbeRCALiveRunner:
         watch_supervisor=None,
         progress_tracker=None,
         liveness_config=None,
+        burst_probe_controller=None,
     ):
         self.coordinator = coordinator
         self.inventory = inventory
@@ -71,6 +72,9 @@ class ProbeRCALiveRunner:
         self.window_adapter = window_adapter
         self.commit_payload_builder = commit_payload_builder
         self.health = health
+        self.burst_probe_controller = burst_probe_controller
+        if self.health is not None and self.burst_probe_controller is not None:
+            self.health.set_probe_status_provider(self.burst_probe_controller)
         self.progress_tracker = progress_tracker or StageProgressTracker()
         self.liveness_config = liveness_config or LiveLivenessConfig()
         self.liveness_config.validate()
@@ -126,6 +130,8 @@ class ProbeRCALiveRunner:
             )
 
     def stop(self, *, join_timeout_sec):
+        if self.burst_probe_controller is not None:
+            self.burst_probe_controller.shutdown()
         if self.watch_supervisor is not None:
             self.watch_supervisor.stop()
             self.watch_supervisor.join(join_timeout_sec)
