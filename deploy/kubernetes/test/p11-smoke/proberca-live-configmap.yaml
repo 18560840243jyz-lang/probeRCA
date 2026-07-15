@@ -1,0 +1,525 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: proberca-live-config
+data:
+  config.yaml: |
+    window_sec: 5
+    healthy_history_sec: 1500
+    alert:
+      healthy_threshold: 0.2
+      soft_threshold: 0.5
+      soft_consecutive_windows: 2
+      hard_threshold: 0.8
+      hard_consecutive_windows: 2
+      recovery_threshold: 0.1
+      recovery_windows: 3
+      recovery_cooldown_sec: 30
+    propagation:
+      service_lags:
+      - 1
+      - 2
+      metric_lags:
+      - 1
+      rls_forgetting_factor: 0.99
+      metric_ridge: 0.1
+      rls_initial_covariance: 100.0
+      service_min_updates: 30
+      service_min_observation_quality: 0.0
+      service_max_gap_windows: 3
+      topology_reconfigure_min_updates: 1
+      include_self_history: true
+      include_impact_parents: true
+      include_host_parents: true
+      include_resource_parents: true
+      metric_history_sec: 600
+      metric_min_training_rows: 60
+      metric_min_observation_quality: 0.8
+      metric_max_condition_number: 100000000.0
+      metric_max_gap_windows: 5
+      metric_model_cache_size: 8
+      metric_include_self_history: true
+      metric_parent_rules:
+      - rule_id: smoke-memory-self
+        enabled: true
+        target_family: memory
+        target_metric_names:
+        - smoke.process.rss_bytes
+        relation_type: self_history
+        parent_family: memory
+        parent_metric_names:
+        - smoke.process.rss_bytes
+        lags:
+        - 1
+        require_signal_spec: true
+        provenance_label: configured-smoke-self
+    candidate_graph:
+      upstream_hops: 2
+      downstream_hops: 1
+      include_cohost: true
+      include_shared_resource: true
+      allow_cross_namespace: false
+      allowed_namespaces:
+      - proberca-p11-smoke
+      max_candidate_services: 100
+      max_candidate_node_metrics: 1000
+      max_candidate_physical_edges: 500
+      fail_on_candidate_overflow: true
+      include_trigger_edge_endpoints: true
+      include_all_provenance_paths: true
+      max_provenance_paths_per_object: 20
+    burst:
+      ttl_sec: 30
+      max_ttl_sec: 120
+    solver:
+      method: fista
+      max_iterations: 500
+      tolerance: 1.0e-06
+      objective_tolerance: 1.0e-08
+      gradient_mapping_tolerance: 1.0e-06
+      backtracking_factor: 2.0
+      max_backtracking_steps: 50
+      initial_lipschitz: 1.0
+      lipschitz_floor: 1.0e-12
+      monotone: true
+      adaptive_restart: true
+      minimum_iterations: 2
+      convergence_patience: 2
+      warm_start_enabled: true
+      strict_convergence: true
+      diagnostic_zero_tolerance: 1.0e-12
+    confidence:
+      strong: 0.8
+      weak: 0.4
+    shock_templates:
+      tcp.retrans_rate:
+        source_metric_families:
+        - net_local
+        target_metric_families:
+        - request
+      dns.timeout_rate:
+        source_metric_families:
+        - net_local
+        target_metric_families:
+        - request
+    impact_derivation_rules: []
+    rca_metric_families:
+    - memory
+    residual:
+      signal_kind: signed_z
+      require_hard_alert: true
+      require_rca_eligible: true
+      require_global_metric_model_ready: true
+      require_complete_node_rows: true
+      require_complete_edge_rows: true
+      max_joint_rows: 10000
+      max_propagation_variables: 50000
+      max_shock_variables: 10000
+      fail_on_overflow: true
+    propagation_dictionary:
+      allowed_relation_types:
+      - host
+      - impact
+      - resource
+      - same_service
+      exclude_self_history: true
+      exclude_call: true
+    shock_projection_templates: []
+    evidence:
+      max_age_windows: 30
+      min_observation_quality: 0.0
+      require_independent_from_residual: true
+      channel_aggregation: max_then_noisy_or
+    quality:
+      quality_weight_floor: 0.2
+    penalties:
+      residual_scale_floor: 0.1
+      c_u: 1.0
+      c_delta: 1.0
+      c_xi: 1.0
+      eta_v: 1.0
+      eta_p: 1.0
+      eta_s: 1.0
+      rho_v: 1.0
+      rho_p: 1.0
+      rho_s: 1.0
+      rho_m: 1.0
+      group_ratio_u: 0.0
+      group_ratio_delta: 0.0
+      group_ratio_xi: 0.0
+    diagnosis:
+      diagnostic_zero_tolerance: 1.0e-12
+      max_active_candidates: 100
+      fail_on_candidate_overflow: true
+      counterfactual_top_k: 10
+      require_primary_counterfactual: true
+      counterfactual_min_relative_delta: 0.0
+      counterfactual_numerical_tolerance: 1.0e-08
+      symptom_anomaly_threshold: 1.0
+      propagated_explained_ratio_threshold: 0.5
+      include_root_node_as_symptom: false
+      max_path_length: 5
+      max_paths_per_root: 10
+      path_length_penalty: 0.1
+      minimum_path_edge_support: 0.01
+      allow_service_level_fallback: false
+      ident_cf_weight: 0.4
+      ident_path_weight: 0.3
+      ident_margin_weight: 0.3
+      ident_coherence_weight: 0.5
+      ident_lag_entropy_weight: 0.5
+      confidence_cf_weight: 0.3
+      confidence_margin_weight: 0.2
+      confidence_quality_weight: 0.2
+      confidence_identifiability_weight: 0.3
+      strong_identifiability_threshold: 0.7
+      minimum_identifiability_threshold: 0.3
+      minimum_relative_counterfactual_delta: 0.01
+      minimum_margin_for_root: 0.05
+    orchestration:
+      analysis_delay_windows: 0
+      evidence_window_windows: 0
+      allow_single_active_incident_only: true
+      fail_on_concurrent_incident: true
+      retain_intermediates: false
+      checkpoint_every_windows: 0
+      strict_stage_identity: true
+      continue_after_incident_failure: true
+    replay:
+      strict_order: true
+      allow_explicit_reorder: false
+      parquet_batch_size: 1024
+      output_overwrite: false
+      write_alerts: true
+      write_failures: true
+    aggregation_specs:
+      kind-smoke::proberca-p11-smoke::metrics-source::smoke.process.rss_bytes:
+        method: last_same_series
+        input_metric_kind: gauge
+        source_scope: service
+        target_scope: service
+        input_metric_ids:
+        - kind-smoke::proberca-p11-smoke::metrics-source::smoke.process.rss_bytes
+        input_series_ids:
+        - kind-smoke::proberca-p11-smoke::metrics-source::smoke.process.rss_bytes::scope=service::service
+        numerator_metric_id: null
+        denominator_metric_id: null
+        numerator_metric_kind: null
+        denominator_metric_kind: null
+        numerator_scope: null
+        denominator_scope: null
+        output_metric_name: smoke.process.rss_bytes
+        output_metric_kind: gauge
+        output_unit: bytes
+        missing_component_policy: missing
+        zero_denominator_policy: null
+        median_weight: null
+        histogram_inputs: null
+        output_quantiles: null
+      kind-smoke::proberca-p11-smoke::metrics-target::smoke.process.rss_bytes:
+        method: last_same_series
+        input_metric_kind: gauge
+        source_scope: service
+        target_scope: service
+        input_metric_ids:
+        - kind-smoke::proberca-p11-smoke::metrics-target::smoke.process.rss_bytes
+        input_series_ids:
+        - kind-smoke::proberca-p11-smoke::metrics-target::smoke.process.rss_bytes::scope=service::service
+        numerator_metric_id: null
+        denominator_metric_id: null
+        numerator_metric_kind: null
+        denominator_metric_kind: null
+        numerator_scope: null
+        denominator_scope: null
+        output_metric_name: smoke.process.rss_bytes
+        output_metric_kind: gauge
+        output_unit: bytes
+        missing_component_policy: missing
+        zero_denominator_policy: null
+        median_weight: null
+        histogram_inputs: null
+        output_quantiles: null
+      kind-smoke::proberca-p11-smoke::metrics-source->metrics-target::http::smoke.edge.rtt_seconds:
+        method: last_same_series
+        input_metric_kind: gauge
+        source_scope: service_pair
+        target_scope: service_pair
+        input_metric_ids:
+        - kind-smoke::proberca-p11-smoke::metrics-source->metrics-target::http::smoke.edge.rtt_seconds
+        input_series_ids:
+        - kind-smoke::proberca-p11-smoke::metrics-source->metrics-target::http::smoke.edge.rtt_seconds::scope=service_pair::service_pair
+        numerator_metric_id: null
+        denominator_metric_id: null
+        numerator_metric_kind: null
+        denominator_metric_kind: null
+        numerator_scope: null
+        denominator_scope: null
+        output_metric_name: smoke.edge.rtt_seconds
+        output_metric_kind: gauge
+        output_unit: seconds
+        missing_component_policy: missing
+        zero_denominator_policy: null
+        median_weight: null
+        histogram_inputs: null
+        output_quantiles: null
+    metric_signal_specs:
+    - record_type: node_metric
+      metric_family: memory
+      metric_name: smoke.process.rss_bytes
+      protocol: null
+      transform: log1p
+      polarity: increase_bad
+      rare_event_threshold: null
+      direct_hard: false
+      z_cap: 6.0
+      aggregation_output_id: kind-smoke::proberca-p11-smoke::metrics-source::smoke.process.rss_bytes
+    - record_type: node_metric
+      metric_family: memory
+      metric_name: smoke.process.rss_bytes
+      protocol: null
+      transform: log1p
+      polarity: increase_bad
+      rare_event_threshold: null
+      direct_hard: false
+      z_cap: 6.0
+      aggregation_output_id: kind-smoke::proberca-p11-smoke::metrics-target::smoke.process.rss_bytes
+    - record_type: edge_metric
+      metric_family: null
+      metric_name: smoke.edge.rtt_seconds
+      protocol: http
+      transform: log1p
+      polarity: increase_bad
+      rare_event_threshold: null
+      direct_hard: false
+      z_cap: 6.0
+      aggregation_output_id: kind-smoke::proberca-p11-smoke::metrics-source->metrics-target::http::smoke.edge.rtt_seconds
+    baseline:
+      healthy_history_sec: 1500
+      min_healthy_windows: 300
+      min_scale: 0.001
+      z_cap: 6.0
+    score:
+      family_weights:
+        request: 0.0
+        cpu: 0.0
+        memory: 1.0
+        io: 0.0
+        net_local: 0.0
+        lock: 0.0
+      allow_partial_families: true
+      edge_weight: 1.0
+      edge_business_impact_threshold: 1.0
+    alert_state: null
+    composite_alert_rules: []
+    kubernetes:
+      enabled: true
+      cluster_id: kind-smoke
+      in_cluster: true
+      kubeconfig_path: null
+      context: null
+      namespaces:
+      - proberca-p11-smoke
+      namespace_label_selector: null
+      field_selectors: {}
+      resync_timeout_sec: 60.0
+      watch_timeout_sec: 10.0
+      reconnect_initial_sec: 0.25
+      reconnect_max_sec: 2.0
+      allow_watch_bookmarks: true
+      endpoint_ready_policy: ready_only
+      include_terminating_endpoints: false
+      include_persistent_volumes: false
+      include_volume_attachments: false
+      include_jobs: false
+      include_external_name_services: false
+      pod_service_ambiguity_policy: fail
+      inventory_stale_after_sec: 120.0
+      topology_snapshot_each_window: true
+      explicit_resource_annotation_prefix: proberca.io/resource-
+    prometheus:
+      enabled: true
+      base_url: http://prometheus:9090
+      token_file: null
+      ca_file: null
+      client_cert_file: null
+      client_key_file: null
+      timeout_sec: 5.0
+      max_retries: 2
+      retry_initial_sec: 0.25
+      retry_max_sec: 1.0
+      collection_delay_sec: 2.0
+      query_step_sec: 1.0
+      query_specs:
+      - spec_id: smoke-node-rss
+        enabled: true
+        record_type: node_metric
+        promql: max by (cluster, namespace, pod, container, service) (proberca_smoke_process_rss_bytes{namespace="proberca-p11-smoke"})
+        query_mode: range
+        metric_name: smoke.process.rss_bytes
+        metric_family: memory
+        metric_kind: gauge
+        counter_semantics: null
+        signal_spec_id: smoke-memory-signal
+        aggregation_spec_id: kind-smoke::proberca-p11-smoke::metrics-source::smoke.process.rss_bytes
+        unit: bytes
+        value_field: value
+        label_mapping:
+          cluster: cluster
+          namespace: namespace
+          pod: pod
+          container_id: container
+          service: service
+        required_labels:
+        - cluster
+        - namespace
+        - pod
+        - container
+        - service
+        optional_labels: []
+        service_resolution: explicit_service
+        source_resolution: null
+        destination_resolution: null
+        protocol_label: null
+        histogram_le_label: null
+        quantile_label: null
+        expected_scope: service
+        allow_empty: false
+        quality_policy: strict
+        query_timeout_sec: 5.0
+      - spec_id: smoke-edge-rtt
+        enabled: true
+        record_type: edge_metric
+        promql: max by (cluster, namespace, source_service, destination_service, protocol) (proberca_smoke_edge_rtt_seconds{namespace="proberca-p11-smoke"})
+        query_mode: range
+        metric_name: smoke.edge.rtt_seconds
+        metric_family: null
+        metric_kind: gauge
+        counter_semantics: null
+        signal_spec_id: smoke-edge-signal
+        aggregation_spec_id: kind-smoke::proberca-p11-smoke::metrics-source->metrics-target::http::smoke.edge.rtt_seconds
+        unit: seconds
+        value_field: value
+        label_mapping:
+          cluster: cluster
+          namespace: namespace
+          source: source_service
+          destination: destination_service
+          protocol: protocol
+        required_labels:
+        - cluster
+        - namespace
+        - source_service
+        - destination_service
+        - protocol
+        optional_labels: []
+        service_resolution: explicit_service
+        source_resolution: service_label
+        destination_resolution: service_label
+        protocol_label: protocol
+        histogram_le_label: null
+        quantile_label: null
+        expected_scope: service_pair
+        allow_empty: false
+        quality_policy: strict
+        query_timeout_sec: 5.0
+      call_edge_query_specs:
+      - spec_id: smoke-call-count
+        enabled: true
+        record_type: call_edge
+        promql: sum by (cluster, namespace, source_service, destination_service, protocol) (increase(proberca_smoke_requests_total{namespace="proberca-p11-smoke"}[5s]))
+        query_mode: range
+        metric_name: smoke.call.request_count
+        metric_family: null
+        metric_kind: delta_counter
+        counter_semantics: delta
+        signal_spec_id: null
+        aggregation_spec_id: null
+        unit: count
+        value_field: value
+        label_mapping:
+          cluster: cluster
+          namespace: namespace
+          source: source_service
+          destination: destination_service
+          protocol: protocol
+        required_labels:
+        - cluster
+        - namespace
+        - source_service
+        - destination_service
+        - protocol
+        optional_labels: []
+        service_resolution: explicit_service
+        source_resolution: service_label
+        destination_resolution: service_label
+        protocol_label: protocol
+        histogram_le_label: null
+        quantile_label: null
+        expected_scope: service_pair
+        allow_empty: false
+        quality_policy: strict
+        query_timeout_sec: 5.0
+      reject_partial_response: true
+      maximum_sample_lateness_sec: 0.0
+      allow_insecure_test_endpoint: true
+    live_liveness:
+      freeze_revision_timeout_sec: 10.0
+      topology_build_timeout_sec: 30.0
+      call_edge_collection_timeout_sec: 60.0
+      node_metric_collection_timeout_sec: 60.0
+      edge_metric_collection_timeout_sec: 60.0
+      record_adaptation_timeout_sec: 30.0
+      engine_process_timeout_sec: 120.0
+      generation_prepare_timeout_sec: 120.0
+      run_state_commit_timeout_sec: 30.0
+      output_projection_timeout_sec: 60.0
+      retention_timeout_sec: 30.0
+      progress_timeout_sec: 180.0
+      watchdog_poll_interval_sec: 1.0
+      watchdog_dump_grace_sec: 10.0
+      watchdog_exit_grace_sec: 30.0
+      transient_retry_max_attempts: 3
+      transient_retry_initial_backoff_sec: 1.0
+      transient_retry_max_backoff_sec: 10.0
+      backlog_not_ready_threshold: 10
+      backlog_fatal_threshold: 1000
+      maximum_stage_event_history: 256
+      attempt_audit_max_bytes: 1048576
+      attempt_audit_backup_count: 2
+      fail_stop_on_unrecoverable_stall: true
+      controlled_stage_delay_enabled: false
+      controlled_stage_delay_stage: ""
+      controlled_stage_delay_sec: 0.0
+      controlled_collection_fault_enabled: false
+      controlled_transient_empty_attempts: 0
+    live:
+      window_sec: 5
+      start_alignment: utc_epoch
+      collection_delay_sec: 2.0
+      maximum_catchup_windows: 1440
+      fail_on_missed_window: true
+      checkpoint_every_windows: 1
+      output_flush_every_windows: 1
+      graceful_shutdown_timeout_sec: 30.0
+      leader_election: true
+      health_bind: 0.0.0.0:8080
+      metrics_bind: 0.0.0.0:9090
+      topology_required: true
+      prometheus_required: true
+      call_edge_required: true
+      normalized_evidence_required: false
+      no_evidence_is_degraded_not_failed: true
+    leader_election:
+      enabled: true
+      lease_namespace: proberca-p11-smoke
+      lease_name: proberca-live
+      holder_identity_source: pod_uid
+      lease_duration_sec: 15.0
+      renew_deadline_sec: 10.0
+      retry_period_sec: 2.0
+      run_state_annotation_max_bytes: 196608
+    retention:
+      checkpoint_generations: 3
+      checkpoint_min_age_sec: 5.0
+      report_retention_days: 30
+      failure_retention_days: 30

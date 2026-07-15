@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools==79.0.1", "wheel==0.46.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,14 +8,26 @@ version = "0.1.0"
 description = "probeRCA P0 single-VM pseudo-distributed validation scaffold"
 requires-python = ">=3.10"
 dependencies = [
-  "numpy",
-  "pyyaml",
-  "pytest",
-  "pyarrow==24.0.*",
+  "numpy==1.21.5",
+  "scipy==1.8.0",
+  "PyYAML==6.0.3",
+  "pyarrow==24.0.0",
+  "kubernetes==35.0.0",
+  "requests==2.25.1",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest==9.0.3",
+  "tomli==2.4.1; python_version < '3.11'",
 ]
 
 [project.scripts]
 proberca-replay = "proberca.cli.replay:main"
+proberca-live = "proberca.cli.live:main"
+
+[tool.setuptools.packages.find]
+include = ["proberca*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

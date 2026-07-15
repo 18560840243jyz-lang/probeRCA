@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-target
+  labels:
+    proberca.io/workload-role: shared-observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: metrics-target
+  template:
+    metadata:
+      labels:
+        app: metrics-target
+        proberca.io/workload-role: shared-observability
+    spec:
+      containers:
+      - name: app
+        image: python:3.11-alpine@sha256:cf0253107a1e77e63c814a05428308965a47eb44a2d62fc828564c4a8c839fab
+        command:
+        - python
+        - /app/app.py
+        env:
+        - name: ROLE
+          value: target
+        - name: CLUSTER
+          value: kind-smoke
+        - name: SERVICE_NAME
+          value: metrics-target
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        ports:
+        - name: http
+          containerPort: 8000
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 65534
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: app
+          mountPath: /app
+          readOnly: true
+        - name: source
+          mountPath: /source
+          readOnly: true
+      volumes:
+      - name: app
+        configMap:
+          name: metrics-target-app
+      - name: source
+        configMap:
+          name: metrics-source-app

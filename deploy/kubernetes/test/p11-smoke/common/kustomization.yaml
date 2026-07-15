@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../namespace.yaml
+  - ../metrics-source-configmap.yaml
+  - ../metrics-target-configmap.yaml
+  - ../metrics-source-deployment.yaml
+  - ../metrics-source-service.yaml
+  - ../metrics-target-deployment.yaml
+  - ../metrics-target-service.yaml
+  - ../prometheus-configmap.yaml
+  - ../prometheus-pvc.yaml
+  - ../prometheus-deployment.yaml
+  - ../prometheus-service.yaml
+  - ../test-rbac.yaml
+  - ../proberca-live-configmap.yaml
+  - ../proberca-live-pvc.yaml

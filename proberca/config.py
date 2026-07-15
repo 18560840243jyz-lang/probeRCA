@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 from dataclasses import MISSING, asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import yaml
 
@@ -1253,6 +1256,464 @@ class ReplayConfig:
         return asdict(self)
 
 
+def _stable_fingerprint(payload: dict) -> str:
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True)
+class PrometheusQuerySpec:
+    spec_id: str
+    enabled: bool
+    record_type: str
+    promql: str
+    query_mode: str
+    metric_name: str
+    metric_family: str | None
+    metric_kind: str
+    counter_semantics: str | None
+    signal_spec_id: str | None
+    aggregation_spec_id: str | None
+    unit: str
+    value_field: str
+    label_mapping: dict[str, str]
+    required_labels: list[str]
+    optional_labels: list[str]
+    service_resolution: str
+    source_resolution: str | None
+    destination_resolution: str | None
+    protocol_label: str | None
+    histogram_le_label: str | None
+    quantile_label: str | None
+    expected_scope: str
+    allow_empty: bool
+    quality_policy: str
+    query_timeout_sec: float
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "PrometheusQuerySpec":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "prometheus query spec")
+        result = cls(**values)
+        result.validate()
+        return result
+
+    def validate(self) -> None:
+        for name in ("spec_id", "promql", "metric_name", "unit", "value_field",
+                     "service_resolution", "expected_scope", "quality_policy"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"query spec {name} must be non-empty")
+        if type(self.enabled) is not bool or type(self.allow_empty) is not bool:
+            raise TypeError("query spec enabled and allow_empty must be boolean")
+        if self.record_type not in {"node_metric", "edge_metric", "call_edge"}:
+            raise ValueError("query spec record_type is invalid")
+        if self.query_mode not in {"range", "instant_at_end"}:
+            raise ValueError("query spec query_mode is invalid")
+        if self.metric_kind not in METRIC_KINDS:
+            raise ValueError("query spec metric_kind is invalid")
+        if self.metric_kind == "monotonic_counter":
+            if self.counter_semantics != "raw_cumulative" or "rate(" in self.promql.lower():
+                raise ValueError("monotonic_counter requires raw_cumulative semantics")
+        elif self.counter_semantics not in {None, "delta"}:
+            raise ValueError("counter_semantics is incompatible with metric_kind")
+        if self.metric_kind == "histogram_bucket" and not self.histogram_le_label:
+            raise ValueError("histogram bucket query requires histogram_le_label")
+        if self.metric_kind != "histogram_bucket" and self.histogram_le_label is not None:
+            raise ValueError("histogram_le_label is only valid for histogram buckets")
+        if self.metric_kind == "quantile" and not self.quantile_label:
+            raise ValueError("quantile query requires quantile_label")
+        if self.record_type in {"edge_metric", "call_edge"} and (
+                not self.source_resolution or not self.destination_resolution):
+            raise ValueError("edge/call query requires source and destination resolution")
+        if not isinstance(self.label_mapping, dict) or any(
+                not isinstance(key, str) or not key or not isinstance(value, str) or not value
+                for key, value in self.label_mapping.items()):
+            raise ValueError("query spec label_mapping must be exact non-empty strings")
+        if len(self.required_labels) != len(set(self.required_labels)) or \
+                len(self.optional_labels) != len(set(self.optional_labels)):
+            raise ValueError("query spec labels must be unique")
+        if set(self.required_labels) & set(self.optional_labels):
+            raise ValueError("required and optional labels overlap")
+        if any(label not in self.label_mapping.values() for label in self.required_labels):
+            raise ValueError("required label has no exact label mapping")
+        _finite("query_timeout_sec", self.query_timeout_sec)
+        if self.query_timeout_sec <= 0:
+            raise ValueError("query_timeout_sec must be positive")
+
+    @property
+    def fingerprint(self) -> str:
+        self.validate()
+        return _stable_fingerprint(asdict(self))
+
+
+@dataclass(frozen=True)
+class KubernetesConfig:
+    enabled: bool = False
+    cluster_id: str = ""
+    in_cluster: bool = False
+    kubeconfig_path: str | None = None
+    context: str | None = None
+    namespaces: tuple[str, ...] = ()
+    namespace_label_selector: str | None = None
+    field_selectors: dict[str, str] = field(default_factory=dict)
+    resync_timeout_sec: float = 60.0
+    watch_timeout_sec: float = 30.0
+    reconnect_initial_sec: float = 1.0
+    reconnect_max_sec: float = 30.0
+    allow_watch_bookmarks: bool = True
+    endpoint_ready_policy: str = "ready_only"
+    include_terminating_endpoints: bool = False
+    include_persistent_volumes: bool = True
+    include_volume_attachments: bool = False
+    include_jobs: bool = True
+    include_external_name_services: bool = False
+    pod_service_ambiguity_policy: str = "fail"
+    inventory_stale_after_sec: float = 120.0
+    topology_snapshot_each_window: bool = True
+    explicit_resource_annotation_prefix: str = "proberca.io/resource-"
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "KubernetesConfig":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "kubernetes")
+        if isinstance(values.get("namespaces"), list):
+            values = dict(values)
+            values["namespaces"] = tuple(values["namespaces"])
+        result = cls(**values)
+        result.validate()
+        return result
+
+    def validate(self) -> None:
+        if type(self.enabled) is not bool or type(self.in_cluster) is not bool:
+            raise TypeError("kubernetes enabled/in_cluster must be boolean")
+        if not isinstance(self.cluster_id, str) or not self.cluster_id.strip():
+            raise ValueError("kubernetes.cluster_id is required")
+        if not self.namespaces and not self.namespace_label_selector:
+            raise ValueError("explicit namespaces or namespace_label_selector is required")
+        if any(not isinstance(item, str) or not item.strip() for item in self.namespaces):
+            raise ValueError("kubernetes namespaces must be non-empty strings")
+        if len(self.namespaces) != len(set(self.namespaces)):
+            raise ValueError("kubernetes namespaces contain duplicates")
+        for name in ("resync_timeout_sec", "watch_timeout_sec", "reconnect_initial_sec",
+                     "reconnect_max_sec", "inventory_stale_after_sec"):
+            value = _finite(f"kubernetes.{name}", getattr(self, name))
+            if value <= 0:
+                raise ValueError(f"kubernetes.{name} must be positive")
+        if self.reconnect_initial_sec > self.reconnect_max_sec:
+            raise ValueError("kubernetes reconnect_initial_sec exceeds reconnect_max_sec")
+        if self.endpoint_ready_policy not in {"ready_only", "ready_or_serving", "all"}:
+            raise ValueError("invalid endpoint_ready_policy")
+        if self.pod_service_ambiguity_policy not in {"fail", "explicit_only"}:
+            raise ValueError("invalid pod_service_ambiguity_policy")
+
+
+@dataclass(frozen=True)
+class PrometheusConfig:
+    enabled: bool = False
+    base_url: str | None = None
+    token_file: str | None = None
+    ca_file: str | None = None
+    client_cert_file: str | None = None
+    client_key_file: str | None = None
+    timeout_sec: float = 10.0
+    max_retries: int = 3
+    retry_initial_sec: float = 0.5
+    retry_max_sec: float = 5.0
+    collection_delay_sec: float = 1.0
+    query_step_sec: float = 1.0
+    query_specs: tuple[PrometheusQuerySpec, ...] = ()
+    call_edge_query_specs: tuple[PrometheusQuerySpec, ...] = ()
+    reject_partial_response: bool = True
+    maximum_sample_lateness_sec: float = 0.0
+    allow_insecure_test_endpoint: bool = False
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "PrometheusConfig":
+        values = _strict_dict(payload, set(cls.__dataclass_fields__), "prometheus")
+        values = dict(values)
+        values["query_specs"] = tuple(
+            item if isinstance(item, PrometheusQuerySpec) else PrometheusQuerySpec.from_dict(item)
+            for item in values["query_specs"])
+        values["call_edge_query_specs"] = tuple(
+            item if isinstance(item, PrometheusQuerySpec) else PrometheusQuerySpec.from_dict(item)
+            for item in values["call_edge_query_specs"])
+        result = cls(**values)
+        result.validate()
+        return result
+
+    def validate(self) -> None:
+        if self.enabled and (not isinstance(self.base_url, str) or not self.base_url):
+            raise ValueError("prometheus.base_url is required when enabled")
+        if self.base_url:
+            parsed = urlparse(self.base_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("prometheus.base_url must be HTTP(S)")
+            forbidden = {"token", "access_token", "authorization", "auth"}
+            if parsed.username or parsed.password or forbidden & set(parse_qs(parsed.query)):
+                raise ValueError("Prometheus URL must not contain credentials")
+            if parsed.scheme == "http" and not self.allow_insecure_test_endpoint:
+                raise ValueError(
+                    "plain HTTP Prometheus requires allow_insecure_test_endpoint=true")
+        if type(self.allow_insecure_test_endpoint) is not bool:
+            raise TypeError("allow_insecure_test_endpoint must be boolean")
+        for name in ("timeout_sec", "retry_initial_sec", "retry_max_sec",
+                     "query_step_sec"):
+            if _finite(f"prometheus.{name}", getattr(self, name)) <= 0:
+                raise ValueError(f"prometheus.{name} must be positive")
+        for name in ("collection_delay_sec", "maximum_sample_lateness_sec"):
+            if _finite(f"prometheus.{name}", getattr(self, name)) < 0:
+                raise ValueError(f"prometheus.{name} must be non-negative")
+        if isinstance(self.max_retries, bool) or not isinstance(self.max_retries, int) or self.max_retries < 0:
+            raise ValueError("prometheus.max_retries must be a non-negative integer")
+        if self.retry_initial_sec > self.retry_max_sec:
+            raise ValueError("prometheus retry_initial_sec exceeds retry_max_sec")
+        specs = [*self.query_specs, *self.call_edge_query_specs]
+        if len({item.spec_id for item in specs}) != len(specs):
+            raise ValueError("Prometheus query spec IDs must be unique")
+        for item in specs:
+            item.validate()
+
+    @property
+    def fingerprint(self) -> str:
+        self.validate()
+        payload = asdict(self)
+        for name in ("token_file", "ca_file", "client_cert_file", "client_key_file"):
+            payload[name] = bool(payload[name])
+        return _stable_fingerprint(payload)
+
+
+@dataclass(frozen=True)
+class LeaderElectionConfig:
+    enabled: bool = True
+    lease_namespace: str = "default"
+    lease_name: str = "proberca"
+    holder_identity_source: str = "pod_uid"
+    lease_duration_sec: float = 15.0
+    renew_deadline_sec: float = 10.0
+    retry_period_sec: float = 2.0
+    run_state_annotation_max_bytes: int = 196608
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "LeaderElectionConfig":
+        result = cls(**_strict_dict(payload, set(cls.__dataclass_fields__), "leader_election"))
+        result.validate()
+        return result
+
+    def validate(self) -> None:
+        if not self.lease_namespace or not self.lease_name:
+            raise ValueError("Lease namespace and name are required")
+        if self.holder_identity_source not in {"pod_uid", "explicit_instance_id"}:
+            raise ValueError("holder_identity_source must be unique")
+        if not (self.lease_duration_sec > self.renew_deadline_sec > self.retry_period_sec > 0):
+            raise ValueError("lease duration must exceed renew deadline and retry period")
+        if isinstance(self.run_state_annotation_max_bytes, bool) or not (
+            0 < self.run_state_annotation_max_bytes <= 262144
+        ):
+            raise ValueError("Lease RunState annotation limit is invalid")
+
+
+@dataclass(frozen=True)
+class LiveLivenessConfig:
+    freeze_revision_timeout_sec: float = 10.0
+    topology_build_timeout_sec: float = 30.0
+    call_edge_collection_timeout_sec: float = 60.0
+    node_metric_collection_timeout_sec: float = 60.0
+    edge_metric_collection_timeout_sec: float = 60.0
+    record_adaptation_timeout_sec: float = 30.0
+    engine_process_timeout_sec: float = 120.0
+    generation_prepare_timeout_sec: float = 120.0
+    run_state_commit_timeout_sec: float = 30.0
+    output_projection_timeout_sec: float = 60.0
+    retention_timeout_sec: float = 30.0
+    progress_timeout_sec: float = 180.0
+    watchdog_poll_interval_sec: float = 1.0
+    watchdog_dump_grace_sec: float = 10.0
+    watchdog_exit_grace_sec: float = 30.0
+    transient_retry_max_attempts: int = 3
+    transient_retry_initial_backoff_sec: float = 1.0
+    transient_retry_max_backoff_sec: float = 10.0
+    backlog_not_ready_threshold: int = 10
+    backlog_fatal_threshold: int = 1000
+    maximum_stage_event_history: int = 256
+    attempt_audit_max_bytes: int = 1_048_576
+    attempt_audit_backup_count: int = 2
+    fail_stop_on_unrecoverable_stall: bool = True
+    controlled_stage_delay_enabled: bool = False
+    controlled_stage_delay_stage: str = ""
+    controlled_stage_delay_sec: float = 0.0
+    controlled_collection_fault_enabled: bool = False
+    controlled_transient_empty_attempts: int = 0
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "LiveLivenessConfig":
+        result = cls(**_strict_dict(
+            payload,
+            set(cls.__dataclass_fields__),
+            "live_liveness",
+        ))
+        result.validate()
+        return result
+
+    def validate(self) -> None:
+        timeout_names = (
+            "freeze_revision_timeout_sec",
+            "topology_build_timeout_sec",
+            "call_edge_collection_timeout_sec",
+            "node_metric_collection_timeout_sec",
+            "edge_metric_collection_timeout_sec",
+            "record_adaptation_timeout_sec",
+            "engine_process_timeout_sec",
+            "generation_prepare_timeout_sec",
+            "run_state_commit_timeout_sec",
+            "output_projection_timeout_sec",
+            "retention_timeout_sec",
+            "progress_timeout_sec",
+            "watchdog_poll_interval_sec",
+            "watchdog_dump_grace_sec",
+            "watchdog_exit_grace_sec",
+            "transient_retry_initial_backoff_sec",
+            "transient_retry_max_backoff_sec",
+        )
+        for name in timeout_names:
+            if _finite(f"live_liveness.{name}", getattr(self, name)) <= 0:
+                raise ValueError(f"live_liveness.{name} must be positive")
+        for name in (
+            "transient_retry_max_attempts",
+            "backlog_not_ready_threshold",
+            "backlog_fatal_threshold",
+            "maximum_stage_event_history",
+            "attempt_audit_max_bytes",
+            "attempt_audit_backup_count",
+        ):
+            _positive_int(f"live_liveness.{name}", getattr(self, name))
+        if self.transient_retry_initial_backoff_sec > self.transient_retry_max_backoff_sec:
+            raise ValueError("live liveness retry initial exceeds maximum")
+        if self.watchdog_poll_interval_sec >= self.progress_timeout_sec:
+            raise ValueError("watchdog poll must be shorter than progress timeout")
+        if self.watchdog_dump_grace_sec >= self.watchdog_exit_grace_sec:
+            raise ValueError("watchdog dump grace must be shorter than exit grace")
+        if self.backlog_fatal_threshold < self.backlog_not_ready_threshold:
+            raise ValueError("fatal backlog threshold must not be lower than readiness threshold")
+        if self.fail_stop_on_unrecoverable_stall is not True:
+            raise ValueError("production live liveness requires fail-stop")
+        if type(self.controlled_stage_delay_enabled) is not bool:
+            raise TypeError("controlled stage delay enabled must be boolean")
+        if self.controlled_stage_delay_enabled:
+            allowed = {item.value for item in self.stage_timeouts()}
+            if self.controlled_stage_delay_stage not in allowed:
+                raise ValueError("controlled stage delay requires a LiveStage")
+            if _finite(
+                "live_liveness.controlled_stage_delay_sec",
+                self.controlled_stage_delay_sec,
+            ) <= 0:
+                raise ValueError("controlled stage delay must be positive")
+        elif (
+            self.controlled_stage_delay_stage != ""
+            or self.controlled_stage_delay_sec != 0.0
+        ):
+            raise ValueError("disabled controlled stage delay must be empty")
+        if type(self.controlled_collection_fault_enabled) is not bool:
+            raise TypeError("controlled collection fault enabled must be boolean")
+        if self.controlled_collection_fault_enabled:
+            _positive_int(
+                "live_liveness.controlled_transient_empty_attempts",
+                self.controlled_transient_empty_attempts,
+            )
+            if (self.controlled_transient_empty_attempts
+                    >= self.transient_retry_max_attempts):
+                raise ValueError(
+                    "controlled transient empty attempts must permit recovery",
+                )
+        elif self.controlled_transient_empty_attempts != 0:
+            raise ValueError(
+                "disabled controlled collection fault must have zero attempts",
+            )
+
+    def stage_timeouts(self) -> dict:
+        from proberca.live.progress import LiveStage
+
+        return {
+            LiveStage.BEGIN_WINDOW: self.record_adaptation_timeout_sec,
+            LiveStage.FREEZE_REVISION: self.freeze_revision_timeout_sec,
+            LiveStage.BUILD_TOPOLOGY: self.topology_build_timeout_sec,
+            LiveStage.COLLECT_CALL_EDGES: self.call_edge_collection_timeout_sec,
+            LiveStage.COLLECT_NODE_METRICS: self.node_metric_collection_timeout_sec,
+            LiveStage.COLLECT_EDGE_METRICS: self.edge_metric_collection_timeout_sec,
+            LiveStage.ADAPT_RECORDS: self.record_adaptation_timeout_sec,
+            LiveStage.ADAPT_NODE_RECORDS: self.record_adaptation_timeout_sec,
+            LiveStage.ADAPT_EDGE_RECORDS: self.record_adaptation_timeout_sec,
+            LiveStage.BUILD_ENGINE_INPUT: self.record_adaptation_timeout_sec,
+            LiveStage.ENGINE_PROCESS: self.engine_process_timeout_sec,
+            LiveStage.PREPARE_GENERATION: self.generation_prepare_timeout_sec,
+            LiveStage.COMMIT_RUN_STATE: self.run_state_commit_timeout_sec,
+            LiveStage.PROJECT_OUTPUT: self.output_projection_timeout_sec,
+            LiveStage.RETENTION: self.retention_timeout_sec,
+        }
+
+
+@dataclass(frozen=True)
+class LiveConfig:
+    window_sec: int = 1
+    start_alignment: str = "utc_epoch"
+    collection_delay_sec: float = 1.0
+    maximum_catchup_windows: int = 1
+    fail_on_missed_window: bool = True
+    checkpoint_every_windows: int = 1
+    output_flush_every_windows: int = 1
+    graceful_shutdown_timeout_sec: float = 30.0
+    leader_election: bool = True
+    health_bind: str = "127.0.0.1:8080"
+    metrics_bind: str = "127.0.0.1:9090"
+    topology_required: bool = True
+    prometheus_required: bool = True
+    call_edge_required: bool = True
+    normalized_evidence_required: bool = False
+    no_evidence_is_degraded_not_failed: bool = True
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "LiveConfig":
+        result = cls(**_strict_dict(payload, set(cls.__dataclass_fields__), "live"))
+        result.validate()
+        return result
+
+    def validate(self, engine_window_sec: int | None = None) -> None:
+        _positive_int("live.window_sec", self.window_sec)
+        if engine_window_sec is not None and self.window_sec != engine_window_sec:
+            raise ValueError("live.window_sec must match ProbeRCA window_sec")
+        if self.start_alignment != "utc_epoch":
+            raise ValueError("live start_alignment must be utc_epoch")
+        if self.collection_delay_sec < 0 or self.graceful_shutdown_timeout_sec <= 0:
+            raise ValueError("live delay/timeout is invalid")
+        for name in ("maximum_catchup_windows", "checkpoint_every_windows",
+                     "output_flush_every_windows"):
+            _positive_int(f"live.{name}", getattr(self, name))
+        if not self.topology_required:
+            raise ValueError("live cannot skip topology/Engine stages")
+
+
+@dataclass(frozen=True)
+class RetentionConfig:
+    checkpoint_generations: int = 2
+    checkpoint_min_age_sec: float = 60.0
+    report_retention_days: int = 30
+    failure_retention_days: int = 30
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "RetentionConfig":
+        result = cls(**_strict_dict(payload, set(cls.__dataclass_fields__), "retention"))
+        result.validate()
+        return result
+
+    def validate(self) -> None:
+        if self.checkpoint_generations < 2:
+            raise ValueError("retention must preserve current and previous checkpoint")
+        if self.checkpoint_min_age_sec < 0:
+            raise ValueError("checkpoint_min_age_sec must be non-negative")
+        _positive_int("report_retention_days", self.report_retention_days)
+        _positive_int("failure_retention_days", self.failure_retention_days)
+
+
 @dataclass(frozen=True)
 class ProbeRCAConfig:
     window_sec: int
@@ -1284,6 +1745,12 @@ class ProbeRCAConfig:
     ))
     alert_state: AlertStateConfig | None = None
     composite_alert_rules: list[CompositeAlertRule] = field(default_factory=list)
+    kubernetes: KubernetesConfig | None = None
+    prometheus: PrometheusConfig | None = None
+    live: LiveConfig | None = None
+    live_liveness: LiveLivenessConfig = field(default_factory=LiveLivenessConfig)
+    leader_election: LeaderElectionConfig | None = None
+    retention: RetentionConfig | None = None
 
     @classmethod
     def from_dict(cls, payload: dict) -> "ProbeRCAConfig":
@@ -1304,6 +1771,7 @@ class ProbeRCAConfig:
             "evidence", "quality", "penalties", "diagnosis", "orchestration", "replay",
             "aggregation_specs", "metric_signal_specs", "baseline", "score",
             "alert_state", "composite_alert_rules",
+            "kubernetes", "prometheus", "live", "live_liveness", "leader_election", "retention",
         }
         if not isinstance(payload, dict):
             raise TypeError("ProbeRCAConfig must be a dictionary")
@@ -1332,6 +1800,12 @@ class ProbeRCAConfig:
         )))
         values.setdefault("alert_state", None)
         values.setdefault("composite_alert_rules", [])
+        values.setdefault("kubernetes", None)
+        values.setdefault("prometheus", None)
+        values.setdefault("live", None)
+        values.setdefault("live_liveness", asdict(LiveLivenessConfig()))
+        values.setdefault("leader_election", None)
+        values.setdefault("retention", None)
         if not isinstance(values["aggregation_specs"], dict):
             raise TypeError("aggregation_specs must map stable output IDs to specs")
         if not isinstance(values["metric_signal_specs"], list):
@@ -1429,6 +1903,37 @@ class ProbeRCAConfig:
                 item if isinstance(item, CompositeAlertRule) else CompositeAlertRule.from_dict(item)
                 for item in values["composite_alert_rules"]
             ],
+            kubernetes=(
+                values["kubernetes"] if isinstance(values["kubernetes"], KubernetesConfig)
+                else (KubernetesConfig.from_dict(values["kubernetes"])
+                      if values["kubernetes"] is not None else None)
+            ),
+            prometheus=(
+                values["prometheus"] if isinstance(values["prometheus"], PrometheusConfig)
+                else (PrometheusConfig.from_dict(values["prometheus"])
+                      if values["prometheus"] is not None else None)
+            ),
+            live=(
+                values["live"] if isinstance(values["live"], LiveConfig)
+                else (LiveConfig.from_dict(values["live"])
+                      if values["live"] is not None else None)
+            ),
+            live_liveness=(
+                values["live_liveness"]
+                if isinstance(values["live_liveness"], LiveLivenessConfig)
+                else LiveLivenessConfig.from_dict(values["live_liveness"])
+            ),
+            leader_election=(
+                values["leader_election"]
+                if isinstance(values["leader_election"], LeaderElectionConfig)
+                else (LeaderElectionConfig.from_dict(values["leader_election"])
+                      if values["leader_election"] is not None else None)
+            ),
+            retention=(
+                values["retention"] if isinstance(values["retention"], RetentionConfig)
+                else (RetentionConfig.from_dict(values["retention"])
+                      if values["retention"] is not None else None)
+            ),
         )
 
     def to_dict(self) -> dict:

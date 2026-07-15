@@ -609,6 +609,12 @@ class TopologySnapshot(StrictRecord):
     resource_edges: list[TopologyEdge]
     service_nodes: list[ServiceNodePlacement] = field(default_factory=list)
     service_resources: list[ServiceResourceBinding] = field(default_factory=list)
+    structure_fingerprint: str | None = None
+    inventory_revision_id: str | None = None
+    resource_version_vector: dict[str, str] = field(default_factory=dict)
+    runtime_identity_fingerprints: list[str] = field(default_factory=list)
+    call_edge_provider_fingerprint: str | None = None
+    topology_build_issues: list[dict[str, Any]] = field(default_factory=list)
     record_type: str = field(default="topology_snapshot", init=False)
 
     _nested_list_fields = {
@@ -628,6 +634,22 @@ class TopologySnapshot(StrictRecord):
         if self.valid_to_ns <= self.valid_from_ns:
             raise ValueError("valid_to_ns must be greater than valid_from_ns")
         _identity_component("cluster_id", self.cluster_id)
+        for name in ("structure_fingerprint", "inventory_revision_id",
+                     "call_edge_provider_fingerprint"):
+            value = getattr(self, name)
+            if value is not None:
+                _required_string(name, value)
+        if not isinstance(self.resource_version_vector, dict) or any(
+                not isinstance(key, str) or not key or not isinstance(value, str) or not value
+                for key, value in self.resource_version_vector.items()):
+            raise ValueError("resource_version_vector must map kinds to opaque strings")
+        _string_list("runtime_identity_fingerprints", self.runtime_identity_fingerprints)
+        if len(self.runtime_identity_fingerprints) != len(set(self.runtime_identity_fingerprints)):
+            raise ValueError("runtime_identity_fingerprints contains duplicates")
+        if not isinstance(self.topology_build_issues, list) or any(
+                not isinstance(item, dict) or not item.get("reason_code")
+                for item in self.topology_build_issues):
+            raise ValueError("topology_build_issues must be structured")
         _string_list("services", self.services)
         if len(self.services) != len(set(self.services)):
             raise ValueError("services must not contain duplicates")

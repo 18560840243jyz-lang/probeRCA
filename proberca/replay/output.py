@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -12,6 +13,15 @@ from proberca.orchestration.state import OutputLedger
 
 class ReplayOutputError(ValueError):
     """Replay output is partial, conflicting, or unsafe to overwrite."""
+
+
+def _is_internal_writable_probe(path: Path) -> bool:
+    prefix, suffix = ".proberca-write-probe-", ".tmp"
+    name = path.name
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return False
+    token = name[len(prefix):-len(suffix)]
+    return len(token) == 32 and all(character in "0123456789abcdef" for character in token)
 
 
 def _canonical(value):
@@ -30,15 +40,23 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _atomic_write(path: Path, text: str) -> None:
+def _atomic_write(path: Path, text: str, *, operation=None,
+                  fence_token=None, fence_validator=None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
-    _fsync_directory(path.parent)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if fence_validator is not None:
+            fence_validator(operation or "output_publish", fence_token)
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _entries_text(entries: list[dict]) -> str:
@@ -69,7 +87,8 @@ class ReplayRunManifest:
 
 class ReplayOutputWriter:
     def __init__(self, directory, *, overwrite=False,
-                 resume_ledger: OutputLedger | None = None):
+                 resume_ledger: OutputLedger | None = None,
+                 previous_resume_ledger: OutputLedger | None = None):
         self.directory = Path(directory)
         if resume_ledger is None:
             if self.directory.exists() and any(self.directory.iterdir()) and not overwrite:
@@ -80,49 +99,89 @@ class ReplayOutputWriter:
         if not isinstance(resume_ledger, OutputLedger):
             raise TypeError("resume_ledger must be OutputLedger")
         self.directory.mkdir(parents=True, exist_ok=True)
-        self._materialize_resume(resume_ledger)
+        self._materialize_resume(
+            resume_ledger, previous_ledger=previous_resume_ledger)
 
-    def _validate_or_write(self, path: Path, expected: str) -> None:
+    def _validate_or_write(self, path: Path, expected: str, *,
+                           previous_expected=None, fence_token=None,
+                           fence_validator=None) -> None:
         if path.exists():
             try:
                 actual = path.read_text(encoding="utf-8")
             except Exception as error:
                 raise ReplayOutputError(f"cannot read existing output {path.name}: {error}") from error
-            if actual != expected:
+            if actual != expected and (
+                    previous_expected is None or actual != previous_expected):
                 raise ReplayOutputError(f"existing output conflicts with checkpoint ledger: {path.name}")
-            return
-        _atomic_write(path, expected)
+            if actual == expected:
+                return
+        _atomic_write(
+            path, expected, operation="output_publish",
+            fence_token=fence_token, fence_validator=fence_validator)
 
-    def _materialize_resume(self, ledger: OutputLedger) -> None:
+    def _materialize_resume(self, ledger: OutputLedger, *,
+                            previous_ledger=None, fence_token=None,
+                            fence_validator=None) -> None:
+        if previous_ledger is not None and not isinstance(previous_ledger, OutputLedger):
+            raise TypeError("previous_ledger must be OutputLedger")
         allowed = {
             "alerts.jsonl", "failures.jsonl", "run_manifest.json", "reports",
             "checkpoint", "evaluation.json",
         }
-        extras = sorted(item.name for item in self.directory.iterdir() if item.name not in allowed)
+        extras = sorted(
+            item.name for item in self.directory.iterdir()
+            if item.name not in allowed and not _is_internal_writable_probe(item))
         if extras:
             raise ReplayOutputError(f"resume output contains unknown files: {extras}")
         self._validate_or_write(
-            self.directory / "alerts.jsonl", _entries_text(ledger.alert_entries))
+            self.directory / "alerts.jsonl", _entries_text(ledger.alert_entries),
+            previous_expected=(_entries_text(previous_ledger.alert_entries)
+                               if previous_ledger is not None else None),
+            fence_token=fence_token, fence_validator=fence_validator)
         self._validate_or_write(
-            self.directory / "failures.jsonl", _entries_text(ledger.failure_entries))
+            self.directory / "failures.jsonl", _entries_text(ledger.failure_entries),
+            previous_expected=(_entries_text(previous_ledger.failure_entries)
+                               if previous_ledger is not None else None),
+            fence_token=fence_token, fence_validator=fence_validator)
         reports = self.directory / "reports"
         reports.mkdir(exist_ok=True)
         expected_reports = {
             f"{item['object_id']}.json": _canonical(item["payload"])
             for item in ledger.report_entries
         }
+        previous_reports = ({
+            f"{item['object_id']}.json": _canonical(item["payload"])
+            for item in previous_ledger.report_entries
+        } if previous_ledger is not None else {})
         existing = {item.name for item in reports.glob("*.json")}
         unexpected = sorted(existing - set(expected_reports))
         if unexpected:
             raise ReplayOutputError(f"resume output contains conflicting reports: {unexpected}")
         for name, payload in expected_reports.items():
-            self._validate_or_write(reports / name, payload)
+            self._validate_or_write(
+                reports / name, payload, fence_token=fence_token,
+                fence_validator=fence_validator,
+                previous_expected=previous_reports.get(name))
         if ledger.run_manifest_payload is not None:
             self._validate_or_write(
                 self.directory / "run_manifest.json",
-                _canonical(ledger.run_manifest_payload))
+                _canonical(ledger.run_manifest_payload),
+                previous_expected=(
+                    _canonical(previous_ledger.run_manifest_payload)
+                    if previous_ledger is not None and
+                    previous_ledger.run_manifest_payload is not None else None),
+                fence_token=fence_token, fence_validator=fence_validator)
         _fsync_directory(reports)
         _fsync_directory(self.directory)
+
+    def materialize_ledger(self, ledger: OutputLedger, *,
+                           previous_ledger=None, fence_token=None,
+                           fence_validator=None) -> None:
+        if not isinstance(ledger, OutputLedger):
+            raise TypeError("ledger must be OutputLedger")
+        self._materialize_resume(
+            ledger, previous_ledger=previous_ledger,
+            fence_token=fence_token, fence_validator=fence_validator)
 
     @staticmethod
     def _unique(values, identity, label):

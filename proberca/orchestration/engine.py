@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from dataclasses import asdict, replace
@@ -96,6 +97,21 @@ class ProbeRCAEngine:
         self._alerts = []
         self._reports = []
         self._failures = []
+
+    def fork_for_window(self) -> "ProbeRCAEngine":
+        """Return an isolated working copy for an uncommitted live window."""
+        return copy.deepcopy(self)
+
+    def adopt_committed_working_engine(
+        self, working_engine: "ProbeRCAEngine",
+    ) -> None:
+        """Replace active state only after the live commit authority succeeds."""
+        if not isinstance(working_engine, ProbeRCAEngine):
+            raise TypeError("working_engine must be ProbeRCAEngine")
+        if working_engine.config_fingerprint != self.config_fingerprint:
+            raise EngineStateError("working engine config fingerprint mismatch")
+        self.__dict__.clear()
+        self.__dict__.update(working_engine.__dict__)
 
     def _resolve_signal(self, record):
         matches = [item for item in self.signal_specs

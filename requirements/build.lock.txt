@@ -1,0 +1,7 @@
+# proberca-lock-metadata: {"lock_fingerprint":"dc3bf70e07fdba87aec37ff23d6cd7acb1fc44f51ba4a1337ee217deb8c5d0bb","pip_version":"23.0.1","python_version":"3.10","schema_version":"proberca-dependency-lock-v1","source_input_fingerprint":"c92a1b9003f23546f88d5702d86dd3e3c1f41bcee26dbf9da4b62ab737ad9cef","target_architecture":"x86_64","target_os":"linux"}
+packaging==26.2 \
+    --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
+setuptools==79.0.1 \
+    --hash=sha256:e147c0549f27767ba362f9da434eab9c5dc0045d5304feb602a0af001089fc51
+wheel==0.46.3 \
+    --hash=sha256:4b399d56c9d9338230118d705d9737a2a468ccca63d5e813e2a4fc7815d8bc4d

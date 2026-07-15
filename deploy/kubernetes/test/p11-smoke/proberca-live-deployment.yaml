@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proberca-live
+  labels:
+    proberca.io/workload-role: live-runner
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: proberca-live
+  template:
+    metadata:
+      labels:
+        app: proberca-live
+        proberca.io/workload-role: live-runner
+    spec:
+      serviceAccountName: proberca-smoke
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65534
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: proberca
+        image: PROBERCA_P11_IMAGE
+        imagePullPolicy: IfNotPresent
+        command:
+        - python3
+        - -m
+        - proberca.cli.live
+        args:
+        - --config
+        - /etc/proberca/config.yaml
+        - --in-cluster
+        env:
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: PROBERCA_OUTPUT_DIR
+          value: /var/lib/proberca/output
+        - name: PROBERCA_CHECKPOINT_DIR
+          value: /var/lib/proberca/checkpoint
+        ports:
+        - name: health
+          containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /podreadyz
+            port: health
+          periodSeconds: 2
+        livenessProbe:
+          httpGet:
+            path: /livez
+            port: health
+          periodSeconds: 2
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: config
+          mountPath: /etc/proberca
+          readOnly: true
+        - name: state
+          mountPath: /var/lib/proberca
+      volumes:
+      - name: config
+        configMap:
+          name: proberca-live-config
+      - name: state
+        persistentVolumeClaim:
+          claimName: proberca-live-state

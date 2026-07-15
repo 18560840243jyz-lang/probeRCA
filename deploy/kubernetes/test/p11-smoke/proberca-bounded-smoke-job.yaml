@@ -1,0 +1,69 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: proberca-bounded-smoke
+  labels:
+    app.kubernetes.io/managed-by: proberca-p11-smoke
+    proberca.io/smoke-run-id: P11_SMOKE_RUN_ID
+    proberca.io/smoke-purpose: p11-final-gate
+    proberca.io/workload-role: bounded-runner
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: proberca-bounded-smoke
+        app.kubernetes.io/managed-by: proberca-p11-smoke
+        proberca.io/smoke-run-id: P11_SMOKE_RUN_ID
+        proberca.io/smoke-purpose: p11-final-gate
+        proberca.io/workload-role: bounded-runner
+    spec:
+      restartPolicy: Never
+      serviceAccountName: proberca-smoke
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: proberca
+        image: PROBERCA_P11_IMAGE
+        imagePullPolicy: IfNotPresent
+        command:
+        - python3
+        - -m
+        - proberca.cli.live
+        args:
+        - --config
+        - /etc/proberca/config.yaml
+        - --in-cluster
+        - --max-windows
+        - '3'
+        env:
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: PROBERCA_OUTPUT_DIR
+          value: /var/lib/proberca/output
+        - name: PROBERCA_CHECKPOINT_DIR
+          value: /var/lib/proberca/checkpoint
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: config
+          mountPath: /etc/proberca
+          readOnly: true
+        - name: state
+          mountPath: /var/lib/proberca
+      volumes:
+      - name: config
+        configMap:
+          name: proberca-live-config
+      - name: state
+        persistentVolumeClaim:
+          claimName: proberca-live-state

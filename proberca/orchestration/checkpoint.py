@@ -25,13 +25,113 @@ from proberca.propagation.metric_model import (
 from proberca.propagation.metric_ridge import MetricPropagationLearner
 from proberca.propagation.service_rls import ServicePropagationLearner
 from proberca.topology import TopologyStore
+from proberca.live.sequence import validate_sequence_continuity
 
 from .state import OutputLedger, PendingIncident, ReplayIncidentFailure
 
 
-CHECKPOINT_FORMAT_VERSION = "2"
+CHECKPOINT_FORMAT_VERSION = "4"
 CHECKPOINT_SCHEMA_VERSION = "1.0"
-CODE_FINGERPRINT = "p10.1-checkpoint-schema-2"
+CODE_FINGERPRINT = "p11.3-fenced-checkpoint-schema-4"
+
+
+def _safe_temp_component(value, field):
+    text = str(value)
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+    if not text or Path(text).name != text or any(
+            character not in allowed for character in text):
+        raise ReplayCheckpointError(f"invalid checkpoint {field}")
+    return text
+
+
+def temporary_generation_path(generations, generation_id,
+                              instance_fingerprint, transaction_id):
+    generation = _safe_temp_component(generation_id, "generation ID")
+    instance = _safe_temp_component(instance_fingerprint, "instance fingerprint")
+    transaction = _safe_temp_component(transaction_id, "transaction ID")
+    return Path(generations) / f".{generation}.{instance}.{transaction}.tmp"
+
+
+def temporary_current_path(root, instance_fingerprint, transaction_id):
+    instance = _safe_temp_component(instance_fingerprint, "instance fingerprint")
+    transaction = _safe_temp_component(transaction_id, "transaction ID")
+    return Path(root) / f".CURRENT.{instance}.{transaction}.tmp"
+
+
+def cleanup_owned_temporaries(generations, instance_fingerprint,
+                              active_transaction_ids=()):
+    generations = Path(generations)
+    instance = _safe_temp_component(instance_fingerprint, "instance fingerprint")
+    active = {str(value) for value in active_transaction_ids}
+    removed = []
+    marker = f".{instance}."
+    for path in sorted(generations.iterdir()):
+        if not path.is_dir() or not path.name.startswith(".") or \
+                not path.name.endswith(".tmp") or marker not in path.name:
+            continue
+        transaction = path.name[:-4].rsplit(".", 1)[-1]
+        if transaction in active:
+            continue
+        shutil.rmtree(path)
+        removed.append(path.name)
+    if removed:
+        _fsync_directory(generations)
+    return removed
+
+
+def apply_checkpoint_retention(root, config, *, now_ns,
+                               instance_fingerprint=None,
+                               active_transaction_ids=()):
+    """Delete only old, unselected generations after CURRENT is committed."""
+    root = Path(root)
+    generations = root / "generations"
+    issues = []
+    try:
+        current = json.loads((root / "CURRENT").read_text(encoding="utf-8"))
+        current_id = current["generation_id"]
+    except Exception as error:
+        raise ReplayCheckpointError(f"retention cannot read CURRENT: {error}") from error
+    entries = []
+    for path in sorted(generations.iterdir()):
+        if path.name.startswith(".") and path.name.endswith(".tmp"):
+            if instance_fingerprint is not None:
+                continue
+            try:
+                shutil.rmtree(path)
+            except OSError as error:
+                issues.append({"reason_code": "checkpoint_orphan_cleanup_failed",
+                               "object_id": path.name, "detail": str(error)})
+            continue
+        if not path.is_dir():
+            continue
+        try:
+            metadata = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
+            created = int(metadata["created_at_ns"])
+        except Exception:
+            continue
+        entries.append((created, path.name, path))
+    if instance_fingerprint is not None:
+        try:
+            cleanup_owned_temporaries(
+                generations, instance_fingerprint, active_transaction_ids)
+        except OSError as error:
+            issues.append({"reason_code": "checkpoint_orphan_cleanup_failed",
+                           "object_id": str(instance_fingerprint),
+                           "detail": str(error)})
+    entries.sort(reverse=True)
+    keep = {current_id}
+    keep.update(name for _, name, _ in entries
+                if name != current_id and len(keep) < config.checkpoint_generations)
+    minimum_age_ns = int(config.checkpoint_min_age_sec * 1_000_000_000)
+    for created, name, path in entries:
+        if name in keep or now_ns - created < minimum_age_ns:
+            continue
+        try:
+            shutil.rmtree(path)
+        except OSError as error:
+            issues.append({"reason_code": "checkpoint_retention_failed",
+                           "object_id": name, "detail": str(error)})
+    return issues
 
 
 class ReplayCheckpointError(ValueError):
@@ -119,8 +219,9 @@ def _validate_generation(path: Path, expected_fingerprint: str | None = None) ->
         "format_version", "schema_version", "code_fingerprint", "manifest_hash",
         "config_fingerprint", "replay_sequence", "last_timestamp",
         "has_metric_model", "latest_candidate", "pending", "hard_alert",
-        "alerts", "reports", "failures", "output_ledger", "component_sha256",
-        "created_at_ns", "checkpoint_fingerprint",
+        "alerts", "reports", "failures", "output_ledger",
+        "previous_output_ledger", "component_sha256",
+        "sequence_journal", "created_at_ns", "checkpoint_fingerprint",
     }
     if set(metadata) != required:
         raise ReplayCheckpointError("checkpoint metadata fields mismatch")
@@ -135,6 +236,16 @@ def _validate_generation(path: Path, expected_fingerprint: str | None = None) ->
     if _component_hashes(path) != metadata["component_sha256"]:
         raise ReplayCheckpointError("checkpoint component hash mismatch")
     OutputLedger.from_dict(metadata["output_ledger"])
+    if metadata["previous_output_ledger"] is not None:
+        OutputLedger.from_dict(metadata["previous_output_ledger"])
+    continuity = validate_sequence_continuity(metadata["sequence_journal"])
+    if continuity.gap_count or continuity.duplicate_count or \
+            continuity.max_holders_per_sequence > 1:
+        raise ReplayCheckpointError("checkpoint sequence journal is invalid")
+    if metadata["sequence_journal"] and \
+            int(metadata["sequence_journal"][-1]["sequence"]) != \
+            int(metadata["replay_sequence"]):
+        raise ReplayCheckpointError("checkpoint sequence journal is not current")
     return metadata
 
 
@@ -153,7 +264,21 @@ def _generation_id(engine, replay_sequence: int, created_at_ns: int) -> str:
     return f"{replay_sequence:020d}-{_sha_bytes(_canonical(seed))[:20]}"
 
 
-def save_engine_checkpoint(engine, directory, *, manifest_hash, replay_sequence):
+def save_engine_checkpoint(engine, directory, *, manifest_hash, replay_sequence,
+                           fence_token=None, fence_validator=None,
+                           instance_fingerprint=None, transaction_id=None,
+                           sequence_entry_factory=None):
+    if (fence_token is None) != (fence_validator is None):
+        raise ReplayCheckpointError(
+            "checkpoint fence token and validator must be provided together")
+    if fence_validator is not None and (not instance_fingerprint or not transaction_id):
+        raise ReplayCheckpointError(
+            "fenced checkpoint requires instance and transaction identities")
+
+    def validate_fence(operation):
+        if fence_validator is not None:
+            fence_validator(operation, fence_token)
+
     root = Path(directory)
     generations = root / "generations"
     root.mkdir(parents=True, exist_ok=True)
@@ -163,10 +288,14 @@ def save_engine_checkpoint(engine, directory, *, manifest_hash, replay_sequence)
     created_at_ns = time.time_ns()
     generation_id = _generation_id(engine, replay_sequence, created_at_ns)
     final_generation = generations / generation_id
-    temp_generation = generations / f".{generation_id}.tmp"
+    temp_generation = (
+        temporary_generation_path(
+            generations, generation_id, instance_fingerprint, transaction_id)
+        if fence_validator is not None else generations / f".{generation_id}.tmp")
     if final_generation.exists() or temp_generation.exists():
         raise ReplayCheckpointError("checkpoint generation ID collision")
-    temp_generation.mkdir()
+    validate_fence("generation_prepare")
+    temp_generation.mkdir(exist_ok=False)
 
     engine.aggregator.save_json(temp_generation / "aggregator.json")
     engine.baseline.save_json(temp_generation / "baseline.json")
@@ -194,7 +323,16 @@ def save_engine_checkpoint(engine, directory, *, manifest_hash, replay_sequence)
         config_fingerprint=engine.config_fingerprint,
         run_manifest_payload=run_manifest_payload,
     )
-    engine._output_ledger = ledger
+    sequence_journal = [
+        dict(item) for item in getattr(engine, "_sequence_journal", ())]
+    if sequence_entry_factory is not None:
+        entry = dict(sequence_entry_factory(generation_id, ledger))
+        if sequence_journal and int(entry["sequence"]) != \
+                int(sequence_journal[-1]["sequence"]) + 1:
+            raise ReplayCheckpointError("checkpoint sequence is not continuous")
+        if int(entry["sequence"]) != int(replay_sequence):
+            raise ReplayCheckpointError("checkpoint sequence entry mismatch")
+        sequence_journal.append(entry)
     metadata = {
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -211,6 +349,10 @@ def save_engine_checkpoint(engine, directory, *, manifest_hash, replay_sequence)
         "reports": [item.to_dict() for item in engine._reports],
         "failures": [item.to_dict() for item in engine._failures],
         "output_ledger": ledger.to_dict(),
+        "previous_output_ledger": (
+            previous_ledger.to_dict()
+            if isinstance(previous_ledger, OutputLedger) else None),
+        "sequence_journal": sequence_journal,
         "component_sha256": _component_hashes(temp_generation),
         "created_at_ns": created_at_ns,
     }
@@ -219,6 +361,7 @@ def save_engine_checkpoint(engine, directory, *, manifest_hash, replay_sequence)
     _fsync_tree(temp_generation)
     _validate_generation(temp_generation, metadata["checkpoint_fingerprint"])
 
+    validate_fence("generation_publish")
     os.replace(temp_generation, final_generation)
     _fsync_directory(generations)
     current_payload = {
@@ -227,12 +370,24 @@ def save_engine_checkpoint(engine, directory, *, manifest_hash, replay_sequence)
         "checkpoint_fingerprint": metadata["checkpoint_fingerprint"],
         "created_at_ns": created_at_ns,
     }
-    current_temp = root / "CURRENT.tmp"
+    current_temp = (
+        temporary_current_path(root, instance_fingerprint, transaction_id)
+        if fence_validator is not None else root / "CURRENT.tmp")
     _write_json_fsync(current_temp, current_payload)
+    validate_fence("current_replace")
     os.replace(current_temp, root / "CURRENT")
     _fsync_directory(root)
+    engine._output_ledger = ledger
+    engine._previous_output_ledger = (
+        previous_ledger if isinstance(previous_ledger, OutputLedger) else None)
+    engine._sequence_journal = sequence_journal
     try:
-        _cleanup_orphan_temporaries(generations)
+        if fence_validator is None:
+            _cleanup_orphan_temporaries(generations)
+        else:
+            cleanup_owned_temporaries(
+                generations, instance_fingerprint,
+                active_transaction_ids=(transaction_id,))
     except OSError as error:
         engine._checkpoint_issues = [{
             "reason_code": "checkpoint_cleanup_failed",
@@ -240,6 +395,11 @@ def save_engine_checkpoint(engine, directory, *, manifest_hash, replay_sequence)
         }]
     else:
         engine._checkpoint_issues = []
+    return {
+        "generation_id": generation_id,
+        "checkpoint_fingerprint": metadata["checkpoint_fingerprint"],
+        "output_ledger": ledger,
+    }
 
 
 def _selected_generation(root: Path) -> tuple[Path, dict]:
@@ -324,6 +484,10 @@ def restore_engine_checkpoint(engine, directory, *, manifest_hash):
         engine._reports = [RCAReport.from_dict(item) for item in metadata["reports"]]
         engine._failures = [ReplayIncidentFailure(**item) for item in metadata["failures"]]
         engine._output_ledger = OutputLedger.from_dict(metadata["output_ledger"])
+        engine._previous_output_ledger = (
+            OutputLedger.from_dict(metadata["previous_output_ledger"])
+            if metadata["previous_output_ledger"] is not None else None)
+        engine._sequence_journal = [dict(item) for item in metadata["sequence_journal"]]
         return metadata["replay_sequence"]
     except ReplayCheckpointError:
         raise

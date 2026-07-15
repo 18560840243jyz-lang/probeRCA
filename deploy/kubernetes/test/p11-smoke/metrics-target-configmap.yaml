@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metrics-target-app
+data:
+  app.py: |
+    source = open("/source/app.py", encoding="utf-8").read()
+    exec(compile(source, "/source/app.py", "exec"))

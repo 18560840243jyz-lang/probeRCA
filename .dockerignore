@@ -1,0 +1,9 @@
+**
+!Dockerfile
+!pyproject.toml
+!requirements/
+!requirements/production.lock.txt
+!requirements/build.lock.txt
+!proberca/
+!proberca/**/
+!proberca/**/*.py

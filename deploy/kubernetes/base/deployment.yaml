@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proberca
+  namespace: proberca-system
+  annotations:
+    proberca.io/immutable-image-required: "true"
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: proberca}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: proberca}
+    spec:
+      serviceAccountName: proberca
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: proberca
+        image: proberca:0.0.0-image-must-be-overridden
+        args: ["--config", "/etc/proberca/config.yaml", "--in-cluster"]
+        ports:
+        - {name: health, containerPort: 8080}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: {drop: ["ALL"]}
+        livenessProbe:
+          httpGet: {path: /livez, port: health}
+        readinessProbe:
+          httpGet: {path: /podreadyz, port: health}
+        volumeMounts:
+        - {name: config, mountPath: /etc/proberca, readOnly: true}
+        - {name: credentials, mountPath: /var/run/secrets/proberca, readOnly: true}
+        - {name: state, mountPath: /var/lib/proberca}
+        - {name: tmp, mountPath: /tmp}
+      volumes:
+      - name: config
+        configMap: {name: proberca-config}
+      - name: credentials
+        secret: {secretName: proberca-credentials}
+      - name: state
+        persistentVolumeClaim: {claimName: proberca-state}
+      - name: tmp
+        emptyDir: {}

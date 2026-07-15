@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: proberca-config
+  namespace: proberca-system
+data:
+  README: "Mount a reviewed ProbeRCAConfig at /etc/proberca/config.yaml."

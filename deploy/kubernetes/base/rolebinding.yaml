@@ -1,0 +1,13 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: proberca-live
+  namespace: proberca-system
+subjects:
+- kind: ServiceAccount
+  name: proberca
+  namespace: proberca-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: proberca-live
