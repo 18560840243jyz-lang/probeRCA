@@ -1,0 +1,24 @@
+schema_version: probeRCA-final-collection-contract-v1
+normal_metric_roles:
+- {record_type: edge_metric, metric_name: dns_failure_rate, entity_type: edge, role: edge_failure, scopes: [service_pair], protocols: [dns], root_category: DNS, root_eligible: true, transform: identity, polarity: 1}
+- {record_type: edge_metric, metric_name: dns_latency_p95, entity_type: edge, role: edge_latency, scopes: [service_pair], protocols: [dns], root_category: DNS, root_eligible: true, transform: log1p, polarity: 1}
+- {record_type: edge_metric, metric_name: dns_query_count, entity_type: edge, role: edge_count, scopes: [service_pair], protocols: [dns], root_category: null, root_eligible: false, transform: identity, polarity: 1}
+- {record_type: edge_metric, metric_name: edge_failure_rate, entity_type: edge, role: edge_failure, scopes: [service_pair], protocols: [tcp], root_category: TCP, root_eligible: true, transform: identity, polarity: 1}
+- {record_type: edge_metric, metric_name: edge_latency_p95, entity_type: edge, role: edge_latency, scopes: [service_pair], protocols: [tcp], root_category: TCP, root_eligible: true, transform: log1p, polarity: 1}
+- {record_type: edge_metric, metric_name: edge_request_count, entity_type: edge, role: edge_count, scopes: [service_pair], protocols: [tcp], root_category: null, root_eligible: false, transform: identity, polarity: 1}
+- {record_type: node_metric, metric_name: cpu_psi, entity_type: host, role: host_cpu, scopes: [node], protocols: [], root_category: CPU, root_eligible: true, transform: identity, polarity: 1}
+- {record_type: node_metric, metric_name: cpu_throttle_ratio, entity_type: service, role: service_cpu_throttle, scopes: [service], protocols: [], root_category: CPU, root_eligible: true, transform: identity, polarity: 1}
+- {record_type: node_metric, metric_name: cpu_usage_rate, entity_type: service, role: service_cpu_usage, scopes: [service], protocols: [], root_category: CPU, root_eligible: true, transform: identity, polarity: 1}
+- {record_type: node_metric, metric_name: futex_wait_time_rate, entity_type: service, role: service_lock, scopes: [service], protocols: [], root_category: Lock, root_eligible: true, transform: identity, polarity: 1}
+- {record_type: node_metric, metric_name: io_psi, entity_type: host, role: host_io, scopes: [node], protocols: [], root_category: IO, root_eligible: true, transform: identity, polarity: 1}
+- {record_type: node_metric, metric_name: io_psi, entity_type: service, role: service_io, scopes: [service], protocols: [], root_category: IO, root_eligible: true, transform: identity, polarity: 1}
+- {record_type: node_metric, metric_name: local_socket_failure_rate, entity_type: service, role: service_localnet, scopes: [service], protocols: [], root_category: LocalNet, root_eligible: true, transform: identity, polarity: 1}
+- {record_type: node_metric, metric_name: memory_psi, entity_type: host, role: host_memory, scopes: [node], protocols: [], root_category: Memory, root_eligible: true, transform: identity, polarity: 1}
+- {record_type: node_metric, metric_name: memory_working_set_ratio, entity_type: service, role: service_memory, scopes: [service], protocols: [], root_category: Memory, root_eligible: true, transform: identity, polarity: 1}
+- {record_type: node_metric, metric_name: nic_drop_error_rate, entity_type: host, role: host_nic, scopes: [node], protocols: [], root_category: NIC, root_eligible: true, transform: identity, polarity: 1}
+- {record_type: node_metric, metric_name: request_failure_rate, entity_type: service, role: request_failure, scopes: [service], protocols: [], root_category: null, root_eligible: false, transform: identity, polarity: 1}
+- {record_type: node_metric, metric_name: request_latency_p95, entity_type: service, role: request_latency, scopes: [service], protocols: [], root_category: null, root_eligible: false, transform: log1p, polarity: 1}
+- {record_type: node_metric, metric_name: request_rate, entity_type: service, role: request_rate, scopes: [service], protocols: [], root_category: null, root_eligible: false, transform: identity, polarity: 1}
+burst_evidence_source_type: burst_event
+burst_evidence_semantics: normalized_strength_times_quality
+window_sec: 1

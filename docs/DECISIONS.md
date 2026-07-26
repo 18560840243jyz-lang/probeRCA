@@ -168,3 +168,8 @@ The parent set is structure constrained rather than fully connected: self-lag, s
 
 The integrated pipeline now emits `05b_structured_propagation/` with structured parent sets, propagation edges, predictions, residuals, and metadata. Final service scoring consumes `structured_propagation_support`, `path_edge_support`, and `lag_support`; if structured support is unavailable, fallback is explicit in score components. B2P remains an existing-raw-metrics replay, not B3 real re-injection.
 
+## Final Data-Plane / Control-Plane Separation Decision
+
+The final ProbeRCA-BPF path must collect and seal all input windows before the RCA control algorithm consumes them. `proberca/dataplane` must not import or execute control-plane code, and `proberca/controlplane` must not invoke collectors or mutate a sealed archive. The legacy mixed `ProbeRCAEngine` path remains only for frozen historical regression compatibility and is not the canonical final-scheme entrypoint.
+
+Final normal metrics are service-level, node-level, or directed service-pair aggregates exactly as declared in `configs/final_collection_contract.yaml`; incomplete entity metric sets fail closed. Ground-truth, target configuration, injection paths, and expected-root fields are forbidden across the boundary. Burst evidence is collected after Hard in a distinct following window, is required to be independent from residual metrics, and may only reduce the matching `(entity, root category)` group penalty. The final path does not subtract Burst evidence from residuals, add a direct evidence ranking term, introduce a composite relation-strength variable, or perform counterfactual repeat solves.

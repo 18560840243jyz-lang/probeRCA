@@ -1,0 +1,17 @@
+# Final ProbeRCA-BPF control-plane configuration.
+# Metric taxonomy and group penalties use the frozen defaults in FinalControlConfig.
+window_sec: 1
+baseline_min_windows: 6
+service_lags: [1, 2]
+metric_lags: [1, 2]
+metric_min_training_rows: 4
+soft_threshold: 2.5
+soft_consecutive_windows: 2
+hard_threshold: 4.0
+hard_consecutive_windows: 2
+candidate_hops: 2
+service_edge_threshold: 0.05
+burst_window_count: 1
+burst_eta: 2.0
+l1_penalty: 0.15
+top_k: 5

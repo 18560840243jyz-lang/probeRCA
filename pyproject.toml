@@ -25,6 +25,8 @@ test = [
 [project.scripts]
 proberca-replay = "proberca.cli.replay:main"
 proberca-live = "proberca.cli.live:main"
+proberca-seal-collection = "proberca.cli.seal_collection:main"
+proberca-analyze-collection = "proberca.cli.analyze_collection:main"
 
 [tool.setuptools.packages.find]
 include = ["proberca*"]

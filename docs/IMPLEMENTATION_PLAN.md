@@ -384,3 +384,13 @@ The parent set is structure constrained rather than fully connected: self-lag, s
 
 The integrated pipeline now emits `05b_structured_propagation/` with structured parent sets, propagation edges, predictions, residuals, and metadata. Final service scoring consumes `structured_propagation_support`, `path_edge_support`, and `lag_support`; if structured support is unavailable, fallback is explicit in score components. B2P remains an existing-raw-metrics replay, not B3 real re-injection.
 
+## Final ProbeRCA-BPF Two-Plane Implementation
+
+- [x] Introduce an algorithm-free `CollectedWindow` boundary and label-safety guard.
+- [x] Add write-once sealed collection archives with contract and content fingerprints.
+- [x] Enforce complete final-scheme service, host, TCP-edge, and DNS-edge metric sets.
+- [x] Add an offline-only final control plane with Healthy `As`, Soft freeze/candidate pruning, healthy masked `Av`, signed cross-metric residuals, Burst penalty adjustment, and non-negative Sparse-Group FISTA.
+- [x] Remove counterfactual re-solves from the final path.
+- [x] Add separate seal/analyze commands and an adapter for existing engine windows.
+- [x] Add end-to-end separation, integrity, metric completeness, evidence, and label-isolation tests.
+- [ ] Migrate each real P13 collector metric name and aggregation scope to the final collection contract before the next real experiment run.
