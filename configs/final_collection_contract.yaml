@@ -1,24 +1,455 @@
-schema_version: probeRCA-final-collection-contract-v1
+schema_version: probeRCA-final-collection-contract-v2
 normal_metric_roles:
-- {record_type: edge_metric, metric_name: dns_failure_rate, entity_type: edge, role: edge_failure, scopes: [service_pair], protocols: [dns], root_category: DNS, root_eligible: true, transform: identity, polarity: 1}
-- {record_type: edge_metric, metric_name: dns_latency_p95, entity_type: edge, role: edge_latency, scopes: [service_pair], protocols: [dns], root_category: DNS, root_eligible: true, transform: log1p, polarity: 1}
-- {record_type: edge_metric, metric_name: dns_query_count, entity_type: edge, role: edge_count, scopes: [service_pair], protocols: [dns], root_category: null, root_eligible: false, transform: identity, polarity: 1}
-- {record_type: edge_metric, metric_name: edge_failure_rate, entity_type: edge, role: edge_failure, scopes: [service_pair], protocols: [tcp], root_category: TCP, root_eligible: true, transform: identity, polarity: 1}
-- {record_type: edge_metric, metric_name: edge_latency_p95, entity_type: edge, role: edge_latency, scopes: [service_pair], protocols: [tcp], root_category: TCP, root_eligible: true, transform: log1p, polarity: 1}
-- {record_type: edge_metric, metric_name: edge_request_count, entity_type: edge, role: edge_count, scopes: [service_pair], protocols: [tcp], root_category: null, root_eligible: false, transform: identity, polarity: 1}
-- {record_type: node_metric, metric_name: cpu_psi, entity_type: host, role: host_cpu, scopes: [node], protocols: [], root_category: CPU, root_eligible: true, transform: identity, polarity: 1}
-- {record_type: node_metric, metric_name: cpu_throttle_ratio, entity_type: service, role: service_cpu_throttle, scopes: [service], protocols: [], root_category: CPU, root_eligible: true, transform: identity, polarity: 1}
-- {record_type: node_metric, metric_name: cpu_usage_rate, entity_type: service, role: service_cpu_usage, scopes: [service], protocols: [], root_category: CPU, root_eligible: true, transform: identity, polarity: 1}
-- {record_type: node_metric, metric_name: futex_wait_time_rate, entity_type: service, role: service_lock, scopes: [service], protocols: [], root_category: Lock, root_eligible: true, transform: identity, polarity: 1}
-- {record_type: node_metric, metric_name: io_psi, entity_type: host, role: host_io, scopes: [node], protocols: [], root_category: IO, root_eligible: true, transform: identity, polarity: 1}
-- {record_type: node_metric, metric_name: io_psi, entity_type: service, role: service_io, scopes: [service], protocols: [], root_category: IO, root_eligible: true, transform: identity, polarity: 1}
-- {record_type: node_metric, metric_name: local_socket_failure_rate, entity_type: service, role: service_localnet, scopes: [service], protocols: [], root_category: LocalNet, root_eligible: true, transform: identity, polarity: 1}
-- {record_type: node_metric, metric_name: memory_psi, entity_type: host, role: host_memory, scopes: [node], protocols: [], root_category: Memory, root_eligible: true, transform: identity, polarity: 1}
-- {record_type: node_metric, metric_name: memory_working_set_ratio, entity_type: service, role: service_memory, scopes: [service], protocols: [], root_category: Memory, root_eligible: true, transform: identity, polarity: 1}
-- {record_type: node_metric, metric_name: nic_drop_error_rate, entity_type: host, role: host_nic, scopes: [node], protocols: [], root_category: NIC, root_eligible: true, transform: identity, polarity: 1}
-- {record_type: node_metric, metric_name: request_failure_rate, entity_type: service, role: request_failure, scopes: [service], protocols: [], root_category: null, root_eligible: false, transform: identity, polarity: 1}
-- {record_type: node_metric, metric_name: request_latency_p95, entity_type: service, role: request_latency, scopes: [service], protocols: [], root_category: null, root_eligible: false, transform: log1p, polarity: 1}
-- {record_type: node_metric, metric_name: request_rate, entity_type: service, role: request_rate, scopes: [service], protocols: [], root_category: null, root_eligible: false, transform: identity, polarity: 1}
+- record_type: edge_metric
+  metric_name: dns_failure_rate
+  entity_type: edge
+  role: edge_failure
+  scopes:
+  - service_pair
+  protocols:
+  - dns
+  root_category: DNS
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: ratio_from_summed_components
+  aggregation_formula: sum_flow(delta(dns_timeout+dns_error_rcode))/(sum_flow(delta(dns_query_total))+epsilon)
+  source_scope: flow
+  quantile: null
+- record_type: edge_metric
+  metric_name: dns_latency_p95
+  entity_type: edge
+  role: edge_latency
+  scopes:
+  - service_pair
+  protocols:
+  - dns
+  root_category: DNS
+  root_eligible: true
+  transform: log1p
+  polarity: 1
+  unit: milliseconds
+  metric_kind: quantile
+  aggregation: histogram_merge_quantile
+  aggregation_formula: q0.95(merge_flow(dns_latency_histogram))
+  source_scope: flow
+  quantile: 0.95
+- record_type: edge_metric
+  metric_name: dns_query_count
+  entity_type: edge
+  role: edge_count
+  scopes:
+  - service_pair
+  protocols:
+  - dns
+  root_category: null
+  root_eligible: false
+  transform: identity
+  polarity: 1
+  unit: queries
+  metric_kind: delta_counter
+  aggregation: cross_series_sum_delta
+  aggregation_formula: sum_flow(delta(dns_query_total))
+  source_scope: flow
+  quantile: null
+- record_type: edge_metric
+  metric_name: edge_failure_rate
+  entity_type: edge
+  role: edge_failure
+  scopes:
+  - service_pair
+  protocols:
+  - tcp
+  root_category: TCP
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: ratio_from_summed_components
+  aggregation_formula: sum_flow(delta(error_total+timeout_total))/(sum_flow(delta(request_total))+epsilon)
+  source_scope: flow
+  quantile: null
+- record_type: edge_metric
+  metric_name: edge_latency_p95
+  entity_type: edge
+  role: edge_latency
+  scopes:
+  - service_pair
+  protocols:
+  - tcp
+  root_category: TCP
+  root_eligible: true
+  transform: log1p
+  polarity: 1
+  unit: milliseconds
+  metric_kind: quantile
+  aggregation: histogram_merge_quantile
+  aggregation_formula: q0.95(merge_flow(edge_latency_histogram))
+  source_scope: flow
+  quantile: 0.95
+- record_type: edge_metric
+  metric_name: edge_request_count
+  entity_type: edge
+  role: edge_count
+  scopes:
+  - service_pair
+  protocols:
+  - tcp
+  root_category: null
+  root_eligible: false
+  transform: identity
+  polarity: 1
+  unit: requests
+  metric_kind: delta_counter
+  aggregation: cross_series_sum_delta
+  aggregation_formula: sum_flow(delta(request_total))
+  source_scope: flow
+  quantile: null
+- record_type: node_metric
+  metric_name: cpu_psi
+  entity_type: host
+  role: host_cpu
+  scopes:
+  - node
+  protocols: []
+  root_category: CPU
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: time_weighted_window_ratio
+  aggregation_formula: node_cpu_psi_some_ns/window_ns
+  source_scope: node
+  quantile: null
+- record_type: node_metric
+  metric_name: cpu_throttle_ratio
+  entity_type: service
+  role: service_cpu_throttle
+  scopes:
+  - service
+  protocols: []
+  root_category: CPU
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: ratio_from_summed_components
+  aggregation_formula: sum_container(delta(nr_throttled))/sum_container(delta(nr_periods)+epsilon)
+  source_scope: pod
+  quantile: null
+- record_type: node_metric
+  metric_name: cpu_usage_rate
+  entity_type: service
+  role: service_cpu_usage
+  scopes:
+  - service
+  protocols: []
+  root_category: CPU
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: counter_delta_then_cross_series_sum_ratio
+  aggregation_formula: sum_container(delta(cpu_time_ns))/(window_ns*allocated_cpu_cores)
+  source_scope: pod
+  quantile: null
+- record_type: node_metric
+  metric_name: futex_wait_time_rate
+  entity_type: service
+  role: service_lock
+  scopes:
+  - service
+  protocols: []
+  root_category: Lock
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: counter_delta_then_cross_series_sum_ratio
+  aggregation_formula: sum_cgroup(delta(futex_wait_ns))/(sum_cgroup(active_thread_ns)+epsilon)
+  source_scope: pod
+  quantile: null
+- record_type: node_metric
+  metric_name: io_psi
+  entity_type: host
+  role: host_io
+  scopes:
+  - node
+  protocols: []
+  root_category: IO
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: time_weighted_window_ratio
+  aggregation_formula: node_io_psi_some_ns/window_ns
+  source_scope: node
+  quantile: null
+- record_type: node_metric
+  metric_name: io_psi
+  entity_type: service
+  role: service_io
+  scopes:
+  - service
+  protocols: []
+  root_category: IO
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: time_weighted_window_ratio
+  aggregation_formula: sum_cgroup(io_psi_some_ns)/(window_ns*active_task_capacity+epsilon)
+  source_scope: pod
+  quantile: null
+- record_type: node_metric
+  metric_name: local_socket_failure_rate
+  entity_type: service
+  role: service_localnet
+  scopes:
+  - service
+  protocols: []
+  root_category: LocalNet
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: ratio_from_summed_components
+  aggregation_formula: sum_pod(delta(backlog_overflow+accept_fail+local_rst+local_drop))/(sum_pod(delta(socket_ops))+epsilon)
+  source_scope: pod
+  quantile: null
+- record_type: node_metric
+  metric_name: memory_psi
+  entity_type: host
+  role: host_memory
+  scopes:
+  - node
+  protocols: []
+  root_category: Memory
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: time_weighted_window_ratio
+  aggregation_formula: node_memory_psi_some_ns/window_ns
+  source_scope: node
+  quantile: null
+- record_type: node_metric
+  metric_name: memory_working_set_ratio
+  entity_type: service
+  role: service_memory
+  scopes:
+  - service
+  protocols: []
+  root_category: Memory
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: ratio_from_summed_components
+  aggregation_formula: sum_container(working_set_bytes)/(sum_container(memory_limit_bytes)+epsilon)
+  source_scope: pod
+  quantile: null
+- record_type: node_metric
+  metric_name: nic_drop_error_rate
+  entity_type: host
+  role: host_nic
+  scopes:
+  - node
+  protocols: []
+  root_category: NIC
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: events_per_second
+  metric_kind: gauge
+  aggregation: counter_delta_then_cross_series_sum_rate
+  aggregation_formula: sum_interface(delta(rx_drop+tx_drop+rx_error+tx_error))/window_sec
+  source_scope: node
+  quantile: null
+- record_type: node_metric
+  metric_name: request_failure_rate
+  entity_type: service
+  role: request_failure
+  scopes:
+  - service
+  protocols: []
+  root_category: null
+  root_eligible: false
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: ratio_from_summed_components
+  aggregation_formula: (sum_pod(delta(error_total))+sum_pod(delta(timeout_total)))/(sum_pod(delta(request_total))+epsilon)
+  source_scope: pod
+  quantile: null
+- record_type: node_metric
+  metric_name: request_latency_p95
+  entity_type: service
+  role: request_latency
+  scopes:
+  - service
+  protocols: []
+  root_category: null
+  root_eligible: false
+  transform: log1p
+  polarity: 1
+  unit: milliseconds
+  metric_kind: quantile
+  aggregation: histogram_merge_quantile
+  aggregation_formula: q0.95(merge_pod(request_latency_histogram))
+  source_scope: pod
+  quantile: 0.95
+- record_type: node_metric
+  metric_name: request_rate
+  entity_type: service
+  role: request_rate
+  scopes:
+  - service
+  protocols: []
+  root_category: null
+  root_eligible: false
+  transform: identity
+  polarity: 1
+  unit: requests_per_second
+  metric_kind: gauge
+  aggregation: counter_delta_then_cross_series_sum_rate
+  aggregation_formula: sum_pod(delta(request_total))/window_sec
+  source_scope: pod
+  quantile: null
+aggregation_output_source: final_window_aggregation
+aggregation_config_fingerprint: 23b5ad4169df77d68aaeaca0e2eee08286a106527348a8d373fb55204075566c
+source_description: final-window-aggregates-v1
 burst_evidence_source_type: burst_event
 burst_evidence_semantics: normalized_strength_times_quality
+burst_channel_roles:
+- channel_id: sched.runqueue_wait_p95
+  root_category: CPU
+  entity_types:
+  - service
+- channel_id: sched.wakeup_latency_p95
+  root_category: CPU
+  entity_types:
+  - service
+- channel_id: memory.major_page_fault_rate
+  root_category: Memory
+  entity_types:
+  - service
+- channel_id: memory.direct_reclaim_stall
+  root_category: Memory
+  entity_types:
+  - service
+- channel_id: memory.oom_victim
+  root_category: Memory
+  entity_types:
+  - service
+- channel_id: block.latency_p95
+  root_category: IO
+  entity_types:
+  - service
+- channel_id: block.queue_wait_p95
+  root_category: IO
+  entity_types:
+  - service
+- channel_id: futex.wait_count
+  root_category: Lock
+  entity_types:
+  - service
+- channel_id: futex.wait_p95
+  root_category: Lock
+  entity_types:
+  - service
+- channel_id: socket.queue_wait_p95
+  root_category: LocalNet
+  entity_types:
+  - service
+- channel_id: socket.backlog_overflow
+  root_category: LocalNet
+  entity_types:
+  - service
+- channel_id: socket.accept_connect_failure
+  root_category: LocalNet
+  entity_types:
+  - service
+- channel_id: host.sched.runqueue_wait_p95
+  root_category: CPU
+  entity_types:
+  - host
+- channel_id: host.sched.wakeup_latency_p95
+  root_category: CPU
+  entity_types:
+  - host
+- channel_id: host.memory.direct_reclaim_stall
+  root_category: Memory
+  entity_types:
+  - host
+- channel_id: host.memory.oom_victim
+  root_category: Memory
+  entity_types:
+  - host
+- channel_id: host.block.latency_p95
+  root_category: IO
+  entity_types:
+  - host
+- channel_id: host.block.queue_wait_p95
+  root_category: IO
+  entity_types:
+  - host
+- channel_id: nic.queue_drop_rate
+  root_category: NIC
+  entity_types:
+  - host
+- channel_id: nic.error_rate
+  root_category: NIC
+  entity_types:
+  - host
+- channel_id: nic.softirq_latency_p95
+  root_category: NIC
+  entity_types:
+  - host
+- channel_id: tcp.retrans_rate
+  root_category: TCP
+  entity_types:
+  - edge
+- channel_id: tcp.rto_rate
+  root_category: TCP
+  entity_types:
+  - edge
+- channel_id: tcp.rtt_p95
+  root_category: TCP
+  entity_types:
+  - edge
+- channel_id: tcp.connect_failure_rate
+  root_category: TCP
+  entity_types:
+  - edge
+- channel_id: tcp.rst_rate
+  root_category: TCP
+  entity_types:
+  - edge
+- channel_id: dns.query_latency_p95
+  root_category: DNS
+  entity_types:
+  - edge
+- channel_id: dns.timeout_rate
+  root_category: DNS
+  entity_types:
+  - edge
+- channel_id: dns.rcode_failure_rate
+  root_category: DNS
+  entity_types:
+  - edge
+burst_config_fingerprint: 96f5d13ada70e54eae52c476c1712b7f144fe38d9e3eef1c050e74c65c2bef22
 window_sec: 1

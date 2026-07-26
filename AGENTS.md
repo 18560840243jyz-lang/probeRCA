@@ -13,12 +13,16 @@ single VM pseudo-distributed verification
 
 P0 已冻结。
 P1 已冻结。
-A1-A10 已完成 label-safe modular repair and final blind audit。
-当前 B 阶段目标是：integrated blind RCA pipeline -> replay -> future re-injection。
 
-当前 B1/B1R 只允许做 integrated pipeline smoke 和 final result schema 修复。
-B2 才允许做 20 次已有 raw metrics 全量 replay。
-B3 才允许重新真实注入故障。
+当前唯一有效的新方案是：
+
+`skills/proberca/SKILL.md` 中保存的 ProbeRCA-BPF 最终定稿版。
+
+当前阶段是最终数据面/控制面分离实现的阻断项修复与 Healthy-only dry run
+准备。旧 A/B 阶段内容只保留为历史兼容背景，不再作为新实现方案。
+
+当前禁止真实故障注入。只有完成最终契约修复、测试、真实采集器迁移、
+Healthy-only 契约 dry run 和单事故 Pilot 审计后，才可进入正式采集。
 
 ## Frozen Logic Rules
 
@@ -36,10 +40,11 @@ B3 才允许重新真实注入故障。
 
 ## Current Implementation Category
 
-当前实现是 stable-only probeRCA modular prototype。
-中文解释：稳定传播版 probeRCA 模块化原型。
+当前实现是 Final ProbeRCA-BPF two-plane architecture checkpoint。
+中文解释：最终 ProbeRCA-BPF 数据面/控制面分离架构检查点。
 
-A3-A9 是 label-safe module previews。B1/B1R 正在把这些模块整合成端到端 blind RCA schema。
+它尚不是正式实验基线。旧混合 `ProbeRCAEngine` 只用于历史回归，
+不是最终方案入口。
 
 ## Still Not Production Ready
 

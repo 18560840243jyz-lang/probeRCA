@@ -16,7 +16,8 @@ def from_engine_window(
     required = (
         "window_start_ns", "window_end_ns", "node_metric_records",
         "edge_metric_records", "topology_snapshot_events",
-        "evidence_observations_available_by_cutoff", "source_record_ids",
+        "evidence_observations_available_by_cutoff",
+        "residual_source_record_ids",
         "replay_sequence_number",
     )
     missing = [name for name in required if not hasattr(window, name)]
@@ -25,7 +26,9 @@ def from_engine_window(
     metadata = dict(collection_metadata or {})
     reorder_issues = getattr(window, "reorder_issues", ())
     if reorder_issues:
-        metadata["reorder_issues"] = list(reorder_issues)
+        raise ValueError(
+            "legacy/reordered engine windows cannot cross the final data-plane boundary"
+        )
     assert_label_safe(metadata)
     return CollectedWindow.create(
         sequence=window.replay_sequence_number,
@@ -35,7 +38,7 @@ def from_engine_window(
         edge_metrics=window.edge_metric_records,
         topology_events=window.topology_snapshot_events,
         burst_evidence=window.evidence_observations_available_by_cutoff,
-        source_record_ids=window.source_record_ids,
+        residual_source_record_ids=window.residual_source_record_ids,
         collection_metadata=metadata,
     )
 
@@ -58,5 +61,7 @@ def seal_engine_windows(
         collection_metadata=collection_metadata,
     )
     for window in windows:
-        writer.append(from_engine_window(window))
+        writer.append(from_engine_window(
+            window, collection_metadata=collection_metadata,
+        ))
     return writer.seal()

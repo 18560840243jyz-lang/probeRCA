@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable
 
@@ -30,6 +31,18 @@ FORBIDDEN_INFERENCE_FIELDS = frozenset({
     "ground_truth",
     "expected_root",
 })
+_FORBIDDEN_NORMALIZED_KEYS = frozenset({
+    "rootservice", "rootmetric", "roottype", "rootedge", "rootcause",
+    "rootcauseservice", "rootcausemetric", "rootcausetype",
+    "targetservice", "targetmetric", "targetfaulttype", "targetedge",
+    "injectedpath", "injectionmethod", "incidentlabel", "incidentid",
+    "groundtruth", "expectedroot", "labels", "label", "fault", "note",
+})
+_STRING_LABEL_INJECTION = re.compile(
+    r"(?i)(?:root(?:[_\s-]*cause)?|target|ground[_\s-]*truth|"
+    r"incident|injected|injection)[_\s-]*"
+    r"(?:service|metric|type|edge|path|label|id)?\s*[:=]"
+)
 
 
 class GroundTruthFieldError(ValueError):
@@ -49,7 +62,14 @@ def fingerprint(value: Any) -> str:
 
 def assert_label_safe(value: Any, path: str = "$") -> None:
     if isinstance(value, dict):
-        forbidden = FORBIDDEN_INFERENCE_FIELDS & set(value)
+        forbidden = {
+            str(key) for key in value
+            if (
+                str(key) in FORBIDDEN_INFERENCE_FIELDS
+                or re.sub(r"[^a-z0-9]", "", str(key).casefold())
+                in _FORBIDDEN_NORMALIZED_KEYS
+            )
+        }
         if forbidden:
             names = ",".join(sorted(forbidden))
             raise GroundTruthFieldError(
@@ -60,6 +80,10 @@ def assert_label_safe(value: Any, path: str = "$") -> None:
     elif isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
             assert_label_safe(child, f"{path}[{index}]")
+    elif isinstance(value, str) and _STRING_LABEL_INJECTION.search(value):
+        raise GroundTruthFieldError(
+            f"ground_truth_string_forbidden at {path}"
+        )
 
 
 def _strict_records(name: str, values: Iterable, expected_type: type) -> tuple:
@@ -82,6 +106,15 @@ def _record_source_id(record) -> str:
     raise TypeError(f"unsupported data-plane record {type(record).__name__}")
 
 
+def _opaque_source_id(value: str) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("source:")
+        and len(value) == 71
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
+
+
 @dataclass(frozen=True)
 class CollectedWindow:
     """One fully collected, already aggregated window; it contains no algorithm state."""
@@ -96,6 +129,7 @@ class CollectedWindow:
     topology_events: tuple[TopologySnapshot, ...]
     burst_evidence: tuple[EvidenceObservationRecord, ...]
     source_record_ids: tuple[str, ...]
+    residual_source_record_ids: tuple[str, ...]
     collection_metadata: dict[str, Any]
     window_fingerprint: str
 
@@ -111,6 +145,7 @@ class CollectedWindow:
         topology_events=(),
         burst_evidence=(),
         source_record_ids=(),
+        residual_source_record_ids=(),
         collection_metadata=None,
     ) -> "CollectedWindow":
         nodes = _strict_records("node_metrics", node_metrics, NodeMetricRecord)
@@ -122,13 +157,24 @@ class CollectedWindow:
             "burst_evidence", burst_evidence, EvidenceObservationRecord,
         )
         metadata = dict(collection_metadata or {})
-        sources = tuple(sorted(source_record_ids or (
+        canonical_sources = tuple(sorted(
             _record_source_id(item)
             for item in (*nodes, *edges, *topology, *evidence)
-        )))
+        ))
+        supplied_sources = tuple(sorted(source_record_ids))
+        if supplied_sources and supplied_sources != canonical_sources:
+            raise GroundTruthFieldError(
+                "source_record_ids must be derived canonically from collected records"
+            )
+        sources = canonical_sources
+        residual_sources = tuple(sorted(residual_source_record_ids))
+        if not residual_sources:
+            raise ValueError(
+                "residual_source_record_ids are required for independence validation"
+            )
         all_records = (*nodes, *edges, *topology, *evidence)
         payload = {
-            "schema_version": "probeRCA-dataplane-window-v1",
+            "schema_version": "probeRCA-dataplane-window-v2",
             "sequence": sequence,
             "window_start_ns": window_start_ns,
             "window_end_ns": window_end_ns,
@@ -141,6 +187,7 @@ class CollectedWindow:
             "topology_events": [item.to_dict() for item in topology],
             "burst_evidence": [item.to_dict() for item in evidence],
             "source_record_ids": list(sources),
+            "residual_source_record_ids": list(residual_sources),
             "collection_metadata": metadata,
         }
         assert_label_safe(payload)
@@ -172,6 +219,7 @@ class CollectedWindow:
                 for item in payload["burst_evidence"]
             ),
             source_record_ids=tuple(payload["source_record_ids"]),
+            residual_source_record_ids=tuple(payload["residual_source_record_ids"]),
             collection_metadata=dict(payload["collection_metadata"]),
             window_fingerprint=payload["window_fingerprint"],
         )
@@ -183,7 +231,7 @@ class CollectedWindow:
         return cls._from_payload(dict(payload))
 
     def validate(self) -> None:
-        if self.schema_version != "probeRCA-dataplane-window-v1":
+        if self.schema_version != "probeRCA-dataplane-window-v2":
             raise ValueError("unsupported CollectedWindow schema_version")
         if isinstance(self.sequence, bool) or not isinstance(self.sequence, int) \
                 or self.sequence <= 0:
@@ -205,6 +253,41 @@ class CollectedWindow:
             raise ValueError("collected window crosses cluster identity")
         if tuple(sorted(set(self.source_record_ids))) != self.source_record_ids:
             raise ValueError("source_record_ids must be sorted and unique")
+        if not self.residual_source_record_ids \
+                or tuple(sorted(set(self.residual_source_record_ids))) \
+                != self.residual_source_record_ids \
+                or any(not _opaque_source_id(value)
+                       for value in self.residual_source_record_ids):
+            raise ValueError(
+                "residual_source_record_ids must be unique opaque source:SHA-256 IDs"
+            )
+        expected_sources = tuple(sorted(
+            _record_source_id(item)
+            for item in (
+                *self.node_metrics, *self.edge_metrics,
+                *self.topology_events, *self.burst_evidence,
+            )
+        ))
+        if self.source_record_ids != expected_sources:
+            raise GroundTruthFieldError(
+                "source_record_ids are not canonical record-derived identities"
+            )
+        normal_source_ids = set(self.residual_source_record_ids)
+        for evidence in self.burst_evidence:
+            if evidence.independent_from_residual is not True:
+                raise ValueError("Burst evidence must be independent from residual metrics")
+            if evidence.evidence_window_start_ns != self.window_start_ns \
+                    or evidence.evidence_window_end_ns != self.window_end_ns \
+                    or evidence.analysis_cutoff_ns != self.window_end_ns:
+                raise ValueError(
+                    "Burst evidence must belong exactly to its collected half-open window"
+                )
+            overlap = normal_source_ids & set(evidence.source_record_ids)
+            if overlap:
+                raise ValueError(
+                    "Burst evidence source overlaps residual metric source: "
+                    + ",".join(sorted(overlap))
+                )
         payload = self.to_dict()
         supplied = payload.pop("window_fingerprint")
         if supplied != fingerprint(payload):
@@ -217,5 +300,8 @@ class CollectedWindow:
         payload["topology_events"] = [item.to_dict() for item in self.topology_events]
         payload["burst_evidence"] = [item.to_dict() for item in self.burst_evidence]
         payload["source_record_ids"] = list(self.source_record_ids)
+        payload["residual_source_record_ids"] = list(
+            self.residual_source_record_ids
+        )
         assert_label_safe(payload)
         return payload

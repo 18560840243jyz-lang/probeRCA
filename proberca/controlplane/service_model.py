@@ -79,7 +79,11 @@ def allowed_service_graph(snapshot: TopologySnapshot) -> AllowedServiceGraph:
                     edge.dst_service, edge.protocol or "tcp",
                 ), source, target, edge.protocol or "tcp",
             ))
-        if edge.directed is False or relation_type in {"host", "resource"}:
+            # The observed communication identity remains caller -> callee, while
+            # the service influence mask learns caller -> callee and callee ->
+            # caller as two distinct coefficients.
+            relations.add((target, source, relation_type))
+        elif edge.directed is False or relation_type in {"host", "resource"}:
             relations.add((target, source, relation_type))
     placements = set()
     by_host = {}
@@ -121,7 +125,14 @@ class ServiceRLS:
         self._history: dict[int, dict[str, float]] = {}
         self._graph: AllowedServiceGraph | None = None
 
+    def reset(self) -> None:
+        """Drop every coefficient and lag row when the deployment layout changes."""
+        self._models = {}
+        self._history = {}
+        self._graph = None
+
     def _configure(self, graph: AllowedServiceGraph) -> None:
+        self._history = {}
         parents = {service: set() for service in graph.services}
         for parent, target, _relation_type in graph.relations:
             if parent in parents and target in parents:
@@ -133,10 +144,6 @@ class ServiceRLS:
                 for parent in sorted(parents[target])
                 for lag in self.config.service_lags
             )
-            previous = self._models.get(target)
-            if previous is not None and previous.feature_keys == keys:
-                models[target] = previous
-                continue
             size = len(keys)
             models[target] = _TargetRLS(
                 keys,

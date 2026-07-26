@@ -15,6 +15,57 @@ ROOT_CATEGORIES = frozenset({
 ENTITY_TYPES = frozenset({"service", "host", "edge"})
 RECORD_TYPES = frozenset({"node_metric", "edge_metric"})
 TRANSFORMS = frozenset({"identity", "log1p"})
+FINAL_METRIC_KINDS = frozenset({"gauge", "delta_counter", "quantile"})
+FINAL_AGGREGATIONS = frozenset({
+    "counter_delta_then_cross_series_sum_rate",
+    "counter_delta_then_cross_series_sum_ratio",
+    "ratio_from_summed_components",
+    "histogram_merge_quantile",
+    "time_weighted_window_ratio",
+    "cross_series_sum_delta",
+})
+FINAL_AGGREGATION_OUTPUT_SOURCE = "final_window_aggregation"
+FINAL_SOURCE_DESCRIPTION = "final-window-aggregates-v1"
+
+
+def default_burst_channel_roles() -> tuple[dict[str, Any], ...]:
+    """Exact Burst channels allowed to cross the final collection boundary."""
+    entries = (
+        ("sched.runqueue_wait_p95", "CPU", ("service",)),
+        ("sched.wakeup_latency_p95", "CPU", ("service",)),
+        ("memory.major_page_fault_rate", "Memory", ("service",)),
+        ("memory.direct_reclaim_stall", "Memory", ("service",)),
+        ("memory.oom_victim", "Memory", ("service",)),
+        ("block.latency_p95", "IO", ("service",)),
+        ("block.queue_wait_p95", "IO", ("service",)),
+        ("futex.wait_count", "Lock", ("service",)),
+        ("futex.wait_p95", "Lock", ("service",)),
+        ("socket.queue_wait_p95", "LocalNet", ("service",)),
+        ("socket.backlog_overflow", "LocalNet", ("service",)),
+        ("socket.accept_connect_failure", "LocalNet", ("service",)),
+        ("host.sched.runqueue_wait_p95", "CPU", ("host",)),
+        ("host.sched.wakeup_latency_p95", "CPU", ("host",)),
+        ("host.memory.direct_reclaim_stall", "Memory", ("host",)),
+        ("host.memory.oom_victim", "Memory", ("host",)),
+        ("host.block.latency_p95", "IO", ("host",)),
+        ("host.block.queue_wait_p95", "IO", ("host",)),
+        ("nic.queue_drop_rate", "NIC", ("host",)),
+        ("nic.error_rate", "NIC", ("host",)),
+        ("nic.softirq_latency_p95", "NIC", ("host",)),
+        ("tcp.retrans_rate", "TCP", ("edge",)),
+        ("tcp.rto_rate", "TCP", ("edge",)),
+        ("tcp.rtt_p95", "TCP", ("edge",)),
+        ("tcp.connect_failure_rate", "TCP", ("edge",)),
+        ("tcp.rst_rate", "TCP", ("edge",)),
+        ("dns.query_latency_p95", "DNS", ("edge",)),
+        ("dns.timeout_rate", "DNS", ("edge",)),
+        ("dns.rcode_failure_rate", "DNS", ("edge",)),
+    )
+    return tuple({
+        "channel_id": channel_id,
+        "root_category": root_category,
+        "entity_types": list(entity_types),
+    } for channel_id, root_category, entity_types in entries)
 
 
 @dataclass(frozen=True)
@@ -29,6 +80,12 @@ class MetricRoleSpec:
     root_eligible: bool = False
     transform: str = "identity"
     polarity: int = 1
+    unit: str = "ratio"
+    metric_kind: str = "gauge"
+    aggregation: str = "time_weighted_window_ratio"
+    aggregation_formula: str = "window_time_weighted_ratio"
+    source_scope: str = "service"
+    quantile: float | None = None
 
     def __post_init__(self) -> None:
         if self.record_type not in RECORD_TYPES:
@@ -53,6 +110,32 @@ class MetricRoleSpec:
             raise ValueError("metric role has invalid transform")
         if self.polarity not in {-1, 1}:
             raise ValueError("metric role polarity must be -1 or +1")
+        if not self.unit:
+            raise ValueError("metric role requires an output unit")
+        if self.metric_kind not in FINAL_METRIC_KINDS:
+            raise ValueError("metric role has invalid final metric_kind")
+        if self.aggregation not in FINAL_AGGREGATIONS:
+            raise ValueError("metric role has invalid aggregation semantics")
+        if not isinstance(self.aggregation_formula, str) \
+                or not self.aggregation_formula:
+            raise ValueError("metric role requires an exact aggregation formula")
+        if self.source_scope not in {"pod", "service", "node", "flow", "pod_pair", "service_pair"}:
+            raise ValueError("metric role has invalid source_scope")
+        if self.metric_kind == "quantile":
+            if self.aggregation != "histogram_merge_quantile" \
+                    or self.quantile != 0.95:
+                raise ValueError("final P95 metrics require merged histogram quantile 0.95")
+        elif self.quantile is not None:
+            raise ValueError("non-quantile final metrics cannot declare quantile")
+        if self.metric_kind == "delta_counter" \
+                and self.aggregation != "cross_series_sum_delta":
+            raise ValueError("final delta counters require cross-series delta sums")
+        if self.aggregation.startswith("counter_delta_then_") \
+                and self.metric_kind != "gauge":
+            raise ValueError("final counter-derived rates/ratios must be gauges")
+        if self.aggregation == "ratio_from_summed_components" \
+                and (self.metric_kind != "gauge" or self.unit != "ratio"):
+            raise ValueError("component ratios must emit ratio gauges")
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "MetricRoleSpec":
@@ -63,6 +146,12 @@ class MetricRoleSpec:
         values.setdefault("root_eligible", False)
         values.setdefault("transform", "identity")
         values.setdefault("polarity", 1)
+        values.setdefault("unit", "ratio")
+        values.setdefault("metric_kind", "gauge")
+        values.setdefault("aggregation", "time_weighted_window_ratio")
+        values.setdefault("aggregation_formula", "window_time_weighted_ratio")
+        values.setdefault("source_scope", "service")
+        values.setdefault("quantile", None)
         if set(values) != expected:
             raise ValueError("metric role fields mismatch")
         values["scopes"] = tuple(values["scopes"])
@@ -77,25 +166,93 @@ def default_metric_roles() -> tuple[MetricRoleSpec, ...]:
     service_scopes = ("service",)
     edge_scopes = ("service_pair",)
     return tuple(sorted((
-        MetricRoleSpec("node_metric", "request_rate", "service", "request_rate", service_scopes),
-        MetricRoleSpec("node_metric", "request_failure_rate", "service", "request_failure", service_scopes),
-        MetricRoleSpec("node_metric", "request_latency_p95", "service", "request_latency", service_scopes, transform="log1p"),
-        MetricRoleSpec("node_metric", "cpu_usage_rate", "service", "service_cpu_usage", service_scopes, root_category="CPU", root_eligible=True),
-        MetricRoleSpec("node_metric", "cpu_throttle_ratio", "service", "service_cpu_throttle", service_scopes, root_category="CPU", root_eligible=True),
-        MetricRoleSpec("node_metric", "memory_working_set_ratio", "service", "service_memory", service_scopes, root_category="Memory", root_eligible=True),
-        MetricRoleSpec("node_metric", "io_psi", "service", "service_io", service_scopes, root_category="IO", root_eligible=True),
-        MetricRoleSpec("node_metric", "futex_wait_time_rate", "service", "service_lock", service_scopes, root_category="Lock", root_eligible=True),
-        MetricRoleSpec("node_metric", "local_socket_failure_rate", "service", "service_localnet", service_scopes, root_category="LocalNet", root_eligible=True),
-        MetricRoleSpec("node_metric", "cpu_psi", "host", "host_cpu", ("node",), root_category="CPU", root_eligible=True),
-        MetricRoleSpec("node_metric", "memory_psi", "host", "host_memory", ("node",), root_category="Memory", root_eligible=True),
-        MetricRoleSpec("node_metric", "io_psi", "host", "host_io", ("node",), root_category="IO", root_eligible=True),
-        MetricRoleSpec("node_metric", "nic_drop_error_rate", "host", "host_nic", ("node",), root_category="NIC", root_eligible=True),
-        MetricRoleSpec("edge_metric", "edge_request_count", "edge", "edge_count", edge_scopes, protocols=("tcp",)),
-        MetricRoleSpec("edge_metric", "edge_latency_p95", "edge", "edge_latency", edge_scopes, protocols=("tcp",), root_category="TCP", root_eligible=True, transform="log1p"),
-        MetricRoleSpec("edge_metric", "edge_failure_rate", "edge", "edge_failure", edge_scopes, protocols=("tcp",), root_category="TCP", root_eligible=True),
-        MetricRoleSpec("edge_metric", "dns_query_count", "edge", "edge_count", edge_scopes, protocols=("dns",)),
-        MetricRoleSpec("edge_metric", "dns_latency_p95", "edge", "edge_latency", edge_scopes, protocols=("dns",), root_category="DNS", root_eligible=True, transform="log1p"),
-        MetricRoleSpec("edge_metric", "dns_failure_rate", "edge", "edge_failure", edge_scopes, protocols=("dns",), root_category="DNS", root_eligible=True),
+        MetricRoleSpec("node_metric", "request_rate", "service", "request_rate", service_scopes,
+                       unit="requests_per_second",
+                       aggregation="counter_delta_then_cross_series_sum_rate",
+                       aggregation_formula="sum_pod(delta(request_total))/window_sec",
+                       source_scope="pod"),
+        MetricRoleSpec("node_metric", "request_failure_rate", "service", "request_failure", service_scopes,
+                       aggregation="ratio_from_summed_components",
+                       aggregation_formula="(sum_pod(delta(error_total))+sum_pod(delta(timeout_total)))/(sum_pod(delta(request_total))+epsilon)",
+                       source_scope="pod"),
+        MetricRoleSpec("node_metric", "request_latency_p95", "service", "request_latency", service_scopes,
+                       transform="log1p", unit="milliseconds", metric_kind="quantile",
+                       aggregation="histogram_merge_quantile",
+                       aggregation_formula="q0.95(merge_pod(request_latency_histogram))",
+                       source_scope="pod", quantile=0.95),
+        MetricRoleSpec("node_metric", "cpu_usage_rate", "service", "service_cpu_usage", service_scopes,
+                       root_category="CPU", root_eligible=True,
+                       aggregation="counter_delta_then_cross_series_sum_ratio",
+                       aggregation_formula="sum_container(delta(cpu_time_ns))/(window_ns*allocated_cpu_cores)",
+                       source_scope="pod"),
+        MetricRoleSpec("node_metric", "cpu_throttle_ratio", "service", "service_cpu_throttle", service_scopes,
+                       root_category="CPU", root_eligible=True,
+                       aggregation="ratio_from_summed_components",
+                       aggregation_formula="sum_container(delta(nr_throttled))/sum_container(delta(nr_periods)+epsilon)",
+                       source_scope="pod"),
+        MetricRoleSpec("node_metric", "memory_working_set_ratio", "service", "service_memory", service_scopes,
+                       root_category="Memory", root_eligible=True,
+                       aggregation="ratio_from_summed_components",
+                       aggregation_formula="sum_container(working_set_bytes)/(sum_container(memory_limit_bytes)+epsilon)",
+                       source_scope="pod"),
+        MetricRoleSpec("node_metric", "io_psi", "service", "service_io", service_scopes,
+                       root_category="IO", root_eligible=True,
+                       aggregation_formula="sum_cgroup(io_psi_some_ns)/(window_ns*active_task_capacity+epsilon)",
+                       source_scope="pod"),
+        MetricRoleSpec("node_metric", "futex_wait_time_rate", "service", "service_lock", service_scopes,
+                       root_category="Lock", root_eligible=True,
+                       aggregation="counter_delta_then_cross_series_sum_ratio",
+                       aggregation_formula="sum_cgroup(delta(futex_wait_ns))/(sum_cgroup(active_thread_ns)+epsilon)",
+                       source_scope="pod"),
+        MetricRoleSpec("node_metric", "local_socket_failure_rate", "service", "service_localnet", service_scopes,
+                       root_category="LocalNet", root_eligible=True,
+                       aggregation="ratio_from_summed_components",
+                       aggregation_formula="sum_pod(delta(backlog_overflow+accept_fail+local_rst+local_drop))/(sum_pod(delta(socket_ops))+epsilon)",
+                       source_scope="pod"),
+        MetricRoleSpec("node_metric", "cpu_psi", "host", "host_cpu", ("node",),
+                       root_category="CPU", root_eligible=True,
+                       aggregation_formula="node_cpu_psi_some_ns/window_ns", source_scope="node"),
+        MetricRoleSpec("node_metric", "memory_psi", "host", "host_memory", ("node",),
+                       root_category="Memory", root_eligible=True,
+                       aggregation_formula="node_memory_psi_some_ns/window_ns", source_scope="node"),
+        MetricRoleSpec("node_metric", "io_psi", "host", "host_io", ("node",),
+                       root_category="IO", root_eligible=True,
+                       aggregation_formula="node_io_psi_some_ns/window_ns", source_scope="node"),
+        MetricRoleSpec("node_metric", "nic_drop_error_rate", "host", "host_nic", ("node",),
+                       root_category="NIC", root_eligible=True, unit="events_per_second",
+                       aggregation="counter_delta_then_cross_series_sum_rate",
+                       aggregation_formula="sum_interface(delta(rx_drop+tx_drop+rx_error+tx_error))/window_sec",
+                       source_scope="node"),
+        MetricRoleSpec("edge_metric", "edge_request_count", "edge", "edge_count", edge_scopes,
+                       protocols=("tcp",), unit="requests", metric_kind="delta_counter",
+                       aggregation="cross_series_sum_delta",
+                       aggregation_formula="sum_flow(delta(request_total))", source_scope="flow"),
+        MetricRoleSpec("edge_metric", "edge_latency_p95", "edge", "edge_latency", edge_scopes,
+                       protocols=("tcp",), root_category="TCP", root_eligible=True,
+                       transform="log1p", unit="milliseconds", metric_kind="quantile",
+                       aggregation="histogram_merge_quantile",
+                       aggregation_formula="q0.95(merge_flow(edge_latency_histogram))",
+                       source_scope="flow", quantile=0.95),
+        MetricRoleSpec("edge_metric", "edge_failure_rate", "edge", "edge_failure", edge_scopes,
+                       protocols=("tcp",), root_category="TCP", root_eligible=True,
+                       aggregation="ratio_from_summed_components",
+                       aggregation_formula="sum_flow(delta(error_total+timeout_total))/(sum_flow(delta(request_total))+epsilon)",
+                       source_scope="flow"),
+        MetricRoleSpec("edge_metric", "dns_query_count", "edge", "edge_count", edge_scopes,
+                       protocols=("dns",), unit="queries", metric_kind="delta_counter",
+                       aggregation="cross_series_sum_delta",
+                       aggregation_formula="sum_flow(delta(dns_query_total))", source_scope="flow"),
+        MetricRoleSpec("edge_metric", "dns_latency_p95", "edge", "edge_latency", edge_scopes,
+                       protocols=("dns",), root_category="DNS", root_eligible=True,
+                       transform="log1p", unit="milliseconds", metric_kind="quantile",
+                       aggregation="histogram_merge_quantile",
+                       aggregation_formula="q0.95(merge_flow(dns_latency_histogram))",
+                       source_scope="flow", quantile=0.95),
+        MetricRoleSpec("edge_metric", "dns_failure_rate", "edge", "edge_failure", edge_scopes,
+                       protocols=("dns",), root_category="DNS", root_eligible=True,
+                       aggregation="ratio_from_summed_components",
+                       aggregation_formula="sum_flow(delta(dns_timeout+dns_error_rcode))/(sum_flow(delta(dns_query_total))+epsilon)",
+                       source_scope="flow"),
     ), key=lambda item: (
         item.record_type, item.metric_name, item.entity_type, item.scopes, item.protocols,
     )))
@@ -114,9 +271,9 @@ class FinalControlConfig:
     metric_min_training_rows: int = 4
     alpha_latency: float = 0.5
     alpha_failure: float = 0.5
-    soft_threshold: float = 2.5
-    soft_consecutive_windows: int = 2
-    hard_threshold: float = 4.0
+    soft_threshold: float = 3.0
+    soft_consecutive_windows: int = 3
+    hard_threshold: float = 5.0
     hard_consecutive_windows: int = 2
     recovery_threshold: float = 1.0
     recovery_windows: int = 2
@@ -221,19 +378,34 @@ class FinalControlConfig:
 
     @property
     def collection_contract(self) -> dict[str, Any]:
+        roles = [
+            item.to_dict() for item in sorted(
+                self.metric_roles,
+                key=lambda value: (
+                    value.record_type, value.metric_name, value.entity_type,
+                    value.scopes, value.protocols,
+                ),
+            )
+        ]
+        burst_roles = list(default_burst_channel_roles())
+        aggregation_fingerprint = fingerprint({
+            "output_source": FINAL_AGGREGATION_OUTPUT_SOURCE,
+            "roles": roles,
+        })
+        burst_fingerprint = fingerprint({
+            "roles": burst_roles,
+            "semantics": "normalized_strength_times_quality",
+        })
         return {
-            "schema_version": "probeRCA-final-collection-contract-v1",
-            "normal_metric_roles": [
-                item.to_dict() for item in sorted(
-                    self.metric_roles,
-                    key=lambda value: (
-                        value.record_type, value.metric_name, value.entity_type,
-                        value.scopes, value.protocols,
-                    ),
-                )
-            ],
+            "schema_version": "probeRCA-final-collection-contract-v2",
+            "normal_metric_roles": roles,
+            "aggregation_output_source": FINAL_AGGREGATION_OUTPUT_SOURCE,
+            "aggregation_config_fingerprint": aggregation_fingerprint,
+            "source_description": FINAL_SOURCE_DESCRIPTION,
             "burst_evidence_source_type": "burst_event",
             "burst_evidence_semantics": "normalized_strength_times_quality",
+            "burst_channel_roles": burst_roles,
+            "burst_config_fingerprint": burst_fingerprint,
             "window_sec": self.window_sec,
         }
 

@@ -1,5 +1,17 @@
 # probeRCA Project Context
 
+## Authoritative Current Scheme
+
+当前唯一有效的新方案全文保存在：
+
+`skills/proberca/SKILL.md`
+
+该方案固定采用数据面/控制面分离、服务级 Healthy `A_s`、指标级
+Healthy masked Ridge `A_v`、只扣除跨指标传播、Burst 只调整对应组惩罚，
+以及单次非负 Sparse-Group FISTA。不得恢复综合关系强度变量或反事实重复求解。
+
+下文关于 P0/P1 和早期 synthetic 路线的内容只表示历史背景，不覆盖上述最终方案。
+
 ## Problem
 
 probeRCA 解决微服务系统故障后的根因定位问题。

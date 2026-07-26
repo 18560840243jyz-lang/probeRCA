@@ -73,10 +73,11 @@ class FinalControlPlane:
         self.resolver = MetricResolver(config)
         self.service_rls = ServiceRLS(config)
         self.state = "healthy"
-        self._soft_count = 0
-        self._hard_count = 0
+        self._soft_counts: dict[tuple[str, str], int] = {}
+        self._hard_counts: dict[tuple[str, str], int] = {}
         self._recovery_count = 0
         self._topology = []
+        self._healthy_topology_snapshot_id: str | None = None
         self._healthy_history: dict[int, dict[str, float]] = {}
         self._signed_history: dict[int, dict[str, float]] = {}
         self._soft: _FrozenSoftContext | None = None
@@ -89,16 +90,27 @@ class FinalControlPlane:
         self._dataset_id = ""
         self._dataset_fingerprint = ""
 
-    def _active_topology(self, timestamp_ns: int):
+    def _active_topology(self, window_start_ns: int, window_end_ns: int):
         matches = [
             item for item in self._topology
-            if item.valid_from_ns <= timestamp_ns < item.valid_to_ns
+            if item.valid_from_ns <= window_start_ns
+            and window_end_ns <= item.valid_to_ns
         ]
         if len(matches) != 1:
             raise ControlPlaneError(
-                f"timestamp {timestamp_ns} has {len(matches)} active topology snapshots"
+                f"window [{window_start_ns},{window_end_ns}) has "
+                f"{len(matches)} covering topology snapshots"
             )
         return matches[0]
+
+    def _reset_healthy_segment(self, snapshot_id: str) -> None:
+        self.baseline.reset()
+        self.service_rls.reset()
+        self._healthy_history.clear()
+        self._signed_history.clear()
+        self._soft_counts.clear()
+        self._hard_counts.clear()
+        self._healthy_topology_snapshot_id = snapshot_id
 
     def _scores(self, observations, graph: AllowedServiceGraph):
         by_entity: dict[str, dict[str, float]] = {}
@@ -144,71 +156,126 @@ class FinalControlPlane:
             self._healthy_history[sequence] = signed
             self.service_rls.update(sequence, service_scores, graph)
 
+    def _advance_alert_counters(
+        self, service_scores, edge_scores,
+    ) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+        scores = {
+            **{("service", key): value for key, value in service_scores.items()},
+            **{("edge", key): value for key, value in edge_scores.items()},
+        }
+        keys = set(scores) | set(self._soft_counts) | set(self._hard_counts)
+        for key in keys:
+            value = scores.get(key, 0.0)
+            self._soft_counts[key] = (
+                self._soft_counts.get(key, 0) + 1
+                if value >= self.config.soft_threshold else 0
+            )
+            self._hard_counts[key] = (
+                self._hard_counts.get(key, 0) + 1
+                if value >= self.config.hard_threshold else 0
+            )
+        soft = {
+            key for key, count in self._soft_counts.items()
+            if count >= self.config.soft_consecutive_windows
+        }
+        hard = {
+            key for key, count in self._hard_counts.items()
+            if count >= self.config.hard_consecutive_windows
+        }
+        return soft, hard
+
+    def _freeze_soft_context(
+        self, *, sequence: int, timestamp_ns: int,
+        graph: AllowedServiceGraph, observations,
+        alert_entities: set[tuple[str, str]],
+    ) -> None:
+        seeds = {entity_id for kind, entity_id in alert_entities if kind == "service"}
+        edge_seeds = {entity_id for kind, entity_id in alert_entities if kind == "edge"}
+        candidate = build_candidate_graph(
+            graph=graph,
+            service_strengths=self.service_rls.relation_strengths(),
+            seed_services=seeds,
+            seed_edges=edge_seeds,
+            config=self.config,
+        )
+        metrics = candidate_metric_nodes(observations, candidate)
+        model = fit_metric_propagation(
+            metrics=metrics,
+            healthy_history=self._healthy_history,
+            candidate=candidate,
+            service_graph=graph,
+            healthy_cutoff_ns=timestamp_ns,
+            config=self.config,
+        )
+        self._soft = _FrozenSoftContext(
+            soft_sequence=sequence,
+            soft_timestamp_ns=timestamp_ns,
+            service_graph=graph,
+            candidate_graph=candidate,
+            metrics=metrics,
+            metric_model=model,
+            seed_services=seeds,
+            seed_edges=edge_seeds,
+        )
+
+    def _enter_hard(
+        self, *, sequence: int, timestamp_ns: int, observations,
+    ) -> None:
+        if self._soft is None:
+            raise ControlPlaneError("Hard transition has no frozen context")
+        self.state = "hard"
+        self._hard = _PendingHardContext(
+            sequence=sequence,
+            timestamp_ns=timestamp_ns,
+            analysis_sequence=sequence + self.config.burst_window_count,
+            analysis_cutoff_ns=(
+                timestamp_ns
+                + self.config.burst_window_count
+                * self.config.window_sec * 1_000_000_000
+            ),
+            observations=dict(observations),
+        )
+        self._recovery_count = 0
+
     def _transition(
-        self, *, timestamp_ns: int, service_scores, edge_scores,
+        self, *, sequence: int, timestamp_ns: int, service_scores, edge_scores,
         graph: AllowedServiceGraph, observations,
     ) -> None:
         maximum = max((*service_scores.values(), *edge_scores.values()), default=0.0)
         previous = self.state
-        if self.state == "healthy":
-            self._soft_count = self._soft_count + 1 if maximum >= self.config.soft_threshold else 0
-            if self._soft_count >= self.config.soft_consecutive_windows:
-                self.state = "soft"
-                seeds = {
-                    key for key, value in service_scores.items()
-                    if value >= self.config.soft_threshold
-                }
-                edge_seeds = {
-                    key for key, value in edge_scores.items()
-                    if value >= self.config.soft_threshold
-                }
-                candidate = build_candidate_graph(
-                    graph=graph,
-                    service_strengths=self.service_rls.relation_strengths(),
-                    seed_services=seeds,
-                    seed_edges=edge_seeds,
-                    config=self.config,
-                )
-                metrics = candidate_metric_nodes(observations, candidate)
-                model = fit_metric_propagation(
-                    metrics=metrics,
-                    healthy_history=self._healthy_history,
-                    candidate=candidate,
-                    service_graph=graph,
-                    healthy_cutoff_ns=timestamp_ns,
-                    config=self.config,
-                )
-                self._soft = _FrozenSoftContext(
-                    soft_sequence=max(self._signed_history),
-                    soft_timestamp_ns=timestamp_ns,
-                    service_graph=graph,
-                    candidate_graph=candidate,
-                    metrics=metrics,
-                    metric_model=model,
-                    seed_services=seeds,
-                    seed_edges=edge_seeds,
-                )
-        elif self.state == "soft":
-            self._hard_count = self._hard_count + 1 if maximum >= self.config.hard_threshold else 0
-            if self._hard_count >= self.config.hard_consecutive_windows:
-                if self._soft is None:
-                    raise ControlPlaneError("Hard transition has no frozen Soft context")
-                self.state = "hard"
-                sequence = max(self._signed_history)
-                analysis_sequence = sequence + self.config.burst_window_count
-                self._hard = _PendingHardContext(
+        soft_entities: set[tuple[str, str]] = set()
+        hard_entities: set[tuple[str, str]] = set()
+        if self.state in {"healthy", "soft"}:
+            soft_entities, hard_entities = self._advance_alert_counters(
+                service_scores, edge_scores,
+            )
+        if self.state in {"healthy", "soft"} and hard_entities:
+            if self._soft is None:
+                # Hard has its own per-entity 5x2 detector. It may freeze the
+                # healthy context before the slower Soft 3x3 detector fires.
+                self._freeze_soft_context(
                     sequence=sequence,
                     timestamp_ns=timestamp_ns,
-                    analysis_sequence=analysis_sequence,
-                    analysis_cutoff_ns=(
-                        timestamp_ns
-                        + self.config.burst_window_count
-                        * self.config.window_sec * 1_000_000_000
-                    ),
-                    observations=dict(observations),
+                    graph=graph,
+                    observations=observations,
+                    alert_entities=hard_entities | soft_entities,
                 )
-                self._recovery_count = 0
-            elif maximum <= self.config.recovery_threshold:
+            self._enter_hard(
+                sequence=sequence,
+                timestamp_ns=timestamp_ns,
+                observations=observations,
+            )
+        elif self.state == "healthy" and soft_entities:
+            self._freeze_soft_context(
+                sequence=sequence,
+                timestamp_ns=timestamp_ns,
+                graph=graph,
+                observations=observations,
+                alert_entities=soft_entities,
+            )
+            self.state = "soft"
+        elif self.state == "soft":
+            if maximum <= self.config.recovery_threshold:
                 self._recovery_count += 1
                 if self._recovery_count >= self.config.recovery_windows:
                     self.state = "recovery"
@@ -234,8 +301,8 @@ class FinalControlPlane:
             )
             if self._recovery_count >= self.config.recovery_windows and incident_complete:
                 self.state = "healthy"
-                self._soft_count = 0
-                self._hard_count = 0
+                self._soft_counts.clear()
+                self._hard_counts.clear()
                 self._recovery_count = 0
                 self._soft = None
                 self._hard = None
@@ -247,6 +314,15 @@ class FinalControlPlane:
             "maximum_symptom_score": maximum,
             "service_scores": dict(sorted(service_scores.items())),
             "edge_scores": dict(sorted(edge_scores.items())),
+            "soft_consecutive_counts": {
+                f"{key[0]}|{key[1]}": value
+                for key, value in sorted(self._soft_counts.items())
+            },
+            "hard_consecutive_counts": {
+                f"{key[0]}|{key[1]}": value
+                for key, value in sorted(self._hard_counts.items())
+            },
+            "topology_snapshot_id": graph.snapshot_id,
             "baseline_frozen": not models_updated,
             "service_model_frozen": not models_updated,
         })
@@ -285,7 +361,10 @@ class FinalControlPlane:
         }
         evidence = [
             item for item in self._evidence
-            if self._hard.timestamp_ns <= item.timestamp_ns <= self._hard.analysis_cutoff_ns
+            if self._hard.timestamp_ns <= item.evidence_window_start_ns
+            and item.evidence_window_end_ns <= self._hard.analysis_cutoff_ns
+            and self._hard.timestamp_ns <= item.timestamp_ns
+            < self._hard.analysis_cutoff_ns
         ]
         burst_strength, evidence_ids = aggregate_burst_evidence(evidence, groups)
         index = {metric.node_id: position for position, metric in enumerate(root_metrics)}
@@ -413,8 +492,20 @@ class FinalControlPlane:
             processed += 1
             self._topology.extend(window.topology_events)
             self._evidence.extend(window.burst_evidence)
-            snapshot = self._active_topology(window.window_end_ns)
-            graph = allowed_service_graph(snapshot)
+            snapshot = self._active_topology(
+                window.window_start_ns, window.window_end_ns,
+            )
+            live_graph = allowed_service_graph(snapshot)
+            topology_reset = False
+            if self.state == "healthy" \
+                    and self._healthy_topology_snapshot_id != snapshot.snapshot_id:
+                topology_reset = self._healthy_topology_snapshot_id is not None
+                self._reset_healthy_segment(snapshot.snapshot_id)
+            graph = (
+                self._soft.service_graph
+                if self.state != "healthy" and self._soft is not None
+                else live_graph
+            )
             observations, raw = self.resolver.normalize_window(window, self.baseline)
             signed = {
                 node_id: item.signed_z for node_id, item in observations.items()
@@ -439,6 +530,7 @@ class FinalControlPlane:
             )
             if baseline_ready:
                 self._transition(
+                    sequence=window.sequence,
                     timestamp_ns=window.window_end_ns,
                     service_scores=service_scores,
                     edge_scores=edge_scores,
@@ -455,7 +547,11 @@ class FinalControlPlane:
                     "edge_scores": {},
                     "baseline_frozen": False,
                     "service_model_frozen": False,
-                    "reason": "baseline_not_ready",
+                    "reason": (
+                        "topology_changed_baseline_reset"
+                        if topology_reset else "baseline_not_ready"
+                    ),
+                    "topology_snapshot_id": graph.snapshot_id,
                 })
             if self._hard is not None \
                     and window.sequence >= self._hard.analysis_sequence \

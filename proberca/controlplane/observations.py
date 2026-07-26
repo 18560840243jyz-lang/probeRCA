@@ -21,6 +21,10 @@ class RobustBaselineStore:
         self.config = config
         self._values: dict[str, list[float]] = defaultdict(list)
 
+    def reset(self) -> None:
+        """Start a new healthy segment after a topology-version change."""
+        self._values = defaultdict(list)
+
     @staticmethod
     def transform(value: float, spec: MetricRoleSpec) -> float:
         raw = float(value)

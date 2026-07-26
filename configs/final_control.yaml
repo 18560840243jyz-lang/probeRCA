@@ -1,17 +1,369 @@
-# Final ProbeRCA-BPF control-plane configuration.
-# Metric taxonomy and group penalties use the frozen defaults in FinalControlConfig.
 window_sec: 1
 baseline_min_windows: 6
-service_lags: [1, 2]
-metric_lags: [1, 2]
+baseline_min_scale: 1.0e-06
+service_lags:
+- 1
+- 2
+metric_lags:
+- 1
+- 2
+rls_forgetting_factor: 0.99
+rls_initial_covariance: 100.0
+metric_ridge: 0.1
 metric_min_training_rows: 4
-soft_threshold: 2.5
-soft_consecutive_windows: 2
-hard_threshold: 4.0
+alpha_latency: 0.5
+alpha_failure: 0.5
+soft_threshold: 3.0
+soft_consecutive_windows: 3
+hard_threshold: 5.0
 hard_consecutive_windows: 2
+recovery_threshold: 1.0
+recovery_windows: 2
 candidate_hops: 2
 service_edge_threshold: 0.05
 burst_window_count: 1
 burst_eta: 2.0
 l1_penalty: 0.15
+group_penalties:
+  CPU: 0.25
+  DNS: 0.25
+  IO: 0.25
+  LocalNet: 0.25
+  Lock: 0.25
+  Memory: 0.25
+  NIC: 0.25
+  TCP: 0.25
+fista_max_iterations: 500
+fista_tolerance: 1.0e-07
 top_k: 5
+strict_metric_contract: true
+metric_roles:
+- record_type: edge_metric
+  metric_name: dns_failure_rate
+  entity_type: edge
+  role: edge_failure
+  scopes:
+  - service_pair
+  protocols:
+  - dns
+  root_category: DNS
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: ratio_from_summed_components
+  aggregation_formula: sum_flow(delta(dns_timeout+dns_error_rcode))/(sum_flow(delta(dns_query_total))+epsilon)
+  source_scope: flow
+  quantile: null
+- record_type: edge_metric
+  metric_name: dns_latency_p95
+  entity_type: edge
+  role: edge_latency
+  scopes:
+  - service_pair
+  protocols:
+  - dns
+  root_category: DNS
+  root_eligible: true
+  transform: log1p
+  polarity: 1
+  unit: milliseconds
+  metric_kind: quantile
+  aggregation: histogram_merge_quantile
+  aggregation_formula: q0.95(merge_flow(dns_latency_histogram))
+  source_scope: flow
+  quantile: 0.95
+- record_type: edge_metric
+  metric_name: dns_query_count
+  entity_type: edge
+  role: edge_count
+  scopes:
+  - service_pair
+  protocols:
+  - dns
+  root_category: null
+  root_eligible: false
+  transform: identity
+  polarity: 1
+  unit: queries
+  metric_kind: delta_counter
+  aggregation: cross_series_sum_delta
+  aggregation_formula: sum_flow(delta(dns_query_total))
+  source_scope: flow
+  quantile: null
+- record_type: edge_metric
+  metric_name: edge_failure_rate
+  entity_type: edge
+  role: edge_failure
+  scopes:
+  - service_pair
+  protocols:
+  - tcp
+  root_category: TCP
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: ratio_from_summed_components
+  aggregation_formula: sum_flow(delta(error_total+timeout_total))/(sum_flow(delta(request_total))+epsilon)
+  source_scope: flow
+  quantile: null
+- record_type: edge_metric
+  metric_name: edge_latency_p95
+  entity_type: edge
+  role: edge_latency
+  scopes:
+  - service_pair
+  protocols:
+  - tcp
+  root_category: TCP
+  root_eligible: true
+  transform: log1p
+  polarity: 1
+  unit: milliseconds
+  metric_kind: quantile
+  aggregation: histogram_merge_quantile
+  aggregation_formula: q0.95(merge_flow(edge_latency_histogram))
+  source_scope: flow
+  quantile: 0.95
+- record_type: edge_metric
+  metric_name: edge_request_count
+  entity_type: edge
+  role: edge_count
+  scopes:
+  - service_pair
+  protocols:
+  - tcp
+  root_category: null
+  root_eligible: false
+  transform: identity
+  polarity: 1
+  unit: requests
+  metric_kind: delta_counter
+  aggregation: cross_series_sum_delta
+  aggregation_formula: sum_flow(delta(request_total))
+  source_scope: flow
+  quantile: null
+- record_type: node_metric
+  metric_name: cpu_psi
+  entity_type: host
+  role: host_cpu
+  scopes:
+  - node
+  protocols: []
+  root_category: CPU
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: time_weighted_window_ratio
+  aggregation_formula: node_cpu_psi_some_ns/window_ns
+  source_scope: node
+  quantile: null
+- record_type: node_metric
+  metric_name: cpu_throttle_ratio
+  entity_type: service
+  role: service_cpu_throttle
+  scopes:
+  - service
+  protocols: []
+  root_category: CPU
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: ratio_from_summed_components
+  aggregation_formula: sum_container(delta(nr_throttled))/sum_container(delta(nr_periods)+epsilon)
+  source_scope: pod
+  quantile: null
+- record_type: node_metric
+  metric_name: cpu_usage_rate
+  entity_type: service
+  role: service_cpu_usage
+  scopes:
+  - service
+  protocols: []
+  root_category: CPU
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: counter_delta_then_cross_series_sum_ratio
+  aggregation_formula: sum_container(delta(cpu_time_ns))/(window_ns*allocated_cpu_cores)
+  source_scope: pod
+  quantile: null
+- record_type: node_metric
+  metric_name: futex_wait_time_rate
+  entity_type: service
+  role: service_lock
+  scopes:
+  - service
+  protocols: []
+  root_category: Lock
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: counter_delta_then_cross_series_sum_ratio
+  aggregation_formula: sum_cgroup(delta(futex_wait_ns))/(sum_cgroup(active_thread_ns)+epsilon)
+  source_scope: pod
+  quantile: null
+- record_type: node_metric
+  metric_name: io_psi
+  entity_type: host
+  role: host_io
+  scopes:
+  - node
+  protocols: []
+  root_category: IO
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: time_weighted_window_ratio
+  aggregation_formula: node_io_psi_some_ns/window_ns
+  source_scope: node
+  quantile: null
+- record_type: node_metric
+  metric_name: io_psi
+  entity_type: service
+  role: service_io
+  scopes:
+  - service
+  protocols: []
+  root_category: IO
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: time_weighted_window_ratio
+  aggregation_formula: sum_cgroup(io_psi_some_ns)/(window_ns*active_task_capacity+epsilon)
+  source_scope: pod
+  quantile: null
+- record_type: node_metric
+  metric_name: local_socket_failure_rate
+  entity_type: service
+  role: service_localnet
+  scopes:
+  - service
+  protocols: []
+  root_category: LocalNet
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: ratio_from_summed_components
+  aggregation_formula: sum_pod(delta(backlog_overflow+accept_fail+local_rst+local_drop))/(sum_pod(delta(socket_ops))+epsilon)
+  source_scope: pod
+  quantile: null
+- record_type: node_metric
+  metric_name: memory_psi
+  entity_type: host
+  role: host_memory
+  scopes:
+  - node
+  protocols: []
+  root_category: Memory
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: time_weighted_window_ratio
+  aggregation_formula: node_memory_psi_some_ns/window_ns
+  source_scope: node
+  quantile: null
+- record_type: node_metric
+  metric_name: memory_working_set_ratio
+  entity_type: service
+  role: service_memory
+  scopes:
+  - service
+  protocols: []
+  root_category: Memory
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: ratio_from_summed_components
+  aggregation_formula: sum_container(working_set_bytes)/(sum_container(memory_limit_bytes)+epsilon)
+  source_scope: pod
+  quantile: null
+- record_type: node_metric
+  metric_name: nic_drop_error_rate
+  entity_type: host
+  role: host_nic
+  scopes:
+  - node
+  protocols: []
+  root_category: NIC
+  root_eligible: true
+  transform: identity
+  polarity: 1
+  unit: events_per_second
+  metric_kind: gauge
+  aggregation: counter_delta_then_cross_series_sum_rate
+  aggregation_formula: sum_interface(delta(rx_drop+tx_drop+rx_error+tx_error))/window_sec
+  source_scope: node
+  quantile: null
+- record_type: node_metric
+  metric_name: request_failure_rate
+  entity_type: service
+  role: request_failure
+  scopes:
+  - service
+  protocols: []
+  root_category: null
+  root_eligible: false
+  transform: identity
+  polarity: 1
+  unit: ratio
+  metric_kind: gauge
+  aggregation: ratio_from_summed_components
+  aggregation_formula: (sum_pod(delta(error_total))+sum_pod(delta(timeout_total)))/(sum_pod(delta(request_total))+epsilon)
+  source_scope: pod
+  quantile: null
+- record_type: node_metric
+  metric_name: request_latency_p95
+  entity_type: service
+  role: request_latency
+  scopes:
+  - service
+  protocols: []
+  root_category: null
+  root_eligible: false
+  transform: log1p
+  polarity: 1
+  unit: milliseconds
+  metric_kind: quantile
+  aggregation: histogram_merge_quantile
+  aggregation_formula: q0.95(merge_pod(request_latency_histogram))
+  source_scope: pod
+  quantile: 0.95
+- record_type: node_metric
+  metric_name: request_rate
+  entity_type: service
+  role: request_rate
+  scopes:
+  - service
+  protocols: []
+  root_category: null
+  root_eligible: false
+  transform: identity
+  polarity: 1
+  unit: requests_per_second
+  metric_kind: gauge
+  aggregation: counter_delta_then_cross_series_sum_rate
+  aggregation_formula: sum_pod(delta(request_total))/window_sec
+  source_scope: pod
+  quantile: null
