@@ -37,16 +37,29 @@ from .sources import PrimitiveSource, PrometheusSourceConfig
 COLLECTOR_CONFIG_SCHEMA_VERSION = "probeRCA-final-live-collector-v1"
 
 
-class BurstEvidenceSource(Protocol):
-    """Independent source of already normalized Burst observations."""
+class RawBurstWindowSource(Protocol):
+    """Algorithm-free source of raw Burst windows."""
 
-    def collect(
+    event_source_fingerprint: str
+
+    @property
+    def source_record_ids(self) -> tuple[str, ...]:
+        ...
+
+    def collect_window(
         self,
         *,
+        sequence: int,
         window_start_ns: int,
         window_end_ns: int,
         inventory_revision,
-    ) -> tuple[EvidenceObservationRecord, ...]:
+        normal_raw_window: RawCollectionWindow,
+    ):
+        ...
+
+
+class RawBurstWindowSink(Protocol):
+    def append(self, window) -> None:
         ...
 
 
@@ -535,7 +548,8 @@ class FinalLiveCollectionRunner:
         config: FinalLiveCollectorConfig,
         collection_contract: dict[str, Any],
         primitive_source: PrimitiveSource,
-        burst_source: BurstEvidenceSource | None = None,
+        raw_burst_source: RawBurstWindowSource | None = None,
+        raw_burst_sink: RawBurstWindowSink | None = None,
         discovery_client: KubernetesDiscoveryClient | None = None,
         wall_clock_ns=time.time_ns,
         sleep=time.sleep,
@@ -547,7 +561,12 @@ class FinalLiveCollectionRunner:
             )
         self.config = config
         self.primitive_source = primitive_source
-        self.burst_source = burst_source
+        if (raw_burst_source is None) != (raw_burst_sink is None):
+            raise RawCollectionError(
+                "raw Burst source and sink must be configured together"
+            )
+        self.raw_burst_source = raw_burst_source
+        self.raw_burst_sink = raw_burst_sink
         self.discovery = discovery_client or KubernetesDiscoveryClient(
             config.kubernetes
         )
@@ -556,6 +575,13 @@ class FinalLiveCollectionRunner:
         build_id = collector_build_fingerprint(
             collection_contract, config.public_fingerprint
         )
+        if raw_burst_source is not None:
+            build_id = fingerprint({
+                "normal_collector_build_fingerprint": build_id,
+                "raw_burst_event_source_fingerprint": (
+                    raw_burst_source.event_source_fingerprint
+                ),
+            })
         self.assembler = FinalDataPlaneCollector(
             collection_contract=collection_contract,
             collector_build_id=build_id,
@@ -595,20 +621,34 @@ class FinalLiveCollectionRunner:
             cluster_id=self.config.cluster_id,
             samples=samples,
         )
-        evidence = (
-            self.burst_source.collect(
+        raw_burst_window = (
+            self.raw_burst_source.collect_window(
+                sequence=sequence,
                 window_start_ns=start_ns,
                 window_end_ns=end_ns,
                 inventory_revision=before,
+                normal_raw_window=raw_window,
             )
-            if self.burst_source is not None else ()
+            if self.raw_burst_source is not None else None
         )
-        return self.assembler.assemble(
+        window = self.assembler.assemble(
             raw_window=raw_window,
             inventory_at_start=before,
             inventory_at_end=after_inventory,
-            burst_evidence=evidence,
+            burst_evidence=(),
         )
+        if raw_burst_window is not None:
+            residual = set(window.residual_source_record_ids)
+            overlap = residual & {
+                sample.source_record_id
+                for sample in raw_burst_window.samples
+            }
+            if overlap:
+                raise RawCollectionError(
+                    "raw Burst source overlaps normal residual source"
+                )
+            self.raw_burst_sink.append(raw_burst_window)
+        return window
 
     def collect(self, window_count: int) -> tuple[CollectedWindow, ...]:
         if isinstance(window_count, bool) or not isinstance(window_count, int) \

@@ -1,0 +1,16 @@
+[Unit]
+Description=ProbeRCA final independent Burst probe recorder
+After=local-fs.target docker.service
+RequiresMountsFor=/sys/fs/cgroup
+
+[Service]
+Type=simple
+StateDirectory=proberca-final-burst
+ExecStart=/usr/local/lib/proberca-final/proberca-final-burst-loader --object /usr/local/lib/proberca-final/final_burst.bpf.o --cgroup /sys/fs/cgroup --output /var/lib/proberca-final-burst/events.jsonl --timeout-ms 5000 --sampling-profile low
+Restart=on-failure
+RestartSec=2s
+LimitMEMLOCK=infinity
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

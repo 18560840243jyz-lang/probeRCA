@@ -9,11 +9,17 @@ BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_x86 -Wall -Werror \
 	-I$(BUILD_DIR) -Ibpf/final_normal \
 	-I/usr/include/$(shell uname -m)-linux-gnu
 USER_CFLAGS := -g -O2 -Wall -Wextra -Werror -Ibpf/final_normal
+BURST_BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_x86 -Wall -Werror \
+	-I$(BUILD_DIR) -Ibpf/final_burst \
+	-I/usr/include/$(shell uname -m)-linux-gnu
+BURST_USER_CFLAGS := -g -O2 -Wall -Wextra -Werror -Ibpf/final_burst
 
 .PHONY: all clean
 all: $(BUILD_DIR)/vmlinux.h \
 	$(BUILD_DIR)/final_normal.bpf.o \
-	$(BUILD_DIR)/proberca-final-ebpf-loader
+	$(BUILD_DIR)/proberca-final-ebpf-loader \
+	$(BUILD_DIR)/final_burst.bpf.o \
+	$(BUILD_DIR)/proberca-final-burst-loader
 
 $(BUILD_DIR):
 >install -d -m 0755 "$@"
@@ -37,7 +43,23 @@ $(BUILD_DIR)/proberca-final-ebpf-loader: \
 >chmod 0755 "$@.tmp"
 >mv "$@.tmp" "$@"
 
+$(BUILD_DIR)/final_burst.bpf.o: \
+		bpf/final_burst/final_burst.bpf.c \
+		bpf/final_burst/final_burst.h \
+		$(BUILD_DIR)/vmlinux.h | $(BUILD_DIR)
+>$(CLANG) $(BURST_BPF_CFLAGS) -c "$<" -o "$@.tmp"
+>mv "$@.tmp" "$@"
+
+$(BUILD_DIR)/proberca-final-burst-loader: \
+		bpf/user/proberca_final_burst_loader.c \
+		bpf/final_burst/final_burst.h | $(BUILD_DIR)
+>$(CC) $(BURST_USER_CFLAGS) "$<" -o "$@.tmp" -lbpf -lelf -lz
+>chmod 0755 "$@.tmp"
+>mv "$@.tmp" "$@"
+
 clean:
 >rm -f -- "$(BUILD_DIR)/vmlinux.h" \
 >  "$(BUILD_DIR)/final_normal.bpf.o" \
->  "$(BUILD_DIR)/proberca-final-ebpf-loader"
+>  "$(BUILD_DIR)/proberca-final-ebpf-loader" \
+>  "$(BUILD_DIR)/final_burst.bpf.o" \
+>  "$(BUILD_DIR)/proberca-final-burst-loader"

@@ -13,6 +13,13 @@ from proberca.dataplane.burst_collection import (
     BurstEvidenceCollector,
     RawBurstSample,
 )
+from proberca.dataplane.burst_live import (
+    DNS_CHANNELS,
+    HOST_CHANNELS,
+    RARE_CHANNELS,
+    SERVICE_CHANNELS,
+    TCP_CHANNELS,
+)
 from proberca.dataplane.collector import FinalDataPlaneCollector
 from proberca.dataplane.collector import FinalLiveCollectorConfig
 from proberca.dataplane.contracts import fingerprint
@@ -560,6 +567,74 @@ def _calibrations(contract):
             minimum_scale=1.0e-6,
         ))
     return output
+
+
+def test_burst_event_and_continuous_channels_are_disjoint():
+    channels = set(
+        SERVICE_CHANNELS + HOST_CHANNELS + TCP_CHANNELS + DNS_CHANNELS
+    )
+    assert set(BURST_CHANNEL_MODES) == channels
+    assert {
+        channel for channel, mode in BURST_CHANNEL_MODES.items()
+        if mode == "rare"
+    } == set(RARE_CHANNELS)
+    assert {
+        channel for channel, mode in BURST_CHANNEL_MODES.items()
+        if mode == "continuous"
+    } == channels - set(RARE_CHANNELS)
+
+    with pytest.raises(
+        RawCollectionError, match="only a positive threshold"
+    ):
+        BurstChannelCalibration.create(
+            channel_id="tcp.rto_rate",
+            mode="rare",
+            rare_event_threshold=0.1,
+            healthy_values=[0.0],
+            transform="identity",
+            polarity=1,
+            z_cap=5.0,
+            minimum_healthy_samples=5,
+            minimum_scale=1.0e-6,
+        )
+    with pytest.raises(
+        RawCollectionError, match="cannot declare a rare threshold"
+    ):
+        BurstChannelCalibration.create(
+            channel_id="tcp.rtt_p95",
+            mode="continuous",
+            rare_event_threshold=0.1,
+            healthy_values=[1, 2, 3, 4, 5],
+            transform="identity",
+            polarity=1,
+            z_cap=5.0,
+            minimum_healthy_samples=5,
+            minimum_scale=1.0e-6,
+        )
+    common = {
+        "source_object_id": "object:" + fingerprint({"probe": "typed"}),
+        "timestamp_ns": END - 1,
+        "cluster_id": CLUSTER,
+        "namespace": NAMESPACE,
+        "entity_type": "edge",
+        "entity_id": f"{CLUSTER}::{NAMESPACE}::frontend->payment::tcp",
+        "value": 1,
+        "coverage": 1.0,
+        "event_loss_rate": 0.0,
+        "mapping_quality": 1.0,
+    }
+    with pytest.raises(RawCollectionError, match="requires exposure"):
+        RawBurstSample.create(
+            **common,
+            channel_id="tcp.rto_rate",
+            exposure=None,
+        )
+    with pytest.raises(RawCollectionError, match="cannot declare exposure"):
+        RawBurstSample.create(
+            **common,
+            channel_id="tcp.rtt_p95",
+            exposure=10,
+        )
 
 
 def test_burst_is_normalized_from_independent_sources(contract):

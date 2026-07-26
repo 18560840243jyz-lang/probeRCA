@@ -19,6 +19,16 @@ from .burst_collection import (
     BurstEvidenceCollector,
     RawBurstSample,
 )
+from .burst_archive import (
+    BurstArchive,
+    BurstArchiveWriter,
+    RawBurstWindow,
+)
+from .burst_live import (
+    FinalLiveBurstConfig,
+    FinalLiveBurstSource,
+    load_final_live_burst_config,
+)
 from .collector import (
     FinalDataPlaneCollector,
     FinalLiveCollectionRunner,
@@ -43,7 +53,13 @@ __all__ = [
     "BurstNormalizationError",
     "BurstChannelCalibration",
     "BurstEvidenceCollector",
+    "BurstArchive",
+    "BurstArchiveWriter",
+    "RawBurstWindow",
     "RawBurstSample",
+    "FinalLiveBurstConfig",
+    "FinalLiveBurstSource",
+    "load_final_live_burst_config",
     "CollectedWindow",
     "CollectionArchive",
     "CollectionArchiveWriter",

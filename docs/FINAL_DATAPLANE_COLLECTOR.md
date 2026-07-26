@@ -9,12 +9,12 @@ proberca-collect-final
 It performs only:
 
 ```text
-raw Prometheus/eBPF-map primitives
+raw Prometheus/eBPF-map primitives + dedicated Burst ring events
   -> Kubernetes identity resolution
-  -> exact 1-second 9/4/3/3 aggregation
+  -> exact 1-second 9/4/3/3 normal aggregation
   -> topology-version proof
-  -> optional independent Burst evidence
-  -> write-once sealed collection archive
+  -> typed raw Burst count/exposure or continuous samples
+  -> paired write-once normal and raw-Burst archives
 ```
 
 It does not import or execute alerting, propagation, candidate selection,
@@ -100,11 +100,34 @@ timestamp.
 
 ## Burst boundary
 
-`BurstEvidenceCollector` accepts a different set of opaque source records.
-It applies the frozen rare-event or continuous normalization, multiplies
-strength by coverage/loss/mapping quality exactly once, and writes the result
-as independent Burst evidence. Any overlap with normal residual sources fails
-closed.
+`proberca-final-burst-loader` is a dedicated 31-program eBPF producer. It
+writes an append-only JSONL event stream plus 250 ms loss checkpoints. The
+`low` sampling profile is the Healthy default; `full` is the high-resolution
+profile. Every sampled event carries its sampling divisor, so event counts
+and exposure denominators are corrected without treating sampled counts as
+complete counts.
+
+The live adapter freezes 29 Burst channel types:
+
+- event-count channels store an integral count plus exposure. OOM, backlog
+  overflow, accept/connect failure, retransmission, RTO, RST, DNS timeout,
+  rcode failure, and the other frozen count channels never consume a
+  median/MAD Healthy baseline;
+- continuous channels store one window value with no exposure. Scheduler,
+  reclaim, block, futex/socket wait, softirq, RTT, and DNS latency channels
+  are the only channels that later consume a Healthy reference distribution.
+
+This distinction is enforced when each raw sample is created and again when
+the control plane converts a sealed raw sample into evidence. An event-count
+channel without exposure, a continuous channel with exposure, an unknown
+channel, or a mode/calibration mismatch fails closed.
+
+The data plane does not calculate Burst anomaly strength. It writes
+`burst-windows.jsonl` and `burst-manifest.json` as a separate sealed archive
+sharing the normal archive's dataset ID and 1-second window sequence. The
+later control plane applies the rare-event threshold or continuous
+median/MAD calibration and quality weight. Raw Burst source IDs are checked
+against normal residual source IDs before either window is committed.
 
 ## Healthy-only collection
 
@@ -122,16 +145,20 @@ Then collect without fault injection:
 proberca-collect-final \
   --source-config configs/final_live_collector.example.yaml \
   --collection-contract configs/final_collection_contract.yaml \
+  --burst-config configs/final_live_burst.example.yaml \
   --output artifacts/healthy-collection \
+  --burst-output artifacts/healthy-burst \
   --windows 30
 ```
 
-This command does not inject a fault. If any required source is absent, it
-exits without producing a sealed archive. Only a successfully sealed archive
-may later be passed to the control plane.
+This command does not inject a fault. If any required normal or Burst source
+is absent, it exits without producing a sealed pair. Only matching,
+successfully sealed archives may later be passed to the control plane.
 
-The single-VM Healthy dry run on 2026-07-26 sealed three consecutive windows.
-Each window contained 12 complete service sets (108 metrics), one complete
-host set (4 metrics), and 16 stable directed edge sets (48 metrics). All three
-windows had the same topology structure fingerprint:
-`f0fdfe3e0bcd17b99080e8aa0adfcc8ea32d1aa81fe88051dd8fcdb1c5253272`.
+The single-VM Healthy paired dry run on 2026-07-26 sealed consecutive
+normal/Burst windows with one shared dataset ID and exact sequence/time
+alignment. Every normal window contained 12 complete service sets, one host
+set, and 16 stable directed edge sets. Every matching raw-Burst window
+contained all 29 channel types across the same 12 services, one host, 15 TCP
+edges, and one DNS edge. Ring-buffer loss was zero and the minimum identity
+mapping quality was one.

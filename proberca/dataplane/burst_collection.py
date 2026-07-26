@@ -235,6 +235,17 @@ class RawBurstSample:
                     "raw Burst exposure must be non-negative"
                 )
             object.__setattr__(self, "exposure", exposure)
+        mode = BURST_CHANNEL_MODES.get(self.channel_id)
+        if mode is None:
+            raise RawCollectionError("unknown raw Burst channel")
+        if mode == "rare" and self.exposure is None:
+            raise RawCollectionError(
+                "event-count Burst channel requires exposure"
+            )
+        if mode == "continuous" and self.exposure is not None:
+            raise RawCollectionError(
+                "continuous Burst channel cannot declare exposure"
+            )
         for name in ("coverage", "event_loss_rate", "mapping_quality"):
             object.__setattr__(
                 self, name, _probability(name, getattr(self, name))

@@ -141,10 +141,21 @@ def install(repository: Path) -> None:
         install_directory / "final_normal.bpf.o",
         0o644,
     )
+    _atomic_copy(
+        build_directory / "proberca-final-burst-loader",
+        install_directory / "proberca-final-burst-loader",
+        0o755,
+    )
+    _atomic_copy(
+        build_directory / "final_burst.bpf.o",
+        install_directory / "final_burst.bpf.o",
+        0o644,
+    )
 
     unit_directory = Path("/etc/systemd/system")
     for name in (
         "proberca-final-ebpf.service",
+        "proberca-final-burst.service",
         "proberca-final-primitive-exporter.service",
     ):
         _atomic_copy(
@@ -172,9 +183,11 @@ def install(repository: Path) -> None:
     _run([
         "systemctl", "enable",
         "proberca-final-ebpf.service",
+        "proberca-final-burst.service",
         "proberca-final-primitive-exporter.service",
     ])
     _run(["systemctl", "restart", "proberca-final-ebpf.service"])
+    _run(["systemctl", "restart", "proberca-final-burst.service"])
     _run([
         "systemctl", "restart",
         "proberca-final-primitive-exporter.service",
@@ -183,6 +196,10 @@ def install(repository: Path) -> None:
     _run([
         "systemctl", "is-active", "--quiet",
         "proberca-final-ebpf.service",
+    ])
+    _run([
+        "systemctl", "is-active", "--quiet",
+        "proberca-final-burst.service",
     ])
     _run([
         "systemctl", "is-active", "--quiet",
