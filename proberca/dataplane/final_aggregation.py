@@ -406,7 +406,8 @@ class FinalWindowAggregator:
             if numerator.value == 0 and name in {
                 "request_failure_rate", "cpu_throttle_ratio",
                 "local_socket_failure_rate", "edge_failure_rate",
-                "dns_failure_rate",
+                "dns_failure_rate", "io_psi",
+                "futex_wait_time_rate",
             }:
                 return _combine((numerator, denominator), 0.0)
             raise RawCollectionError(f"{name} has a non-positive denominator")
@@ -686,9 +687,21 @@ class FinalWindowAggregator:
                 "socket_local_rst_total", "socket_local_drop_total",
             )
         )
+        socket_operations = self._sum(local["socket_ops_total"])
+        # One failed socket operation can produce more than one raw kernel
+        # symptom (for example, a drop followed by a reset).  The metric is a
+        # failed-operation ratio, so conservatively de-duplicate overlapping
+        # symptom counters at the number of observed operations.
+        local_failed_operations = _combine(
+            local_bad,
+            min(
+                sum(item.value for item in local_bad),
+                socket_operations.value,
+            ),
+        )
         local_failure = self._ratio(
-            _combine(local_bad, sum(item.value for item in local_bad)),
-            self._sum(local["socket_ops_total"]),
+            local_failed_operations,
+            socket_operations,
             "local_socket_failure_rate",
         )
         outputs = (
@@ -824,9 +837,13 @@ class FinalWindowAggregator:
                     raise RawCollectionError(
                         "inactive DNS edge has failure/latency observations"
                     )
-            if latency.sample_count != count.value:
+            if (
+                latency.sample_count + bad[0].value
+                != count.value
+            ):
                 raise RawCollectionError(
-                    "DNS latency histogram count does not match query_total"
+                    "DNS response histogram plus timeouts does not "
+                    "match completed query_total"
                 )
             failure = self._ratio(
                 _combine(bad, sum(item.value for item in bad)),

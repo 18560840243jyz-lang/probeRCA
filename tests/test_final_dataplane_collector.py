@@ -110,6 +110,8 @@ def _histogram(
 def _service_samples(
     output, service, node, *, series, request_delta=100, error_delta=2,
     request_histogram_deltas=None,
+    socket_failure_deltas=(1, 0, 0, 0),
+    socket_ops_delta=100,
 ):
     identity = {
         "namespace": NAMESPACE,
@@ -129,11 +131,11 @@ def _service_samples(
         ("active_task_ns_total", 1_000_000_000),
         ("futex_wait_ns_total", 10_000_000),
         ("active_thread_ns_total", 1_000_000_000),
-        ("socket_backlog_overflow_total", 1),
-        ("socket_accept_fail_total", 0),
-        ("socket_local_rst_total", 0),
-        ("socket_local_drop_total", 0),
-        ("socket_ops_total", 100),
+        ("socket_backlog_overflow_total", socket_failure_deltas[0]),
+        ("socket_accept_fail_total", socket_failure_deltas[1]),
+        ("socket_local_rst_total", socket_failure_deltas[2]),
+        ("socket_local_drop_total", socket_failure_deltas[3]),
+        ("socket_ops_total", socket_ops_delta),
     ):
         _counter(
             output, component, 100, delta,
@@ -206,7 +208,7 @@ def _edge_samples(
         histogram = "edge_latency_histogram"
     else:
         components = (
-            ("dns_query_total", 20 if count_delta is None else count_delta),
+            ("dns_query_total", 21 if count_delta is None else count_delta),
             ("dns_timeout_total", 1 if timeout_delta is None else timeout_delta),
             ("dns_error_rcode_total", 1 if error_delta is None else error_delta),
         )
@@ -352,7 +354,7 @@ def test_real_shape_9_4_3_3_and_exact_math(contract):
     assert services["frontend"]["memory_working_set_ratio"] == pytest.approx(0.5)
     assert hosts["node-a"]["nic_drop_error_rate"] == 10.0
     assert edges["tcp"]["edge_failure_rate"] == pytest.approx(3 / 50)
-    assert edges["dns"]["dns_failure_rate"] == pytest.approx(2 / 20)
+    assert edges["dns"]["dns_failure_rate"] == pytest.approx(2 / 21)
 
 
 def test_ratio_is_recomputed_after_cross_pod_sum(contract):
@@ -373,6 +375,82 @@ def test_ratio_is_recomputed_after_cross_pod_sum(contract):
         and item.metric_name == "request_failure_rate"
     )
     assert value == pytest.approx(2 / 1000)
+
+
+def test_local_socket_failure_events_are_deduplicated_per_operation(contract):
+    raw = _raw_window()
+    samples = [
+        item for item in raw.samples
+        if item.service_name != "frontend"
+    ]
+    _service_samples(
+        samples,
+        "frontend",
+        "node-a",
+        series="frontend-series",
+        socket_failure_deltas=(1, 1, 0, 0),
+        socket_ops_delta=1,
+    )
+    window = RawCollectionWindow.create(
+        sequence=1,
+        window_start_ns=START,
+        window_end_ns=END,
+        cluster_id=CLUSTER,
+        samples=samples,
+    )
+    result = FinalWindowAggregator(contract).aggregate(window)
+    value = next(
+        item.value for item in result.node_metrics
+        if item.service_name == "frontend"
+        and item.metric_name == "local_socket_failure_rate"
+    )
+    assert value == pytest.approx(1.0)
+
+
+def test_idle_pressure_and_lock_zero_over_zero_use_formula_epsilon(contract):
+    raw = _raw_window()
+    targets = {
+        "io_psi_some_ns_total",
+        "active_task_ns_total",
+        "futex_wait_ns_total",
+        "active_thread_ns_total",
+    }
+    starts = {
+        (item.component, item.series_id): item.value
+        for item in raw.samples
+        if (
+            item.service_name == "frontend"
+            and item.component in targets
+            and item.timestamp_ns == START
+        )
+    }
+    samples = []
+    for item in raw.samples:
+        if (
+            item.service_name == "frontend"
+            and item.component in targets
+            and item.timestamp_ns == END
+        ):
+            values = item.to_dict()
+            values["value"] = starts[(item.component, item.series_id)]
+            values.pop("source_record_id")
+            item = RawMetricSample.create(**values)
+        samples.append(item)
+    idle = RawCollectionWindow.create(
+        sequence=1,
+        window_start_ns=START,
+        window_end_ns=END,
+        cluster_id=CLUSTER,
+        samples=samples,
+    )
+    result = FinalWindowAggregator(contract).aggregate(idle)
+    values = {
+        item.metric_name: item.value
+        for item in result.node_metrics
+        if item.service_name == "frontend"
+    }
+    assert values["io_psi"] == 0.0
+    assert values["futex_wait_time_rate"] == 0.0
 
 
 def test_counter_reset_missing_component_and_wrong_unit_fail_closed(contract):

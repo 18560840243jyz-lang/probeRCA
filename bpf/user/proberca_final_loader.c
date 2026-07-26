@@ -24,7 +24,8 @@
 
 #define MAX_LINKS 64
 #define DEFAULT_TIMEOUT_MS 5000
-#define ACTIVE_WAIT_TABLE_SIZE (PROBERCA_FINAL_MAX_CGROUPS * 2)
+#define FUTEX_SNAPSHOT_TABLE_SIZE (PROBERCA_FINAL_MAX_CGROUPS * 2)
+#define FUTEX_SNAPSHOT_ATTEMPTS 16
 
 struct options {
     const char *object_path;
@@ -34,10 +35,14 @@ struct options {
     uint64_t timeout_ms;
 };
 
-struct active_wait_entry {
+struct futex_snapshot_entry {
     uint64_t cgroup_id;
-    uint64_t total_ns;
+    uint64_t completed_before_ns;
+    uint64_t active_ns;
+    uint64_t wait_total_ns;
     bool occupied;
+    bool prepared;
+    bool resolved;
 };
 
 static volatile sig_atomic_t stopping;
@@ -315,16 +320,16 @@ static int sweep_dns_timeouts(
     }
 }
 
-static struct active_wait_entry *active_wait_entry(
-    struct active_wait_entry *table, uint64_t cgroup_id, bool create)
+static struct futex_snapshot_entry *futex_snapshot_entry(
+    struct futex_snapshot_entry *table, uint64_t cgroup_id, bool create)
 {
     size_t index = (size_t)(
         (cgroup_id * 11400714819323198485ULL) &
-        (ACTIVE_WAIT_TABLE_SIZE - 1));
+        (FUTEX_SNAPSHOT_TABLE_SIZE - 1));
     size_t scanned;
 
-    for (scanned = 0; scanned < ACTIVE_WAIT_TABLE_SIZE; scanned++) {
-        struct active_wait_entry *entry = &table[index];
+    for (scanned = 0; scanned < FUTEX_SNAPSHOT_TABLE_SIZE; scanned++) {
+        struct futex_snapshot_entry *entry = &table[index];
 
         if (!entry->occupied) {
             if (!create)
@@ -335,16 +340,56 @@ static struct active_wait_entry *active_wait_entry(
         }
         if (entry->cgroup_id == cgroup_id)
             return entry;
-        index = (index + 1) & (ACTIVE_WAIT_TABLE_SIZE - 1);
+        index = (index + 1) & (FUTEX_SNAPSHOT_TABLE_SIZE - 1);
     }
     return NULL;
 }
 
+static void reset_unresolved_futex_entries(
+    struct futex_snapshot_entry *table)
+{
+    size_t index;
+
+    for (index = 0; index < FUTEX_SNAPSHOT_TABLE_SIZE; index++) {
+        if (table[index].occupied && !table[index].resolved) {
+            table[index].active_ns = 0;
+            table[index].prepared = false;
+        }
+    }
+}
+
+static int prepare_futex_snapshot(
+    int map_fd, struct futex_snapshot_entry *table)
+{
+    struct proberca_final_cgroup_counters value;
+    struct futex_snapshot_entry *entry;
+    uint64_t key;
+    uint64_t next;
+    bool have_key = false;
+
+    errno = 0;
+    while (bpf_map_get_next_key(
+               map_fd, have_key ? &key : NULL, &next) == 0) {
+        key = next;
+        have_key = true;
+        if (bpf_map_lookup_elem(map_fd, &key, &value) != 0)
+            continue;
+        entry = futex_snapshot_entry(table, key, true);
+        if (!entry)
+            return -ENOSPC;
+        if (entry->resolved)
+            continue;
+        entry->completed_before_ns = value.futex_wait_ns_total;
+        entry->prepared = true;
+    }
+    return errno == ENOENT ? 0 : -errno;
+}
+
 static int collect_active_futex_waits(
-    int futex_fd, uint64_t now_ns, struct active_wait_entry *table)
+    int futex_fd, uint64_t now_ns, struct futex_snapshot_entry *table)
 {
     struct proberca_final_futex_start value;
-    struct active_wait_entry *entry;
+    struct futex_snapshot_entry *entry;
     uint64_t key;
     uint64_t next;
     uint64_t elapsed;
@@ -359,39 +404,27 @@ static int collect_active_futex_waits(
             continue;
         if (now_ns < value.started_ns)
             continue;
+        entry = futex_snapshot_entry(
+            table, value.cgroup_id, false);
+        if (!entry || entry->resolved || !entry->prepared)
+            continue;
         elapsed = now_ns - value.started_ns;
-        entry = active_wait_entry(table, value.cgroup_id, true);
-        if (!entry)
-            return -ENOSPC;
-        if (UINT64_MAX - entry->total_ns < elapsed)
+        if (UINT64_MAX - entry->active_ns < elapsed)
             return -EOVERFLOW;
-        entry->total_ns += elapsed;
+        entry->active_ns += elapsed;
     }
     return errno == ENOENT ? 0 : -errno;
 }
 
-static int print_cgroups(int map_fd, int futex_fd, uint64_t now_ns)
+static int resolve_stable_futex_entries(
+    int map_fd, struct futex_snapshot_entry *table)
 {
-    struct active_wait_entry *active_waits;
-    struct active_wait_entry *active;
     struct proberca_final_cgroup_counters value;
-    uint64_t active_wait_ns;
-    uint64_t wait_total;
+    struct futex_snapshot_entry *entry;
     uint64_t key;
     uint64_t next;
     bool have_key = false;
-    int result;
 
-    active_waits = calloc(
-        ACTIVE_WAIT_TABLE_SIZE, sizeof(*active_waits));
-    if (!active_waits)
-        return -ENOMEM;
-    result = collect_active_futex_waits(
-        futex_fd, now_ns, active_waits);
-    if (result != 0) {
-        free(active_waits);
-        return result;
-    }
     errno = 0;
     while (bpf_map_get_next_key(
                map_fd, have_key ? &key : NULL, &next) == 0) {
@@ -399,13 +432,100 @@ static int print_cgroups(int map_fd, int futex_fd, uint64_t now_ns)
         have_key = true;
         if (bpf_map_lookup_elem(map_fd, &key, &value) != 0)
             continue;
-        active = active_wait_entry(active_waits, key, false);
-        active_wait_ns = active ? active->total_ns : 0;
-        if (UINT64_MAX - value.futex_wait_ns_total < active_wait_ns)
-            result = -EOVERFLOW;
+        entry = futex_snapshot_entry(table, key, false);
+        if (!entry || !entry->prepared)
+            continue;
+        if (entry->resolved ||
+            entry->completed_before_ns != value.futex_wait_ns_total)
+            continue;
+        if (UINT64_MAX - entry->completed_before_ns < entry->active_ns)
+            return -EOVERFLOW;
+        entry->wait_total_ns =
+            entry->completed_before_ns + entry->active_ns;
+        entry->resolved = true;
+    }
+    return errno == ENOENT ? 0 : -errno;
+}
+
+static bool all_futex_entries_resolved(
+    int map_fd, struct futex_snapshot_entry *table)
+{
+    struct futex_snapshot_entry *entry;
+    uint64_t key;
+    uint64_t next;
+    bool have_key = false;
+
+    errno = 0;
+    while (bpf_map_get_next_key(
+               map_fd, have_key ? &key : NULL, &next) == 0) {
+        key = next;
+        have_key = true;
+        entry = futex_snapshot_entry(table, key, false);
+        if (!entry || !entry->resolved)
+            return false;
+    }
+    return errno == ENOENT;
+}
+
+static int print_cgroups(int map_fd, int futex_fd)
+{
+    struct futex_snapshot_entry *table;
+    struct futex_snapshot_entry *entry;
+    struct proberca_final_cgroup_counters value;
+    uint64_t now_ns;
+    uint64_t key;
+    uint64_t next;
+    bool have_key = false;
+    unsigned int attempt;
+    int result = 0;
+
+    table = calloc(FUTEX_SNAPSHOT_TABLE_SIZE, sizeof(*table));
+    if (!table)
+        return -ENOMEM;
+    for (attempt = 0; attempt < FUTEX_SNAPSHOT_ATTEMPTS; attempt++) {
+        reset_unresolved_futex_entries(table);
+        result = prepare_futex_snapshot(map_fd, table);
         if (result != 0)
             break;
-        wait_total = value.futex_wait_ns_total + active_wait_ns;
+        now_ns = monotonic_ns();
+        if (!now_ns) {
+            result = -EIO;
+            break;
+        }
+        result = collect_active_futex_waits(
+            futex_fd, now_ns, table);
+        if (result != 0)
+            break;
+        result = resolve_stable_futex_entries(map_fd, table);
+        if (result != 0 || all_futex_entries_resolved(map_fd, table))
+            break;
+    }
+    if (result != 0) {
+        free(table);
+        return result;
+    }
+
+    errno = 0;
+    while (bpf_map_get_next_key(
+               map_fd, have_key ? &key : NULL, &next) == 0) {
+        key = next;
+        have_key = true;
+        if (bpf_map_lookup_elem(map_fd, &key, &value) != 0)
+            continue;
+        entry = futex_snapshot_entry(table, key, false);
+        if (!entry) {
+            result = -ENOSPC;
+            break;
+        }
+        /*
+         * Each cgroup is frozen only in an attempt where its completed total
+         * stays unchanged across the active-wait scan.  This preserves the
+         * continuous completed-plus-active definition without double-counting
+         * a wait that completes between the two BPF-map reads.  A cgroup that
+         * remains hot through every bounded retry emits its completed-only
+         * lower bound; the long-running exporter enforces the physical
+         * monotonic/thread-capacity invariants before publishing the counter.
+         */
         printf(
             "{\"record_type\":\"cgroup\",\"cgroup_id\":%llu,"
             "\"futex_wait_ns_total\":%llu,"
@@ -415,7 +535,10 @@ static int print_cgroups(int map_fd, int futex_fd, uint64_t now_ns)
             "\"socket_local_drop_total\":%llu,"
             "\"socket_ops_total\":%llu}\n",
             (unsigned long long)key,
-            (unsigned long long)wait_total,
+            (unsigned long long)(
+                entry->resolved
+                    ? entry->wait_total_ns
+                    : value.futex_wait_ns_total),
             (unsigned long long)value.socket_backlog_overflow_total,
             (unsigned long long)value.socket_accept_fail_total,
             (unsigned long long)value.socket_local_rst_total,
@@ -424,7 +547,7 @@ static int print_cgroups(int map_fd, int futex_fd, uint64_t now_ns)
     }
     if (result == 0 && errno != ENOENT)
         result = -errno;
-    free(active_waits);
+    free(table);
     return result;
 }
 
@@ -500,7 +623,7 @@ static int run_snapshot(const struct options *options)
         fprintf(stderr, "cannot sweep DNS timeout map\n");
         goto cleanup;
     }
-    if (print_cgroups(cgroups_fd, futex_fd, monotonic_ns()) != 0 ||
+    if (print_cgroups(cgroups_fd, futex_fd) != 0 ||
         print_dns(dns_fd, timeout_fd) != 0) {
         fprintf(stderr, "cannot read final BPF maps\n");
         goto cleanup;

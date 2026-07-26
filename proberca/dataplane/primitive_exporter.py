@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import subprocess
 import threading
@@ -396,6 +397,15 @@ class FinalPrimitiveExporter:
         self._stop = threading.Event()
         self._active_task_ns: dict[str, float] = {}
         self._active_thread_ns: dict[str, float] = {}
+        self._futex_raw_high_water_ns: dict[str, float] = {}
+        self._futex_wait_ns: dict[str, float] = {}
+        self._edge_sample_high_water: dict[
+            tuple[str, tuple[tuple[str, str], ...]], PrometheusSample
+        ] = {}
+        self._service_sample_high_water: dict[
+            tuple[str, tuple[tuple[str, str], ...]], PrometheusSample
+        ] = {}
+        self._qdisc_drop_state: dict[str, tuple[float, float]] = {}
         self._last_capacity_ns: int | None = None
         kubernetes_config.load_kube_config(
             config_file=self.config.kubeconfig_path,
@@ -671,6 +681,37 @@ class FinalPrimitiveExporter:
             "source_series": item.series,
         }
 
+    def _bounded_futex_counter(
+        self,
+        key: str,
+        raw_wait_ns: float,
+        thread_capacity_increment_ns: float,
+    ) -> float:
+        if (
+            not math.isfinite(raw_wait_ns)
+            or raw_wait_ns < 0
+            or not math.isfinite(thread_capacity_increment_ns)
+            or thread_capacity_increment_ns < 0
+        ):
+            raise RawCollectionError("futex counter input is invalid")
+        previous_raw = self._futex_raw_high_water_ns.get(key)
+        if previous_raw is None:
+            self._futex_raw_high_water_ns[key] = raw_wait_ns
+            self._futex_wait_ns[key] = 0.0
+            return 0.0
+        raw_increment = max(0.0, raw_wait_ns - previous_raw)
+        self._futex_raw_high_water_ns[key] = max(
+            previous_raw, raw_wait_ns
+        )
+        accepted_increment = min(
+            raw_increment, thread_capacity_increment_ns
+        )
+        value = (
+            self._futex_wait_ns.get(key, 0.0) + accepted_increment
+        )
+        self._futex_wait_ns[key] = value
+        return value
+
     def _resource_samples(
         self,
         inventory: Inventory,
@@ -858,13 +899,18 @@ class FinalPrimitiveExporter:
                 + float(thread_count * elapsed_ns)
             )
             record = cgroup_records.get(cgroup_id, {})
+            futex_wait_ns = self._bounded_futex_counter(
+                key,
+                float(record.get("futex_wait_ns_total", 0)),
+                float(thread_count * elapsed_ns),
+            )
             labels = self._resource_labels(identity)
             for metric_name, metric_value in (
                 ("proberca_cgroup_io_psi_some_nanoseconds_total", io_psi_ns),
                 ("proberca_cgroup_active_task_nanoseconds_total",
                  self._active_task_ns[key]),
                 ("proberca_cgroup_futex_wait_nanoseconds_total",
-                 float(record.get("futex_wait_ns_total", 0))),
+                 futex_wait_ns),
                 ("proberca_cgroup_active_thread_nanoseconds_total",
                  self._active_thread_ns[key]),
                 ("proberca_cgroup_socket_backlog_overflow_total",
@@ -1047,6 +1093,79 @@ class FinalPrimitiveExporter:
                 ))
         return tuple(output)
 
+    def _persistent_edge_samples(
+        self, samples: tuple[PrometheusSample, ...],
+    ) -> tuple[PrometheusSample, ...]:
+        for sample in samples:
+            if not sample.name.startswith("proberca_tcp_edge_"):
+                raise RawCollectionError(
+                    "edge persistence received a non-edge metric"
+                )
+            previous = self._edge_sample_high_water.get(sample.identity)
+            value = (
+                sample.value
+                if previous is None
+                else max(previous.value, sample.value)
+            )
+            self._edge_sample_high_water[sample.identity] = (
+                PrometheusSample(
+                    sample.name, sample.labels, value
+                )
+            )
+        return tuple(
+            self._edge_sample_high_water[key]
+            for key in sorted(self._edge_sample_high_water)
+        )
+
+    def _persistent_service_samples(
+        self,
+        samples: tuple[PrometheusSample, ...],
+        inventory: Inventory,
+    ) -> tuple[PrometheusSample, ...]:
+        active = {
+            (item.namespace, item.pod, item.container)
+            for item in inventory.containers
+        }
+        for key, sample in tuple(
+            self._service_sample_high_water.items()
+        ):
+            labels = sample.label_dict
+            coordinates = (
+                labels.get("namespace"),
+                labels.get("pod"),
+                labels.get("container"),
+            )
+            if coordinates not in active:
+                del self._service_sample_high_water[key]
+        for sample in samples:
+            if not sample.name.startswith("proberca_service_"):
+                raise RawCollectionError(
+                    "service persistence received a non-service metric"
+                )
+            labels = sample.label_dict
+            coordinates = (
+                labels.get("namespace"),
+                labels.get("pod"),
+                labels.get("container"),
+            )
+            if coordinates not in active:
+                raise RawCollectionError(
+                    "service persistence received an inactive container"
+                )
+            previous = self._service_sample_high_water.get(sample.identity)
+            value = (
+                sample.value
+                if previous is None
+                else max(previous.value, sample.value)
+            )
+            self._service_sample_high_water[sample.identity] = (
+                PrometheusSample(sample.name, sample.labels, value)
+            )
+        return tuple(
+            self._service_sample_high_water[key]
+            for key in sorted(self._service_sample_high_water)
+        )
+
     def _coredns_request_samples(
         self,
         inventory: Inventory,
@@ -1145,24 +1264,41 @@ class FinalPrimitiveExporter:
                     ),
                 ),
             }
-            output.extend((
-                PrometheusSample.create(
-                    "proberca_dns_edge_query_total",
-                    common, float(record["query_total"]),
-                ),
-                PrometheusSample.create(
-                    "proberca_dns_edge_timeout_total",
-                    common, float(record["timeout_total"]),
-                ),
-                PrometheusSample.create(
-                    "proberca_dns_edge_error_rcode_total",
-                    common, float(record["error_rcode_total"]),
-                ),
-            ))
             buckets = record.get("latency_buckets")
             if not isinstance(buckets, list) \
                     or len(buckets) != len(DNS_BUCKETS_MS):
                 raise RawCollectionError("BPF DNS histogram is invalid")
+            raw_query_total = float(record["query_total"])
+            timeout_total = float(record["timeout_total"])
+            response_total = float(buckets[-1])
+            raw_error_total = float(record["error_rcode_total"])
+            error_total = min(raw_error_total, response_total)
+            completed_total = response_total + timeout_total
+            if (
+                min(
+                    raw_query_total, timeout_total,
+                    response_total, raw_error_total,
+                ) < 0
+                or
+                raw_query_total < completed_total
+            ):
+                raise RawCollectionError(
+                    "BPF DNS counters violate completion invariants"
+                )
+            output.extend((
+                PrometheusSample.create(
+                    "proberca_dns_edge_query_total",
+                    common, completed_total,
+                ),
+                PrometheusSample.create(
+                    "proberca_dns_edge_timeout_total",
+                    common, timeout_total,
+                ),
+                PrometheusSample.create(
+                    "proberca_dns_edge_error_rcode_total",
+                    common, error_total,
+                ),
+            ))
             for bound, value in zip(DNS_BUCKETS_MS, buckets):
                 labels = dict(common)
                 labels["le"] = (
@@ -1173,6 +1309,58 @@ class FinalPrimitiveExporter:
                     labels, float(value),
                 ))
         return tuple(output)
+
+    def _qdisc_transmit_drop_totals(self) -> dict[str, float]:
+        result = subprocess.run(
+            ["tc", "-j", "-s", "qdisc", "show"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=float(self.config.source_timeout_sec),
+        )
+        if result.returncode != 0:
+            raise RawCollectionError(
+                "tc qdisc counters are unavailable: "
+                + result.stderr.strip()
+            )
+        try:
+            records = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise RawCollectionError(
+                "tc qdisc counters are not valid JSON"
+            ) from error
+        if not isinstance(records, list):
+            raise RawCollectionError("tc qdisc counter payload is not a list")
+        raw: dict[str, float] = {}
+        for record in records:
+            if not isinstance(record, dict):
+                raise RawCollectionError("tc qdisc record is not an object")
+            interface = record.get("dev")
+            drops = record.get("drops")
+            if not isinstance(interface, str) or not interface:
+                raise RawCollectionError("tc qdisc record lacks an interface")
+            if not isinstance(drops, (int, float)) or drops < 0:
+                raise RawCollectionError("tc qdisc drop counter is invalid")
+            # Hierarchical qdiscs may expose the same dropped packet at more
+            # than one level.  The maximum is a conservative non-duplicating
+            # interface total.
+            raw[interface] = max(raw.get(interface, 0.0), float(drops))
+        totals: dict[str, float] = {}
+        for interface in sorted(set(raw) | set(self._qdisc_drop_state)):
+            current = raw.get(interface, 0.0)
+            previous = self._qdisc_drop_state.get(interface)
+            if previous is None:
+                total = current
+            else:
+                last_raw, total = previous
+                total += (
+                    current - last_raw
+                    if current >= last_raw
+                    else current
+                )
+            self._qdisc_drop_state[interface] = (current, total)
+            totals[interface] = total
+        return totals
 
     def _host_samples(
         self,
@@ -1217,6 +1405,7 @@ class FinalPrimitiveExporter:
             "proberca_node_network_transmit_error_total":
                 "node_network_transmit_errs_total",
         }
+        qdisc_transmit_drops = self._qdisc_transmit_drop_totals()
         for output_name, source_name in network.items():
             values = index.get(source_name, ())
             if not values:
@@ -1232,7 +1421,12 @@ class FinalPrimitiveExporter:
                 output.append(PrometheusSample.create(
                     output_name,
                     {"node": node, "interface": interface},
-                    value.value,
+                    value.value + (
+                        qdisc_transmit_drops.get(interface, 0.0)
+                        if output_name
+                        == "proberca_node_network_transmit_drop_total"
+                        else 0.0
+                    ),
                 ))
         return tuple(output)
 
@@ -1317,6 +1511,12 @@ class FinalPrimitiveExporter:
         service_samples.extend(
             self._coredns_request_samples(inventory, coredns)
         )
+        service_samples = list(self._persistent_service_samples(
+            tuple(service_samples), inventory
+        ))
+        edge_samples = self._persistent_edge_samples(
+            self._render_request_rows(edge_rows, edge=True)
+        )
         covered_services = {
             (item.label_dict["namespace"],
              next(
@@ -1337,7 +1537,7 @@ class FinalPrimitiveExporter:
         cgroup_identity = self._cgroup_identity(inventory, cadvisor)
         samples = [
             *service_samples,
-            *self._render_request_rows(edge_rows, edge=True),
+            *edge_samples,
             *self._dns_samples(inventory, bpf, cgroup_identity),
             *self._resource_samples(
                 inventory, cadvisor, bpf, timestamp_ns

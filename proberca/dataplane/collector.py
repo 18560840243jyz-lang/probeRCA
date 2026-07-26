@@ -654,7 +654,79 @@ class FinalLiveCollectionRunner:
         if isinstance(window_count, bool) or not isinstance(window_count, int) \
                 or window_count <= 0:
             raise RawCollectionError("window_count must be positive")
-        return tuple(
-            self.collect_one(sequence)
-            for sequence in range(1, window_count + 1)
+        before = self.discovery.discover_once(
+            self.wall_clock_ns()
+        ).freeze(self.wall_clock_ns())
+        lead_ns = int(self.config.window_lead_sec * 1_000_000_000)
+        window_ns = self.config.window_sec * 1_000_000_000
+        now = self.wall_clock_ns() + lead_ns
+        first_start_ns = (
+            (now + window_ns - 1) // window_ns
+        ) * window_ns
+        bounds = tuple(
+            (
+                first_start_ns + index * window_ns,
+                first_start_ns + (index + 1) * window_ns,
+            )
+            for index in range(window_count)
         )
+        if self.raw_burst_source is not None:
+            begin_capture = getattr(
+                self.raw_burst_source, "begin_capture", None
+            )
+            if not callable(begin_capture):
+                raise RawCollectionError(
+                    "raw Burst source cannot begin a contiguous capture"
+                )
+            begin_capture()
+        self._wait_until(
+            bounds[-1][1] + int(
+                self.config.collection_delay_sec * 1_000_000_000
+            )
+        )
+        after = self.discovery.discover_once(
+            self.wall_clock_ns()
+        ).freeze(self.wall_clock_ns())
+        output = []
+        for sequence, (start_ns, end_ns) in enumerate(bounds, 1):
+            samples = self.primitive_source.collect(
+                window_start_ns=start_ns,
+                window_end_ns=end_ns,
+                inventory_revision=before,
+            )
+            raw_window = RawCollectionWindow.create(
+                sequence=sequence,
+                window_start_ns=start_ns,
+                window_end_ns=end_ns,
+                cluster_id=self.config.cluster_id,
+                samples=samples,
+            )
+            raw_burst_window = (
+                self.raw_burst_source.collect_window(
+                    sequence=sequence,
+                    window_start_ns=start_ns,
+                    window_end_ns=end_ns,
+                    inventory_revision=before,
+                    normal_raw_window=raw_window,
+                )
+                if self.raw_burst_source is not None else None
+            )
+            window = self.assembler.assemble(
+                raw_window=raw_window,
+                inventory_at_start=before,
+                inventory_at_end=after,
+                burst_evidence=(),
+            )
+            if raw_burst_window is not None:
+                residual = set(window.residual_source_record_ids)
+                overlap = residual & {
+                    sample.source_record_id
+                    for sample in raw_burst_window.samples
+                }
+                if overlap:
+                    raise RawCollectionError(
+                        "raw Burst source overlaps normal residual source"
+                    )
+                self.raw_burst_sink.append(raw_burst_window)
+            output.append(window)
+        return tuple(output)

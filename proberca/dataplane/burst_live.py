@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import math
+import os
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -217,10 +218,43 @@ class FinalLiveBurstSource:
         self._ready_records: deque[dict[str, Any]] = deque()
         self._memory_state: dict[int, tuple[int, int, int]] = {}
         self._nic_state: tuple[int, int, int] | None = None
+        self._cgroup_paths: dict[str, Path] = {}
+        self._ambiguous_cgroups: set[str] = set()
 
     @property
     def source_record_ids(self) -> tuple[str, ...]:
         return ()
+
+    def begin_capture(self) -> None:
+        """Fix the log offset before a contiguous collection interval."""
+        self._read_log()
+
+    def _refresh_cgroup_paths(self, root: Path) -> None:
+        prefix = "cri-containerd-"
+        suffix = ".scope"
+        paths: dict[str, Path] = {}
+        ambiguous: set[str] = set()
+        for directory, names, _files in os.walk(
+            root, topdown=True, onerror=lambda _error: None
+        ):
+            for name in names:
+                if not name.startswith(prefix) or not name.endswith(suffix):
+                    continue
+                container_id = name[len(prefix):-len(suffix)]
+                if (
+                    len(container_id) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in container_id.lower()
+                    )
+                ):
+                    continue
+                path = Path(directory) / name
+                previous = paths.setdefault(container_id, path)
+                if previous != path:
+                    ambiguous.add(container_id)
+        self._cgroup_paths = paths
+        self._ambiguous_cgroups = ambiguous
 
     def _read_log(self) -> None:
         path = Path(self.config.event_log_path)
@@ -279,6 +313,7 @@ class FinalLiveBurstSource:
         ip_services = {}
         node_names = set()
         service_entities = set()
+        refreshed_paths = False
         for identity in runtime_identities(revision):
             if (
                 not identity.ready
@@ -298,13 +333,20 @@ class FinalLiveBurstSource:
                 raise RawCollectionError(
                     "Burst runtime container identity is invalid"
                 )
-            matches = list(cgroup_root.rglob(
-                f"cri-containerd-{container_id}.scope"
-            ))
-            if len(matches) != 1:
-                raise RawCollectionError(
-                    "Burst cgroup identity is missing or ambiguous"
-                )
+            path = self._cgroup_paths.get(container_id)
+            if path is None or not path.is_dir():
+                if not refreshed_paths:
+                    self._refresh_cgroup_paths(cgroup_root)
+                    refreshed_paths = True
+                path = self._cgroup_paths.get(container_id)
+                if (
+                    container_id in self._ambiguous_cgroups
+                    or path is None
+                    or not path.is_dir()
+                ):
+                    raise RawCollectionError(
+                        "Burst cgroup identity is missing or ambiguous"
+                    )
             services = []
             for service_id in identity.service_ids:
                 _, namespace, service = service_id.split("::", 2)
@@ -321,13 +363,13 @@ class FinalLiveBurstSource:
                 service_entities.add((namespace, service, entity))
             if not services:
                 continue
-            cgroup_id = matches[0].stat().st_ino
+            cgroup_id = path.stat().st_ino
             if cgroup_id in cgroups:
                 raise RawCollectionError("Burst cgroup identity is duplicated")
             cgroups[cgroup_id] = {
                 "services": tuple(services),
                 "node": identity.node_name,
-                "path": matches[0],
+                "path": path,
             }
             if identity.node_name:
                 node_names.add(identity.node_name)
@@ -513,12 +555,13 @@ class FinalLiveBurstSource:
         coverage, event_loss = self._loss(
             window_start_ns, window_end_ns
         )
-        selected = [
-            record for record in self._events
-            if window_start_ns <= record["timestamp_ns"] < window_end_ns
-        ]
         while self._events and self._events[0]["timestamp_ns"] < window_start_ns:
             self._events.popleft()
+        selected = []
+        for record in self._events:
+            if record["timestamp_ns"] >= window_end_ns:
+                break
+            selected.append(record)
         timestamp_ns = window_end_ns - 1
         by_service = defaultdict(lambda: defaultdict(list))
         by_host = defaultdict(list)
@@ -557,10 +600,9 @@ class FinalLiveBurstSource:
             )
             if source is None or not destinations:
                 return None
-            total[protocol] += 1
             matches = set()
             for caller in source["services"]:
-                for _dst_namespace, dst_service in destinations:
+                for dst_namespace, dst_service in destinations:
                     entity = (
                         f"{self.config.cluster_id}::"
                         f"{caller['namespace']}::"
@@ -568,6 +610,18 @@ class FinalLiveBurstSource:
                     )
                     if entity in known_edges[protocol]:
                         matches.add((caller["namespace"], entity))
+                    if protocol == "tcp":
+                        reverse = (
+                            f"{self.config.cluster_id}::{dst_namespace}::"
+                            f"{dst_service}->{caller['service']}::{protocol}"
+                        )
+                        if reverse in known_edges[protocol]:
+                            matches.add((dst_namespace, reverse))
+            # Events whose two endpoints are known but whose pair is not in
+            # the frozen topology are out of scope, not mapping failures.
+            if not matches:
+                return None
+            total[protocol] += 1
             if len(matches) != 1:
                 return None
             mapped[protocol] += 1

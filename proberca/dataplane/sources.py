@@ -9,6 +9,7 @@ aggregation semantics unverifiable.
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Protocol
@@ -473,6 +474,7 @@ class PrometheusPrimitiveSource:
         inventory_revision: RuntimeIdentityResolver,
     ) -> tuple[RawMetricSample, ...]:
         output = []
+        jobs = []
         for query in self.config.queries:
             spec = COMPONENTS[query.component]
             timestamps = (
@@ -482,30 +484,42 @@ class PrometheusPrimitiveSource:
                 }
                 else (window_end_ns,)
             )
-            query_count = 0
             for requested_ns in timestamps:
-                for labels, observed_ns, value in self._instant(
-                    query, requested_ns
+                jobs.append((query, spec, requested_ns))
+        with ThreadPoolExecutor(
+            max_workers=min(64, len(jobs))
+        ) as executor:
+            responses = tuple(executor.map(
+                lambda item: self._instant(item[0], item[2]),
+                jobs,
+            ))
+        query_counts = {
+            query.query_id: 0 for query in self.config.queries
+        }
+        for (query, spec, requested_ns), response in zip(
+            jobs, responses
+        ):
+            for labels, observed_ns, value in response:
+                if spec.metric_kind in {
+                    "monotonic_counter", "histogram_bucket",
+                } and observed_ns != requested_ns:
+                    raise RawCollectionError(
+                        f"query {query.query_id} did not return an exact "
+                        f"boundary sample: requested={requested_ns}, "
+                        f"observed={observed_ns}"
+                    )
+                if spec.metric_kind == "gauge" and not (
+                    window_start_ns <= observed_ns <= window_end_ns
                 ):
-                    if spec.metric_kind in {
-                        "monotonic_counter", "histogram_bucket",
-                    } and observed_ns != requested_ns:
-                        raise RawCollectionError(
-                            f"query {query.query_id} did not return an exact "
-                            f"boundary sample: requested={requested_ns}, "
-                            f"observed={observed_ns}"
-                        )
-                    if spec.metric_kind == "gauge" and not (
-                        window_start_ns <= observed_ns <= window_end_ns
-                    ):
-                        raise RawCollectionError(
-                            f"query {query.query_id} returned a stale gauge"
-                        )
-                    output.append(self._sample(
-                        query, labels, observed_ns, value, inventory_revision
-                    ))
-                    query_count += 1
-            if query_count == 0:
+                    raise RawCollectionError(
+                        f"query {query.query_id} returned a stale gauge"
+                    )
+                output.append(self._sample(
+                    query, labels, observed_ns, value, inventory_revision
+                ))
+                query_counts[query.query_id] += 1
+        for query in self.config.queries:
+            if query_counts[query.query_id] == 0:
                 raise RawCollectionError(
                     f"query {query.query_id} returned no raw samples"
                 )
