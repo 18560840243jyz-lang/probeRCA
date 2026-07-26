@@ -401,6 +401,7 @@ The integrated pipeline now emits `05b_structured_propagation/` with structured 
   checks and seal only topology-stable windows.
 - [x] Add independent Burst normalization/source-overlap validation without
   starting Burst from the data plane.
-- [ ] Deploy the missing always-on eBPF/cgroup-map exporter series in the
-  single-VM environment and pass a Healthy-only live dry run before any fault
-  injection.
+- [x] Deploy the final always-on eBPF/cgroup-map producer, pinned Beyla
+  application-metric source, primitive exporter, and Prometheus scrape job in
+  the single-VM environment; seal and integrity-load three consecutive
+  Healthy-only 1-second windows before any fault injection.

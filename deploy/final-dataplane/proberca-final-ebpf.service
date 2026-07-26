@@ -1,0 +1,15 @@
+[Unit]
+Description=ProbeRCA final always-on eBPF primitive maps
+After=local-fs.target docker.service
+RequiresMountsFor=/sys/fs/bpf /sys/fs/cgroup
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/proberca-final/proberca-final-ebpf-loader --object /usr/local/lib/proberca-final/final_normal.bpf.o --cgroup /sys/fs/cgroup --pin-dir /sys/fs/bpf/proberca-final
+Restart=on-failure
+RestartSec=2s
+LimitMEMLOCK=infinity
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

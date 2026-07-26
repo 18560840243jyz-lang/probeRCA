@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -101,6 +102,7 @@ def _histogram(
 
 def _service_samples(
     output, service, node, *, series, request_delta=100, error_delta=2,
+    request_histogram_deltas=None,
 ):
     identity = {
         "namespace": NAMESPACE,
@@ -143,7 +145,15 @@ def _service_samples(
         series=series, **identity,
     )
     _histogram(
-        output, "request_latency_histogram", (50, 95, 100),
+        output, "request_latency_histogram", (
+            (
+                request_delta // 2,
+                (request_delta * 95 + 99) // 100,
+                request_delta,
+            )
+            if request_histogram_deltas is None
+            else request_histogram_deltas
+        ),
         entity="service", series=series, **identity,
     )
 
@@ -165,7 +175,10 @@ def _host_samples(output, node):
         )
 
 
-def _edge_samples(output, protocol):
+def _edge_samples(
+    output, protocol, *, count_delta=None, error_delta=None,
+    timeout_delta=None, histogram_deltas=None,
+):
     identity = {
         "namespace": NAMESPACE,
         "src_service": "frontend",
@@ -179,16 +192,16 @@ def _edge_samples(output, protocol):
     }
     if protocol == "tcp":
         components = (
-            ("edge_request_total", 50),
-            ("edge_error_total", 2),
-            ("edge_timeout_total", 1),
+            ("edge_request_total", 50 if count_delta is None else count_delta),
+            ("edge_error_total", 2 if error_delta is None else error_delta),
+            ("edge_timeout_total", 1 if timeout_delta is None else timeout_delta),
         )
         histogram = "edge_latency_histogram"
     else:
         components = (
-            ("dns_query_total", 20),
-            ("dns_timeout_total", 1),
-            ("dns_error_rcode_total", 1),
+            ("dns_query_total", 20 if count_delta is None else count_delta),
+            ("dns_timeout_total", 1 if timeout_delta is None else timeout_delta),
+            ("dns_error_rcode_total", 1 if error_delta is None else error_delta),
         )
         histogram = "dns_latency_histogram"
     for component, delta in components:
@@ -197,7 +210,13 @@ def _edge_samples(output, protocol):
             entity="edge", series=f"{protocol}-flow", **identity,
         )
     _histogram(
-        output, histogram, (10, 19, 20),
+        output, histogram, (
+            (
+                (25, 48, 50)
+                if protocol == "tcp" else (10, 19, 20)
+            )
+            if histogram_deltas is None else histogram_deltas
+        ),
         entity="edge", series=f"{protocol}-flow", **identity,
     )
 
@@ -426,17 +445,103 @@ def test_collector_builds_versioned_topology_and_seals(contract, tmp_path):
     assert len(tuple(archive.iter_windows())) == 1
 
 
-def test_topology_resource_version_change_rejects_window(contract):
+def test_global_resource_watermark_change_does_not_fake_layout_change(
+    contract,
+):
     collector = FinalDataPlaneCollector(
         collection_contract=contract,
         collector_build_id=fingerprint({"build": "test"}),
     )
-    with pytest.raises(RawCollectionError, match="resource version"):
+    before = _revision("rv-1")
+    after = _revision("rv-2")
+    for objects in after.objects_by_kind.values():
+        for raw in objects.values():
+            raw["metadata"]["resourceVersion"] = "rv-1"
+    window = collector.assemble(
+        raw_window=_raw_window(),
+        inventory_at_start=before,
+        inventory_at_end=after,
+    )
+    assert len(window.topology_events) == 1
+
+
+def test_runtime_identity_change_inside_window_is_rejected(contract):
+    before = _revision("rv-1")
+    after = copy.deepcopy(before)
+    after.objects_by_kind["Pod"]["pod-payment"]["status"][
+        "containerStatuses"
+    ][0]["containerID"] = "containerd://replacement-payment"
+    collector = FinalDataPlaneCollector(
+        collection_contract=contract,
+        collector_build_id=fingerprint({"build": "test"}),
+    )
+    with pytest.raises(RawCollectionError, match="runtime identity"):
         collector.assemble(
             raw_window=_raw_window(),
-            inventory_at_start=_revision("rv-1"),
-            inventory_at_end=_revision("rv-2"),
+            inventory_at_start=before,
+            inventory_at_end=after,
         )
+
+
+def test_empty_service_histogram_has_zero_coverage_not_imputation(
+    contract,
+):
+    samples = []
+    _service_samples(
+        samples, "frontend", "node-a", series="frontend-series",
+        request_delta=0, error_delta=0,
+        request_histogram_deltas=(0, 0, 0),
+    )
+    result = FinalWindowAggregator(contract).aggregate(
+        RawCollectionWindow.create(
+            sequence=1,
+            window_start_ns=START,
+            window_end_ns=END,
+            cluster_id=CLUSTER,
+            samples=samples,
+        )
+    )
+    metrics = {item.metric_name: item for item in result.node_metrics}
+    assert len(metrics) == 9
+    assert metrics["request_rate"].value == 0
+    latency = metrics["request_latency_p95"]
+    assert latency.value == 0
+    assert latency.sample_count == 0
+    assert latency.coverage == 0
+
+
+def test_inactive_edge_keeps_stable_identity_with_missing_latency(
+    contract,
+):
+    samples = []
+    _service_samples(
+        samples, "frontend", "node-a", series="frontend-series"
+    )
+    _service_samples(
+        samples, "payment", "node-b", series="payment-series"
+    )
+    _host_samples(samples, "node-a")
+    _host_samples(samples, "node-b")
+    _edge_samples(
+        samples, "tcp", count_delta=0, error_delta=0,
+        timeout_delta=0, histogram_deltas=(0, 0, 0),
+    )
+    result = FinalWindowAggregator(contract).aggregate(
+        RawCollectionWindow.create(
+            sequence=1,
+            window_start_ns=START,
+            window_end_ns=END,
+            cluster_id=CLUSTER,
+            samples=samples,
+        )
+    )
+    metrics = {item.metric_name: item for item in result.edge_metrics}
+    assert set(metrics) == {
+        "edge_request_count", "edge_latency_p95", "edge_failure_rate",
+    }
+    assert metrics["edge_request_count"].value == 0
+    assert metrics["edge_failure_rate"].value == 0
+    assert metrics["edge_latency_p95"].coverage == 0
 
 
 def _calibrations(contract):

@@ -1,0 +1,30 @@
+schema_version: probeRCA-final-primitive-exporter-v1
+cluster_id: kind-proberca-ob
+kubeconfig_path: /home/jyz/.kube/config
+kubernetes_context: kind-proberca-ob
+namespaces:
+  - online-boutique
+  - kube-system
+include_services:
+  - online-boutique/adservice
+  - online-boutique/cartservice
+  - online-boutique/checkoutservice
+  - online-boutique/currencyservice
+  - online-boutique/emailservice
+  - online-boutique/frontend
+  - online-boutique/paymentservice
+  - online-boutique/productcatalogservice
+  - online-boutique/recommendationservice
+  - online-boutique/redis-cart
+  - online-boutique/shippingservice
+  - kube-system/kube-dns
+kind_node_container: proberca-ob-control-plane
+beyla_port: 9400
+node_exporter_url: http://127.0.0.1:9100/metrics
+bpf_loader_path: /usr/local/lib/proberca-final/proberca-final-ebpf-loader
+bpf_map_directory: /sys/fs/bpf/proberca-final
+dns_timeout_ms: 5000
+listen_host: 127.0.0.1
+listen_port: 9477
+snapshot_period_sec: 1
+source_timeout_sec: 5.0

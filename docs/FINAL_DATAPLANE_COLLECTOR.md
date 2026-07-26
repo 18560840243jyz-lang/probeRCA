@@ -39,24 +39,46 @@ canonical final aggregator.
   from summed numerator and denominator components.
 - P95 is accepted only from complete cumulative histograms with identical
   bucket layouts. Bucket deltas are merged before the P95 is selected.
-- Missing, duplicate, stale, ambiguous, pre-aggregated, wrong-unit, or
-  wrong-kind inputs reject the complete window. No source value is filled with
-  zero.
+- Duplicate, stale, ambiguous, pre-aggregated, wrong-unit, or wrong-kind
+  inputs reject the complete window.
+- A genuinely empty request/edge histogram is represented only as
+  `sample_count=0, coverage=0`. Its finite zero placeholder preserves the
+  frozen tensor shape but is not an observation and is never a forward fill.
+- The cumulative histogram `+Inf` delta must equal its corresponding request
+  or query counter delta whenever observations exist.
 
 The output is exactly:
 
 - 9 metrics for every monitored service;
 - 4 metrics for every host that runs a monitored service;
-- 3 metrics for every active directed TCP edge;
-- 3 metrics for every active directed DNS edge.
+- 3 metrics for every known directed TCP edge;
+- 3 metrics for every known directed DNS edge.
+
+Known edges remain in the topology during an idle second. Their count and
+failure rate are zero and their empty latency has zero coverage. This keeps
+traffic sparsity from masquerading as a deployment-layout change.
 
 ## Raw exporter contract
 
-The example source mapping is
-`configs/final_live_collector.example.yaml`. It binds the 34 required raw
-components to Prometheus selectors. Some inputs are standard cAdvisor or node
-exporter counters; the service PSI/futex/local-socket and TCP/DNS primitives
-must come from the always-on eBPF/cgroup-map exporter.
+`proberca-export-final-primitives` is the canonical raw producer. Its frozen
+configuration is `configs/final_primitive_exporter.example.yaml`. It:
+
+- discovers exact ready Kubernetes Pod/container identities;
+- reads only required cAdvisor, CoreDNS, node_exporter, and Beyla cumulative
+  primitives;
+- reads cgroup v2 CPU/memory/PSI/task/thread primitives;
+- snapshots the always-on `bpf/final_normal` cgroup, futex, socket, and DNS
+  maps;
+- exports cumulative counters, cumulative buckets, and gauges with one
+  explicit epoch-second timestamp.
+
+The independent sources are fetched concurrently so a full snapshot completes
+inside the frozen 1-second period. Normal-path BPF data stays in maps; it does
+not stream fine-grained events to userspace.
+
+`configs/final_live_collector.example.yaml` binds all 34 raw components to
+this exporter. It does not query cAdvisor or node_exporter directly, so the
+source labels and aggregation boundary are fixed in one auditable adapter.
 
 Prometheus is a transport for source primitives, not the final aggregator.
 The source adapter rejects `rate`, `irate`, `increase`, `delta`,
@@ -67,11 +89,14 @@ or recording rule from silently changing the mathematical contract.
 ## Topology and identity
 
 Each window is bracketed by two complete Kubernetes inventory revisions.
-Collection fails if the structure fingerprint, required resource-version
-vector, or runtime identity fingerprint changes. Every service is resolved
-through Pod UID and ready container runtime identity, and every active edge
-must have complete metrics for both endpoint services. The sealed topology
-therefore covers the entire window rather than only its end timestamp.
+Collection fails if the relevant structure fingerprint or ready-container
+runtime identity fingerprint changes. The API server's global list
+`resourceVersion` watermarks are recorded for provenance but are not treated
+as layout identity because unrelated cluster events advance them. Every
+service is resolved through Pod UID and ready container runtime identity, and
+every known edge has complete metrics for both endpoint services. The sealed
+topology therefore covers the entire window rather than only its end
+timestamp.
 
 ## Burst boundary
 
@@ -83,8 +108,15 @@ closed.
 
 ## Healthy-only collection
 
-After the required exporters are deployed and the example mapping is adjusted
-to their exact label set:
+Install the pinned Beyla DaemonSet, final BPF loader, raw exporter systemd
+services, and Prometheus scrape job:
+
+```bash
+sudo env PYTHONPATH=/home/jyz/.local/lib/python3.10/site-packages \
+  python3 scripts/install_final_dataplane.py
+```
+
+Then collect without fault injection:
 
 ```bash
 proberca-collect-final \
@@ -97,3 +129,9 @@ proberca-collect-final \
 This command does not inject a fault. If any required source is absent, it
 exits without producing a sealed archive. Only a successfully sealed archive
 may later be passed to the control plane.
+
+The single-VM Healthy dry run on 2026-07-26 sealed three consecutive windows.
+Each window contained 12 complete service sets (108 metrics), one complete
+host set (4 metrics), and 16 stable directed edge sets (48 metrics). All three
+windows had the same topology structure fingerprint:
+`f0fdfe3e0bcd17b99080e8aa0adfcc8ea32d1aa81fe88051dd8fcdb1c5253272`.

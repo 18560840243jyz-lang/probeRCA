@@ -1,0 +1,43 @@
+SHELL := /bin/bash
+.RECIPEPREFIX := >
+
+BUILD_DIR ?= /tmp/proberca-final-bpf-build
+CLANG ?= clang
+CC ?= cc
+BPFTOOL ?= bpftool
+BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_x86 -Wall -Werror \
+	-I$(BUILD_DIR) -Ibpf/final_normal \
+	-I/usr/include/$(shell uname -m)-linux-gnu
+USER_CFLAGS := -g -O2 -Wall -Wextra -Werror -Ibpf/final_normal
+
+.PHONY: all clean
+all: $(BUILD_DIR)/vmlinux.h \
+	$(BUILD_DIR)/final_normal.bpf.o \
+	$(BUILD_DIR)/proberca-final-ebpf-loader
+
+$(BUILD_DIR):
+>install -d -m 0755 "$@"
+
+$(BUILD_DIR)/vmlinux.h: | $(BUILD_DIR)
+>@test -r /sys/kernel/btf/vmlinux
+>$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > "$@.tmp"
+>mv "$@.tmp" "$@"
+
+$(BUILD_DIR)/final_normal.bpf.o: \
+		bpf/final_normal/final_normal.bpf.c \
+		bpf/final_normal/final_normal.h \
+		$(BUILD_DIR)/vmlinux.h | $(BUILD_DIR)
+>$(CLANG) $(BPF_CFLAGS) -c "$<" -o "$@.tmp"
+>mv "$@.tmp" "$@"
+
+$(BUILD_DIR)/proberca-final-ebpf-loader: \
+		bpf/user/proberca_final_loader.c \
+		bpf/final_normal/final_normal.h | $(BUILD_DIR)
+>$(CC) $(USER_CFLAGS) "$<" -o "$@.tmp" -lbpf -lelf -lz
+>chmod 0755 "$@.tmp"
+>mv "$@.tmp" "$@"
+
+clean:
+>rm -f -- "$(BUILD_DIR)/vmlinux.h" \
+>  "$(BUILD_DIR)/final_normal.bpf.o" \
+>  "$(BUILD_DIR)/proberca-final-ebpf-loader"

@@ -1,0 +1,18 @@
+[Unit]
+Description=ProbeRCA final raw primitive exporter
+After=network-online.target docker.service proberca-final-ebpf.service
+Wants=network-online.target
+Requires=proberca-final-ebpf.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/jyz/probeRCA
+Environment=PYTHONPATH=/home/jyz/probeRCA:/home/jyz/.local/lib/python3.10/site-packages
+ExecStart=/usr/bin/python3 -m proberca.cli.export_final_primitives --config /home/jyz/probeRCA/configs/final_primitive_exporter.example.yaml
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

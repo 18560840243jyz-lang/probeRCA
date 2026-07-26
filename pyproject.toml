@@ -26,6 +26,7 @@ test = [
 proberca-replay = "proberca.cli.replay:main"
 proberca-live = "proberca.cli.live:main"
 proberca-collect-final = "proberca.cli.collect_final:main"
+proberca-export-final-primitives = "proberca.cli.export_final_primitives:main"
 proberca-seal-collection = "proberca.cli.seal_collection:main"
 proberca-analyze-collection = "proberca.cli.analyze_collection:main"
 

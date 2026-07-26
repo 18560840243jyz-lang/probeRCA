@@ -126,12 +126,16 @@ class MetricResolver:
                 raise MetricContractError(
                     f"collected window has duplicate metric node {metric.node_id}"
                 )
+            quality = float(record.coverage * (1.0 - record.event_loss_rate))
+            if quality <= 0.0:
+                # A zero-coverage aggregate is an explicit missing observation.
+                # Keep it out of both the healthy baseline and anomaly scoring.
+                continue
             transformed = baseline.transform(record.value, spec)
             raw[metric.node_id] = (transformed, spec)
             signed_z = baseline.score(metric.node_id, transformed, spec.polarity)
             if signed_z is None:
                 continue
-            quality = float(record.coverage * (1.0 - record.event_loss_rate))
             normalized[metric.node_id] = NormalizedObservation(
                 metric=metric,
                 signed_z=signed_z,

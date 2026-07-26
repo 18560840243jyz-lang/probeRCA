@@ -237,21 +237,26 @@ class FinalWindowAggregator:
         used_sources: set[str] = set()
         used_objects: set[str] = set()
         for entity_key, entity_samples in sorted(by_entity.items()):
-            if entity_key[0] == "service":
-                records, sources, objects = self._service(
-                    window, entity_key, entity_samples
-                )
-                nodes.extend(records)
-            elif entity_key[0] == "host":
-                records, sources, objects = self._host(
-                    window, entity_key, entity_samples
-                )
-                nodes.extend(records)
-            else:
-                records, sources, objects = self._edge(
-                    window, entity_key, entity_samples
-                )
-                edges.extend(records)
+            try:
+                if entity_key[0] == "service":
+                    records, sources, objects = self._service(
+                        window, entity_key, entity_samples
+                    )
+                    nodes.extend(records)
+                elif entity_key[0] == "host":
+                    records, sources, objects = self._host(
+                        window, entity_key, entity_samples
+                    )
+                    nodes.extend(records)
+                else:
+                    records, sources, objects = self._edge(
+                        window, entity_key, entity_samples
+                    )
+                    edges.extend(records)
+            except RawCollectionError as error:
+                raise RawCollectionError(
+                    f"entity {entity_key!r}: {error}"
+                ) from error
             used_sources.update(sources)
             used_objects.update(objects)
         if not nodes:
@@ -399,14 +404,19 @@ class FinalWindowAggregator:
     ) -> _Value:
         if denominator.value <= 0:
             if numerator.value == 0 and name in {
-                "request_failure_rate", "local_socket_failure_rate",
+                "request_failure_rate", "cpu_throttle_ratio",
+                "local_socket_failure_rate", "edge_failure_rate",
+                "dns_failure_rate",
             }:
                 return _combine((numerator, denominator), 0.0)
             raise RawCollectionError(f"{name} has a non-positive denominator")
         result = numerator.value / (denominator.value + RATIO_EPSILON)
         if not math.isfinite(result) or result < 0 \
                 or (bounded and result > 1.0):
-            raise RawCollectionError(f"{name} ratio is invalid")
+            raise RawCollectionError(
+                f"{name} ratio is invalid: numerator={numerator.value}, "
+                f"denominator={denominator.value}, result={result}"
+            )
         return _combine((numerator, denominator), result)
 
     def _histogram_p95(
@@ -415,6 +425,8 @@ class FinalWindowAggregator:
         samples: list[RawMetricSample],
         component: str,
         required_series_ids: set[str] | None = None,
+        *,
+        allow_empty: bool = False,
     ) -> _Value:
         records = self._component(samples, component)
         by_series: dict[str, list[RawMetricSample]] = defaultdict(list)
@@ -496,6 +508,13 @@ class FinalWindowAggregator:
         cumulative = [merged[key] for key in ordered]
         total = cumulative[-1]
         if total <= 0:
+            if allow_empty and total == 0:
+                return _Value(
+                    0.0, 0, 0.0,
+                    max(item.event_loss_rate for item in qualities),
+                    min(item.mapping_quality for item in qualities),
+                    frozenset(source_ids), frozenset(object_ids),
+                )
             raise RawCollectionError(f"{component} histogram has no observations")
         threshold = 0.95 * total
         selected = next(
@@ -582,8 +601,12 @@ class FinalWindowAggregator:
         )
         request_p95 = self._histogram_p95(
             window, samples, "request_latency_histogram",
-            set(request["request_total"]),
+            set(request["request_total"]), allow_empty=True,
         )
+        if request_p95.sample_count != request_total.value:
+            raise RawCollectionError(
+                "service request histogram count does not match request_total"
+            )
 
         cpu = self._deltas(
             window, samples, "cpu_time_ns_total",
@@ -787,22 +810,28 @@ class FinalWindowAggregator:
                 ("dns_query_total", "dns_timeout_total", "dns_error_rcode_total"),
             )
             count = self._sum(values["dns_query_total"])
-            if count.value <= 0:
-                raise RawCollectionError(
-                    "DNS edge samples were supplied for an inactive edge"
-                )
             bad = (
                 self._sum(values["dns_timeout_total"]),
                 self._sum(values["dns_error_rcode_total"]),
             )
+            latency = self._histogram_p95(
+                window, samples, "dns_latency_histogram",
+                set(values["dns_query_total"]), allow_empty=True,
+            )
+            if count.value == 0:
+                if any(item.value != 0 for item in bad) \
+                        or latency.sample_count != 0:
+                    raise RawCollectionError(
+                        "inactive DNS edge has failure/latency observations"
+                    )
+            if latency.sample_count != count.value:
+                raise RawCollectionError(
+                    "DNS latency histogram count does not match query_total"
+                )
             failure = self._ratio(
                 _combine(bad, sum(item.value for item in bad)),
                 count,
                 "dns_failure_rate",
-            )
-            latency = self._histogram_p95(
-                window, samples, "dns_latency_histogram",
-                set(values["dns_query_total"]),
             )
             outputs = (
                 ("dns_query_count", count, "queries", "delta_counter", None),
@@ -820,22 +849,28 @@ class FinalWindowAggregator:
                 ("edge_request_total", "edge_error_total", "edge_timeout_total"),
             )
             count = self._sum(values["edge_request_total"])
-            if count.value <= 0:
-                raise RawCollectionError(
-                    "TCP edge samples were supplied for an inactive edge"
-                )
             bad = (
                 self._sum(values["edge_error_total"]),
                 self._sum(values["edge_timeout_total"]),
             )
+            latency = self._histogram_p95(
+                window, samples, "edge_latency_histogram",
+                set(values["edge_request_total"]), allow_empty=True,
+            )
+            if count.value == 0:
+                if any(item.value != 0 for item in bad) \
+                        or latency.sample_count != 0:
+                    raise RawCollectionError(
+                        "inactive TCP edge has failure/latency observations"
+                    )
+            if latency.sample_count != count.value:
+                raise RawCollectionError(
+                    "TCP latency histogram count does not match request_total"
+                )
             failure = self._ratio(
                 _combine(bad, sum(item.value for item in bad)),
                 count,
                 "edge_failure_rate",
-            )
-            latency = self._histogram_p95(
-                window, samples, "edge_latency_histogram",
-                set(values["edge_request_total"]),
             )
             outputs = (
                 ("edge_request_count", count, "requests", "delta_counter", None),

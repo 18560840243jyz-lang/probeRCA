@@ -491,11 +491,9 @@ class FinalDataPlaneCollector:
         if start_topology.structure_fingerprint \
                 != end_topology.structure_fingerprint \
                 or start_topology.runtime_identity_fingerprints \
-                != end_topology.runtime_identity_fingerprints \
-                or start_topology.resource_version_vector \
-                != end_topology.resource_version_vector:
+                != end_topology.runtime_identity_fingerprints:
             raise RawCollectionError(
-                "topology/resource version/runtime identity changed inside "
+                "topology structure/runtime identity changed inside "
                 "the collection window"
             )
         evidence = tuple(burst_evidence)

@@ -12,7 +12,7 @@ from proberca.cli.analyze_collection import main as analyze_main
 from proberca.cli.seal_collection import main as seal_main
 from proberca.controlplane import FinalControlConfig, FinalControlPlane
 from proberca.controlplane.model import MetricPropagationModel
-from proberca.controlplane.observations import MetricResolver
+from proberca.controlplane.observations import MetricResolver, RobustBaselineStore
 from proberca.controlplane.service_model import ServiceRLS, allowed_service_graph
 from proberca.data.schema import (
     EdgeMetricRecord,
@@ -441,6 +441,20 @@ def test_edge_identity_and_cross_metric_only_prediction():
     assert metric.entity_id == "cluster::ns::checkout->payment::tcp"
     assert metric.root_category == "TCP"
     assert spec.role == "edge_latency"
+
+
+def test_zero_coverage_placeholder_does_not_enter_healthy_baseline():
+    config = _config()
+    record = replace(_node_records(1)[0], value=0.0, sample_count=0, coverage=0.0)
+    window = SimpleNamespace(node_metrics=(record,), edge_metrics=())
+
+    normalized, raw = MetricResolver(config).normalize_window(
+        window,
+        RobustBaselineStore(config),
+    )
+
+    assert normalized == {}
+    assert raw == {}
 
     model = MetricPropagationModel(
         node_ids=("a", "b"), lags=(1,),
