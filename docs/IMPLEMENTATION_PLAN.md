@@ -393,4 +393,14 @@ The integrated pipeline now emits `05b_structured_propagation/` with structured 
 - [x] Remove counterfactual re-solves from the final path.
 - [x] Add separate seal/analyze commands and an adapter for existing engine windows.
 - [x] Add end-to-end separation, integrity, metric completeness, evidence, and label-isolation tests.
-- [ ] Migrate each real P13 collector metric name and aggregation scope to the final collection contract before the next real experiment run.
+- [x] Replace the mixed P13 collection entry point with a canonical collection-only
+  runner that never imports the RCA/control modules.
+- [x] Implement the 34 raw primitive source contracts and exact final 9/4/3/3
+  aggregation (per-series counter delta, component ratios, and merged histograms).
+- [x] Bracket every window with Kubernetes resource-version/runtime-identity
+  checks and seal only topology-stable windows.
+- [x] Add independent Burst normalization/source-overlap validation without
+  starting Burst from the data plane.
+- [ ] Deploy the missing always-on eBPF/cgroup-map exporter series in the
+  single-VM environment and pass a Healthy-only live dry run before any fault
+  injection.

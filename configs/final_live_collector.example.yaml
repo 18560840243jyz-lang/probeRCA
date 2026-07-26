@@ -1,0 +1,416 @@
+schema_version: probeRCA-final-live-collector-v1
+cluster_id: kind-proberca-ob
+window_sec: 1
+collection_delay_sec: 1.0
+window_lead_sec: 1.0
+
+kubernetes:
+  enabled: true
+  cluster_id: kind-proberca-ob
+  in_cluster: false
+  kubeconfig_path: /home/jyz/.kube/config
+  context: kind-proberca-ob
+  namespaces: [online-boutique, kube-system]
+  namespace_label_selector: null
+  field_selectors: {}
+  resync_timeout_sec: 60.0
+  watch_timeout_sec: 30.0
+  reconnect_initial_sec: 1.0
+  reconnect_max_sec: 30.0
+  allow_watch_bookmarks: true
+  endpoint_ready_policy: ready_only
+  include_terminating_endpoints: false
+  include_persistent_volumes: true
+  include_volume_attachments: false
+  include_jobs: false
+  include_external_name_services: false
+  pod_service_ambiguity_policy: fail
+  inventory_stale_after_sec: 120.0
+  topology_snapshot_each_window: true
+  explicit_resource_annotation_prefix: proberca.io/resource-
+
+prometheus:
+  base_url: http://127.0.0.1:9090
+  timeout_sec: 10.0
+  reject_warnings: true
+  queries:
+    # Service request symptoms. The exporter must expose raw counters and
+    # cumulative buckets; rate() and histogram_quantile() are forbidden here.
+    - query_id: service-request-total
+      component: request_total
+      promql: 'proberca_service_request_total'
+      label_mapping: &service_labels
+        namespace: namespace
+        pod: pod
+        container_id: container
+      required_labels: &service_required [namespace, pod, container]
+      optional_labels: &service_optional [job, instance]
+      series_labels: &service_series [namespace, pod, container_id]
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: service-request-error-total
+      component: request_error_total
+      promql: 'proberca_service_request_error_total'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: *service_optional
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: service-request-timeout-total
+      component: request_timeout_total
+      promql: 'proberca_service_request_timeout_total'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: *service_optional
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: service-request-latency-histogram
+      component: request_latency_histogram
+      promql: 'proberca_service_request_latency_milliseconds_bucket'
+      label_mapping: &service_histogram_labels
+        namespace: namespace
+        pod: pod
+        container_id: container
+        histogram_upper_bound: le
+      required_labels: &service_histogram_required [namespace, pod, container, le]
+      optional_labels: *service_optional
+      series_labels: *service_series
+      histogram_le_label: le
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+
+    # Service CPU and memory. Counter conversion remains in the collector.
+    - query_id: service-cpu-time
+      component: cpu_time_ns_total
+      promql: 'container_cpu_usage_seconds_total{namespace!="",pod!="",container!=""}'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: [job, instance, image, id, name, node]
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1000000000.0
+      histogram_bound_scale: 1.0
+    - query_id: service-allocated-cpu
+      component: allocated_cpu_cores
+      promql: 'container_spec_cpu_quota{namespace!="",pod!="",container!=""} / container_spec_cpu_period{namespace!="",pod!="",container!=""}'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: [job, instance, image, id, name, node]
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: service-cpu-throttled-periods
+      component: cpu_nr_throttled_total
+      promql: 'container_cpu_cfs_throttled_periods_total{namespace!="",pod!="",container!=""}'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: [job, instance, image, id, name, node]
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: service-cpu-periods
+      component: cpu_nr_periods_total
+      promql: 'container_cpu_cfs_periods_total{namespace!="",pod!="",container!=""}'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: [job, instance, image, id, name, node]
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: service-memory-working-set
+      component: memory_working_set_bytes
+      promql: 'container_memory_working_set_bytes{namespace!="",pod!="",container!=""}'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: [job, instance, image, id, name, node]
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: service-memory-limit
+      component: memory_limit_bytes
+      promql: 'container_spec_memory_limit_bytes{namespace!="",pod!="",container!=""}'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: [job, instance, image, id, name, node]
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+
+    # Always-on eBPF/cgroup-map exporter primitives.
+    - query_id: service-io-psi
+      component: io_psi_some_ns_total
+      promql: 'proberca_cgroup_io_psi_some_nanoseconds_total'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: *service_optional
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: service-active-task-time
+      component: active_task_ns_total
+      promql: 'proberca_cgroup_active_task_nanoseconds_total'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: *service_optional
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: service-futex-wait
+      component: futex_wait_ns_total
+      promql: 'proberca_cgroup_futex_wait_nanoseconds_total'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: *service_optional
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: service-active-thread-time
+      component: active_thread_ns_total
+      promql: 'proberca_cgroup_active_thread_nanoseconds_total'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: *service_optional
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: service-socket-backlog-overflow
+      component: socket_backlog_overflow_total
+      promql: 'proberca_cgroup_socket_backlog_overflow_total'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: *service_optional
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: service-socket-accept-fail
+      component: socket_accept_fail_total
+      promql: 'proberca_cgroup_socket_accept_fail_total'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: *service_optional
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: service-socket-local-rst
+      component: socket_local_rst_total
+      promql: 'proberca_cgroup_socket_local_rst_total'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: *service_optional
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: service-socket-local-drop
+      component: socket_local_drop_total
+      promql: 'proberca_cgroup_socket_local_drop_total'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: *service_optional
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: service-socket-operations
+      component: socket_ops_total
+      promql: 'proberca_cgroup_socket_operations_total'
+      label_mapping: *service_labels
+      required_labels: *service_required
+      optional_labels: *service_optional
+      series_labels: *service_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+
+    # Host metrics.
+    - query_id: host-cpu-psi
+      component: node_cpu_psi_some_ns_total
+      promql: 'node_pressure_cpu_waiting_seconds_total'
+      label_mapping: &host_labels {node: node}
+      required_labels: &host_required [node]
+      optional_labels: &host_optional [job, instance]
+      series_labels: &host_series [node]
+      histogram_le_label: null
+      value_scale: 1000000000.0
+      histogram_bound_scale: 1.0
+    - query_id: host-memory-psi
+      component: node_memory_psi_some_ns_total
+      promql: 'node_pressure_memory_waiting_seconds_total'
+      label_mapping: *host_labels
+      required_labels: *host_required
+      optional_labels: *host_optional
+      series_labels: *host_series
+      histogram_le_label: null
+      value_scale: 1000000000.0
+      histogram_bound_scale: 1.0
+    - query_id: host-io-psi
+      component: node_io_psi_some_ns_total
+      promql: 'node_pressure_io_waiting_seconds_total'
+      label_mapping: *host_labels
+      required_labels: *host_required
+      optional_labels: *host_optional
+      series_labels: *host_series
+      histogram_le_label: null
+      value_scale: 1000000000.0
+      histogram_bound_scale: 1.0
+    - query_id: host-nic-rx-drop
+      component: node_nic_rx_drop_total
+      promql: 'node_network_receive_drop_total{device!="lo"}'
+      label_mapping: &nic_labels {node: node, interface: device}
+      required_labels: &nic_required [node, device]
+      optional_labels: *host_optional
+      series_labels: &nic_series [node, interface]
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: host-nic-tx-drop
+      component: node_nic_tx_drop_total
+      promql: 'node_network_transmit_drop_total{device!="lo"}'
+      label_mapping: *nic_labels
+      required_labels: *nic_required
+      optional_labels: *host_optional
+      series_labels: *nic_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: host-nic-rx-error
+      component: node_nic_rx_error_total
+      promql: 'node_network_receive_errs_total{device!="lo"}'
+      label_mapping: *nic_labels
+      required_labels: *nic_required
+      optional_labels: *host_optional
+      series_labels: *nic_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: host-nic-tx-error
+      component: node_nic_tx_error_total
+      promql: 'node_network_transmit_errs_total{device!="lo"}'
+      label_mapping: *nic_labels
+      required_labels: *nic_required
+      optional_labels: *host_optional
+      series_labels: *nic_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+
+    # TCP service-pair primitives.
+    - query_id: tcp-edge-request-total
+      component: edge_request_total
+      promql: 'proberca_tcp_edge_request_total'
+      label_mapping: &edge_labels
+        namespace: namespace
+        src_service: src_service
+        dst_namespace: dst_namespace
+        dst_service: dst_service
+        protocol: protocol
+        flow_id: flow_id
+        src_pod_uid: src_pod_uid
+        dst_pod_uid: dst_pod_uid
+        src_node: src_node
+        dst_node: dst_node
+      required_labels: &edge_required [namespace, src_service, dst_namespace, dst_service, protocol, flow_id]
+      optional_labels: &edge_optional [job, instance, src_pod_uid, dst_pod_uid, src_node, dst_node]
+      series_labels: &edge_series [namespace, src_service, dst_namespace, dst_service, protocol, flow_id]
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: tcp-edge-error-total
+      component: edge_error_total
+      promql: 'proberca_tcp_edge_error_total'
+      label_mapping: *edge_labels
+      required_labels: *edge_required
+      optional_labels: *edge_optional
+      series_labels: *edge_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: tcp-edge-timeout-total
+      component: edge_timeout_total
+      promql: 'proberca_tcp_edge_timeout_total'
+      label_mapping: *edge_labels
+      required_labels: *edge_required
+      optional_labels: *edge_optional
+      series_labels: *edge_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: tcp-edge-latency-histogram
+      component: edge_latency_histogram
+      promql: 'proberca_tcp_edge_latency_milliseconds_bucket'
+      label_mapping: &edge_histogram_labels
+        namespace: namespace
+        src_service: src_service
+        dst_namespace: dst_namespace
+        dst_service: dst_service
+        protocol: protocol
+        flow_id: flow_id
+        src_pod_uid: src_pod_uid
+        dst_pod_uid: dst_pod_uid
+        src_node: src_node
+        dst_node: dst_node
+        histogram_upper_bound: le
+      required_labels: &edge_histogram_required [namespace, src_service, dst_namespace, dst_service, protocol, flow_id, le]
+      optional_labels: *edge_optional
+      series_labels: *edge_series
+      histogram_le_label: le
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+
+    # DNS calling-service -> resolver-service primitives.
+    - query_id: dns-query-total
+      component: dns_query_total
+      promql: 'proberca_dns_edge_query_total'
+      label_mapping: *edge_labels
+      required_labels: *edge_required
+      optional_labels: *edge_optional
+      series_labels: *edge_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: dns-timeout-total
+      component: dns_timeout_total
+      promql: 'proberca_dns_edge_timeout_total'
+      label_mapping: *edge_labels
+      required_labels: *edge_required
+      optional_labels: *edge_optional
+      series_labels: *edge_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: dns-error-rcode-total
+      component: dns_error_rcode_total
+      promql: 'proberca_dns_edge_error_rcode_total'
+      label_mapping: *edge_labels
+      required_labels: *edge_required
+      optional_labels: *edge_optional
+      series_labels: *edge_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
+    - query_id: dns-latency-histogram
+      component: dns_latency_histogram
+      promql: 'proberca_dns_edge_latency_milliseconds_bucket'
+      label_mapping: *edge_histogram_labels
+      required_labels: *edge_histogram_required
+      optional_labels: *edge_optional
+      series_labels: *edge_series
+      histogram_le_label: le
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
