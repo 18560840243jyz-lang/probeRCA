@@ -12,6 +12,8 @@ Environment=PYTHONPATH=/home/jyz/probeRCA:/home/jyz/.local/lib/python3.10/site-p
 ExecStart=/usr/bin/python3 -m proberca.cli.export_final_primitives --config /home/jyz/probeRCA/configs/final_primitive_exporter.example.yaml
 Restart=on-failure
 RestartSec=2s
+Nice=-5
+CPUWeight=200
 NoNewPrivileges=false
 
 [Install]

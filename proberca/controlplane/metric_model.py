@@ -205,8 +205,10 @@ def fit_metric_propagation(
             reason = "no_allowed_features"
         elif valid_rows < minimum_rows:
             reason = "insufficient_valid_history"
-        elif effective_rank < feature_count:
-            reason = "rank_deficient"
+        # Raw rank remains an explicit diagnostic.  It is not a failure gate:
+        # the frozen Ridge term makes the Gram system identifiable even when
+        # a fault-free counter is constantly zero or healthy parents are
+        # collinear.  Stability is gated on the regularized system below.
         elif condition is None:
             reason = "non_finite_condition_number"
         elif condition > config.metric_max_condition_number:

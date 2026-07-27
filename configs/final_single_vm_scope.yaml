@@ -18,8 +18,11 @@ excluded:
   reason: no_valid_failure_or_latency_windows_in_30_window_load_smoke
 exclusion_policy: exclusions_are_fixed_before_fault_selection
 missing_value_policy: zero_coverage_remains_null_and_is_never_imputed
-load_profile: single-vm-healthy-v1
+load_profile: single-vm-healthy-v2
 load_manifest: deploy/final-dataplane/healthy-calibration-load.yaml
+primitive_exporter_schema: probeRCA-final-primitive-exporter-v3
+container_resource_source: direct_cgroup_v2
+beyla_retired_series_ttl: 30s
 scale_floor_provenance:
   source_dataset_id: 119b1c033b6b36488969b774f12a9c8660ab2ca4f66cfdf59e1b7429a692ec35
   source_measurement: artifacts/healthy-pilot-20260727T111900Z/step3-family-floor-candidates.json

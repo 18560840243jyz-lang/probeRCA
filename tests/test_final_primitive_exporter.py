@@ -73,8 +73,6 @@ def test_final_exporter_config_is_frozen_and_one_second():
     config = FinalPrimitiveExporterConfig.from_dict(payload)
     assert config.schema_version == FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION
     assert config.snapshot_period_sec == 1
-    assert config.kubelet_port == 10250
-    assert config.kubelet_ca_path.endswith("/kubelet.crt")
     assert "kube-system/kube-dns" in config.include_services
     assert len(config.include_services) == 12
     invalid = dict(payload)
@@ -273,6 +271,47 @@ def test_service_series_persist_only_for_the_active_container():
     assert exporter._persistent_service_samples(
         (), SimpleNamespace(containers=())
     ) == ()
+
+
+def test_service_series_ignore_retired_container_after_rollout():
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter._service_sample_high_water = {}
+    inventory = SimpleNamespace(containers=(
+        SimpleNamespace(
+            namespace="online-boutique",
+            pod="frontend-new",
+            container="frontend",
+        ),
+    ))
+    retired = PrometheusSample.create(
+        "proberca_service_request_total",
+        {
+            "namespace": "online-boutique",
+            "pod": "frontend-old",
+            "container": "frontend",
+            "source_series": "retired",
+        },
+        100,
+    )
+    active = PrometheusSample.create(
+        "proberca_service_request_total",
+        {
+            "namespace": "online-boutique",
+            "pod": "frontend-new",
+            "container": "frontend",
+            "source_series": "active",
+        },
+        10,
+    )
+
+    output = exporter._persistent_service_samples(
+        (retired, active), inventory
+    )
+
+    assert len(output) == 1
+    assert output[0].label_dict["pod"] == "frontend-new"
+    assert output[0].label_dict["source_coverage"] == "1"
+    assert set(exporter._service_sample_high_water) == {active.identity}
 
 
 def test_dynamic_service_series_merge_into_one_stable_counter():
@@ -483,19 +522,72 @@ def test_deployment_uses_pinned_beyla_without_unused_service_graph():
     assert "proberca-healthy-checkout-load" not in online_deployments
 
 
-def test_cadvisor_uses_pinned_direct_kubelet_transport():
+def test_container_resources_use_direct_cgroup_v2_primitives():
     source = Path(
         "proberca/dataplane/primitive_exporter.py"
     ).read_text(encoding="utf-8")
-    installer = Path(
-        "scripts/install_final_dataplane.py"
+    assert "self._active_cgroup_paths(inventory)" in source
+    assert '"usage_usec" not in cpu_stat' in source
+    assert '(path / "memory.current").read_text' in source
+    assert '"inactive_file" not in memory_stat' in source
+    assert "cAdvisor" not in source
+
+
+def test_exporter_service_has_deadline_priority():
+    service = Path(
+        "deploy/final-dataplane/proberca-final-primitive-exporter.service"
     ).read_text(encoding="utf-8")
-    assert "urllib3.HTTPSConnectionPool(" in source
-    assert "assert_hostname=node" in source
-    assert "cert_reqs=ssl.CERT_REQUIRED" in source
-    assert "connect_get_node_proxy_with_path" not in source
-    assert '"/var/lib/kubelet/pki/kubelet.crt"' in installer
-    assert '"-----BEGIN CERTIFICATE-----"' in installer
+    assert "Nice=-5" in service
+    assert "CPUWeight=200" in service
+
+
+def test_single_vm_scope_freezes_v2_collection_runtime():
+    scope = yaml.safe_load(Path(
+        "configs/final_single_vm_scope.yaml"
+    ).read_text(encoding="utf-8"))
+    assert scope["status"] == "frozen_before_healthy_pilot"
+    assert scope["load_profile"] == "single-vm-healthy-v2"
+    assert scope["primitive_exporter_schema"] == (
+        FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION
+    )
+    assert scope["container_resource_source"] == "direct_cgroup_v2"
+    assert scope["beyla_retired_series_ttl"] == "30s"
+
+
+def test_snapshot_loop_reports_source_failures():
+    source = Path(
+        "proberca/dataplane/primitive_exporter.py"
+    ).read_text(encoding="utf-8")
+    assert '"final primitive snapshot failed: "' in source
+    assert "file=sys.stderr" in source
+
+
+def test_active_cgroup_paths_resolve_exact_runtime_identities(tmp_path):
+    first_id = "a" * 64
+    second_id = "b" * 64
+    first_path = (
+        tmp_path / "pod-a" / f"cri-containerd-{first_id}.scope"
+    )
+    second_path = (
+        tmp_path / "pod-b" / f"cri-containerd-{second_id}.scope"
+    )
+    first_path.mkdir(parents=True)
+    second_path.mkdir(parents=True)
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter._node_cgroup_root = tmp_path
+    exporter._cgroup_path_cache = None
+    inventory = SimpleNamespace(containers=(
+        SimpleNamespace(container_id=first_id),
+        SimpleNamespace(container_id=second_id),
+    ))
+
+    resolved = exporter._active_cgroup_paths(inventory)
+
+    assert resolved == {
+        first_id: first_path,
+        second_id: second_path,
+    }
+    assert exporter._active_cgroup_paths(inventory) == resolved
 
 
 def test_coredns_cpu_accounting_profile_provides_throttle_denominator():
@@ -530,21 +622,98 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
     assert config_map["metadata"]["namespace"] == "online-boutique"
     assert deployment["metadata"]["annotations"][
         "proberca.io/load-profile"
-    ] == "single-vm-healthy-v1"
-    container = deployment["spec"]["template"]["spec"]["containers"][0]
-    assert "@sha256:" in container["image"]
+    ] == "single-vm-healthy-v2"
+    containers = {
+        item["name"]: item
+        for item in deployment["spec"]["template"]["spec"]["containers"]
+    }
+    assert set(containers) == {"checkout-load"}
+    assert all(
+        "@sha256:" in item["image"]
+        for item in containers.values()
+    )
+    checkout = containers["checkout-load"]
     environment = {
         item["name"]: item["value"]
-        for item in container["env"]
+        for item in checkout["env"]
     }
     assert environment == {
         "TARGET_URL": (
             "http://frontend"
         ),
-        "INTERVAL_SECONDS": "0.4",
+        "INTERVAL_PATTERN_SECONDS": "0.14,0.16,0.18,0.15,0.17",
+        "PHASE_SECONDS": "20",
     }
     driver = config_map["data"]["checkout_driver.py"]
     assert "/cart/checkout" in driver
+    assert "INTERVAL_PATTERN_SECONDS" in driver
     assert "tc " not in driver
     assert "iptables" not in driver
     assert "stress" not in driver
+    installer = Path(
+        "scripts/install_final_dataplane.py"
+    ).read_text(encoding="utf-8")
+    assert "deploy/final-dataplane/healthy-calibration-load.yaml" in installer
+    assert (
+        '"deployment/proberca-healthy-checkout-load"' in installer
+    )
+
+
+def test_healthy_probe_cadence_is_explicit_and_reproducible():
+    configuration = yaml.safe_load(Path(
+        "deploy/final-dataplane/healthy-probe-cadence.yaml"
+    ).read_text(encoding="utf-8"))
+    assert set(configuration) == {
+        "schema_version", "namespace", "readiness_period_seconds",
+        "probe_profiles", "deployments",
+    }
+    assert configuration["schema_version"] \
+        == "proberca-healthy-probe-cadence-v1"
+    assert configuration["namespace"] == "online-boutique"
+    assert configuration["readiness_period_seconds"] == 1
+    assert configuration["probe_profiles"] == {
+        "default": {
+            "liveness_initial_delay_seconds": 0,
+            "liveness_failure_threshold": 3,
+            "liveness_timeout_seconds": 1,
+            "readiness_initial_delay_seconds": 0,
+            "readiness_failure_threshold": 3,
+            "readiness_timeout_seconds": 1,
+        },
+        "python_grace": {
+            "liveness_initial_delay_seconds": 30,
+            "liveness_failure_threshold": 5,
+            "liveness_timeout_seconds": 2,
+            "readiness_initial_delay_seconds": 10,
+            "readiness_failure_threshold": 10,
+            "readiness_timeout_seconds": 2,
+        },
+    }
+    expected = {
+        "adservice": ("server", 15, "default"),
+        "cartservice": ("server", 10, "default"),
+        "checkoutservice": ("server", 10, "default"),
+        "currencyservice": ("server", 10, "default"),
+        "emailservice": ("server", 5, "python_grace"),
+        "frontend": ("server", 10, "default"),
+        "paymentservice": ("server", 10, "default"),
+        "productcatalogservice": ("server", 10, "default"),
+        "recommendationservice": ("server", 5, "default"),
+        "redis-cart": ("redis", 5, "default"),
+        "shippingservice": ("server", 10, "default"),
+    }
+    assert {
+        name: (
+            profile["container"],
+            profile["liveness_period_seconds"],
+            profile["probe_profile"],
+        )
+        for name, profile in configuration["deployments"].items()
+    } == expected
+    installer = Path(
+        "scripts/install_final_dataplane.py"
+    ).read_text(encoding="utf-8")
+    assert "_configure_healthy_probe_cadence(repository)" in installer
+    assert "deploy/final-dataplane/healthy-probe-cadence.yaml" in installer
+    assert '"livenessProbe"' in installer
+    assert '"readinessProbe"' in installer

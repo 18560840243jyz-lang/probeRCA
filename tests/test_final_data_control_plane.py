@@ -791,6 +791,67 @@ def test_metric_ridge_is_fitted_per_target_not_by_global_complete_rows():
     assert model.ready is False
 
 
+def test_metric_ridge_accepts_rank_deficient_healthy_design_when_regularized():
+    service = "cluster::ns::payment"
+    metric = MetricNode(
+        node_id=f"{service}::local_socket_failure_rate",
+        entity_id=service,
+        entity_type="service",
+        metric_name="local_socket_failure_rate",
+        role="service_localnet",
+        root_category="LocalNet",
+        root_eligible=True,
+    )
+    candidate = CandidateEntityGraph(
+        seed_services=(service,),
+        seed_edges=(),
+        services=(service,),
+        hosts=(),
+        edges=(),
+        strong_service_relations=(),
+        topology_snapshot_id="topology",
+    )
+    graph = AllowedServiceGraph(
+        services=(service,),
+        relations=(),
+        physical_edges=(),
+        placements=(),
+        snapshot_id="topology",
+    )
+    history = {
+        sequence: {metric.node_id: 0.0}
+        for sequence in range(1, 9)
+    }
+
+    model = fit_metric_propagation(
+        metrics={metric.node_id: metric},
+        healthy_history=history,
+        candidate=candidate,
+        service_graph=graph,
+        healthy_cutoff_ns=9 * _NS,
+        config=replace(
+            _config(),
+            metric_lags=(1, 2),
+            metric_min_training_rows=4,
+            metric_rows_per_feature=2.0,
+        ),
+    )
+
+    readiness = model.target_readiness[metric.node_id]
+    assert readiness.ready is True
+    assert readiness.allowed_feature_count == 2
+    assert readiness.valid_training_rows == 6
+    assert readiness.minimum_training_rows == 4
+    assert readiness.effective_rank == 0
+    assert readiness.raw_design_rank_ratio == 0.0
+    assert readiness.regularized_gram_condition_number == 1.0
+    assert readiness.not_ready_reason is None
+    assert all(
+        value == 0.0
+        for value in model.coefficients.values()
+    )
+
+
 def test_fully_missing_service_symptom_is_not_treated_as_healthy_zero():
     service = "cluster::ns::payment"
     graph = AllowedServiceGraph(
@@ -864,10 +925,10 @@ def test_calibration_and_healthy_validation_are_independent_and_frozen(
     run = control.run(archive)
     report = run.calibration_readiness
 
-    assert run.state_timeline[7]["state"] == "healthy_validating"
-    assert run.state_timeline[7]["baseline_frozen"] is True
-    assert run.state_timeline[8]["state"] == "ready"
-    assert run.state_timeline[8]["baseline_frozen"] is True
+    assert run.state_timeline[5]["state"] == "healthy_validating"
+    assert run.state_timeline[5]["baseline_frozen"] is True
+    assert run.state_timeline[6]["state"] == "ready"
+    assert run.state_timeline[6]["baseline_frozen"] is True
     assert set(map(len, control.baseline.snapshot().values())) == {8}
     assert report["ready"] is True
     assert report["healthy_validation_result"] == "passed"
@@ -908,7 +969,7 @@ def test_calibration_and_healthy_validation_are_independent_and_frozen(
 def test_sustained_alert_during_healthy_validation_blocks_ready(
     tmp_path,
 ):
-    config = replace(_config(), calibration_validation_windows=3)
+    config = replace(_config(), calibration_validation_windows=5)
     writer = CollectionArchiveWriter(
         tmp_path / "validation-false-alarm",
         dataset_id=fingerprint({"dataset": "validation-false-alarm"}),
@@ -928,7 +989,7 @@ def test_sustained_alert_during_healthy_validation_blocks_ready(
     assert report["state"] == "healthy_validating"
     assert report["healthy_validation_result"] == "failed"
     assert report["healthy_validation_alerts"]
-    assert set(map(len, control.baseline.snapshot().values())) == {8}
+    assert set(map(len, control.baseline.snapshot().values())) == {6}
 
 
 def test_fault_runner_requires_current_readiness_fingerprint_handshake(

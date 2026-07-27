@@ -12,8 +12,8 @@ import hashlib
 import json
 import math
 import re
-import ssl
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import requests
-import urllib3
 import yaml
 from kubernetes import client, config as kubernetes_config
 from kubernetes.utils.quantity import parse_quantity
@@ -38,7 +37,7 @@ from .raw import RawCollectionError
 
 
 FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION = (
-    "probeRCA-final-primitive-exporter-v2"
+    "probeRCA-final-primitive-exporter-v3"
 )
 DNS_BUCKETS_MS = (
     0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0,
@@ -61,11 +60,6 @@ _BEYLA_REQUEST_METRICS = frozenset({
     "http_server_request_duration_seconds_bucket",
     "rpc_server_duration_seconds_count",
     "rpc_server_duration_seconds_bucket",
-})
-_CADVISOR_METRICS = frozenset({
-    "container_cpu_usage_seconds_total",
-    "container_memory_working_set_bytes",
-    "container_spec_memory_limit_bytes",
 })
 _COREDNS_METRICS = frozenset({
     "coredns_dns_request_duration_seconds_count",
@@ -114,8 +108,6 @@ class FinalPrimitiveExporterConfig:
     namespaces: tuple[str, ...]
     include_services: tuple[str, ...]
     kind_node_container: str
-    kubelet_port: int
-    kubelet_ca_path: str
     beyla_port: int
     node_exporter_url: str
     bpf_loader_path: str
@@ -149,7 +141,7 @@ class FinalPrimitiveExporterConfig:
             )
         for name in (
             "cluster_id", "kubeconfig_path", "kubernetes_context",
-            "kind_node_container", "kubelet_ca_path", "node_exporter_url",
+            "kind_node_container", "node_exporter_url",
             "bpf_loader_path", "bpf_map_directory", "listen_host",
         ):
             _nonempty(name, getattr(self, name))
@@ -180,7 +172,6 @@ class FinalPrimitiveExporterConfig:
                 "included service references an unlisted namespace"
             )
         for name, minimum, maximum in (
-            ("kubelet_port", 1, 65535),
             ("beyla_port", 1, 65535),
             ("listen_port", 1, 65535),
             ("dns_timeout_ms", 100, 60000),
@@ -292,6 +283,27 @@ def _sample_index(
     }
 
 
+def _histogram_index(
+    sample_index: dict[str, tuple[PrometheusSample, ...]],
+    bucket_names: Iterable[str],
+) -> dict[
+    tuple[str, tuple[tuple[str, str], ...]],
+    tuple[PrometheusSample, ...],
+]:
+    output: dict[
+        tuple[str, tuple[tuple[str, str], ...]],
+        list[PrometheusSample],
+    ] = {}
+    for bucket_name in bucket_names:
+        for sample in sample_index.get(bucket_name, ()):
+            output.setdefault(
+                (bucket_name, _labels_without(sample, "le")), []
+            ).append(sample)
+    return {
+        key: tuple(values) for key, values in output.items()
+    }
+
+
 def _request_classification(
     protocol: str, labels: dict[str, str],
 ) -> tuple[bool, bool]:
@@ -335,15 +347,14 @@ def _business_route(protocol: str, labels: dict[str, str]) -> bool:
 
 
 def _bucket_rows(
-    index: dict[str, tuple[PrometheusSample, ...]],
+    histogram_index: dict[
+        tuple[str, tuple[tuple[str, str], ...]],
+        tuple[PrometheusSample, ...],
+    ],
     count: PrometheusSample,
     bucket_name: str,
 ) -> tuple[PrometheusSample, ...]:
-    base = count.labels
-    output = tuple(
-        sample for sample in index.get(bucket_name, ())
-        if _labels_without(sample, "le") == base
-    )
+    output = histogram_index.get((bucket_name, count.labels), ())
     bounds = [item.label_dict.get("le") for item in output]
     if not output or len(bounds) != len(set(bounds)) or "+Inf" not in bounds:
         raise RawCollectionError(
@@ -413,9 +424,9 @@ class FinalPrimitiveExporter:
         self._qdisc_drop_state: dict[str, tuple[float, float]] = {}
         self._last_capacity_ns: int | None = None
         self._inventory_cache: Inventory | None = None
-        self._kubelet_pools: dict[
-            str, urllib3.HTTPSConnectionPool
-        ] = {}
+        self._cgroup_path_cache: tuple[
+            tuple[str, ...], dict[str, Path]
+        ] | None = None
         kubernetes_config.load_kube_config(
             config_file=self.config.kubeconfig_path,
             context=self.config.kubernetes_context,
@@ -606,7 +617,9 @@ class FinalPrimitiveExporter:
         metric_names: frozenset[str] | None = None,
     ) -> tuple[PrometheusSample, ...]:
         response = self.session.get(
-            url, timeout=float(self.config.source_timeout_sec)
+            url,
+            headers={"Accept-Encoding": "gzip"},
+            timeout=float(self.config.source_timeout_sec),
         )
         if response.status_code != HTTPStatus.OK:
             raise RawCollectionError(
@@ -616,57 +629,6 @@ class FinalPrimitiveExporter:
         if metric_names is not None:
             text = _select_metric_lines(text, metric_names)
         return parse_prometheus_text(text)
-
-    def _cadvisor(
-        self, node: str, address: str,
-    ) -> tuple[PrometheusSample, ...]:
-        pool = self._kubelet_pools.get(node)
-        if pool is None:
-            configuration = self.core.api_client.configuration
-            if not configuration.cert_file or not configuration.key_file:
-                raise RawCollectionError(
-                    "kubeconfig client certificate is unavailable"
-                )
-            if not Path(self.config.kubelet_ca_path).is_file():
-                raise RawCollectionError(
-                    "pinned kubelet CA chain is unavailable"
-                )
-            pool = urllib3.HTTPSConnectionPool(
-                address,
-                self.config.kubelet_port,
-                cert_file=configuration.cert_file,
-                key_file=configuration.key_file,
-                ca_certs=self.config.kubelet_ca_path,
-                cert_reqs=ssl.CERT_REQUIRED,
-                assert_hostname=node,
-                maxsize=1,
-            )
-            self._kubelet_pools[node] = pool
-        try:
-            response = pool.request(
-                "GET",
-                "/metrics/cadvisor",
-                timeout=urllib3.Timeout(
-                    total=float(self.config.source_timeout_sec)
-                ),
-                retries=False,
-            )
-        except urllib3.exceptions.HTTPError as error:
-            raise RawCollectionError(
-                "direct authenticated kubelet cAdvisor scrape failed"
-            ) from error
-        try:
-            if response.status != HTTPStatus.OK:
-                raise RawCollectionError(
-                    "kubelet cAdvisor returned HTTP "
-                    f"{response.status}"
-                )
-            text = response.data.decode("utf-8", errors="strict")
-        finally:
-            response.release_conn()
-        return parse_prometheus_text(
-            _select_metric_lines(text, _CADVISOR_METRICS)
-        )
 
     def _coredns(
         self, pod: ContainerIdentity,
@@ -697,11 +659,18 @@ class FinalPrimitiveExporter:
         ]
         for cgroup_id in selected_ids:
             command.extend(("--cgroup-id", str(cgroup_id)))
-        result = subprocess.run(
-            command,
-            check=True, capture_output=True, text=True,
-            timeout=float(self.config.source_timeout_sec),
-        )
+        try:
+            result = subprocess.run(
+                command,
+                check=True, capture_output=True, text=True,
+                timeout=float(self.config.source_timeout_sec),
+            )
+        except subprocess.CalledProcessError as error:
+            detail = (error.stderr or error.stdout or "").strip()
+            raise RawCollectionError(
+                "BPF snapshot command failed"
+                + (f": {detail}" if detail else "")
+            ) from error
         records = []
         for line in result.stdout.splitlines():
             if not line:
@@ -777,79 +746,64 @@ class FinalPrimitiveExporter:
         self._futex_wait_ns[key] = value
         return value
 
+    def _active_cgroup_paths(
+        self, inventory: Inventory,
+    ) -> dict[str, Path]:
+        active_ids = tuple(sorted({
+            item.container_id for item in inventory.containers
+        }))
+        cached = self._cgroup_path_cache
+        if (
+            cached is not None
+            and cached[0] == active_ids
+            and all(path.is_dir() for path in cached[1].values())
+        ):
+            return dict(cached[1])
+        active = set(active_ids)
+        resolved: dict[str, Path] = {}
+        try:
+            for path in self._node_cgroup_root.rglob(
+                "cri-containerd-*.scope"
+            ):
+                match = re.fullmatch(
+                    r"cri-containerd-([0-9a-f]{64})\.scope",
+                    path.name,
+                )
+                if match is None or match.group(1) not in active:
+                    continue
+                container_id = match.group(1)
+                if container_id in resolved:
+                    raise RawCollectionError(
+                        "container runtime identity maps to multiple cgroups"
+                    )
+                if not path.is_dir():
+                    raise RawCollectionError(
+                        "active container cgroup path is unavailable"
+                    )
+                resolved[container_id] = path
+        except OSError as error:
+            raise RawCollectionError(
+                "cannot enumerate active container cgroups"
+            ) from error
+        if set(resolved) != active:
+            missing = sorted(active - set(resolved))
+            raise RawCollectionError(
+                f"active container cgroups are incomplete: {missing}"
+            )
+        self._cgroup_path_cache = (active_ids, dict(resolved))
+        return resolved
+
     def _resource_samples(
         self,
         inventory: Inventory,
-        cadvisor: tuple[PrometheusSample, ...],
+        cgroup_paths: dict[str, Path],
         bpf: tuple[dict[str, Any], ...],
         timestamp_ns: int,
     ) -> tuple[PrometheusSample, ...]:
-        index = _sample_index(cadvisor)
-        coordinates = inventory.container_by_coordinates
-        allowed = set(coordinates)
-        selected: dict[
-            tuple[str, str, str, str], PrometheusSample
-        ] = {}
-        cgroup_paths: dict[str, Path] = {}
         cgroup_ids: dict[int, ContainerIdentity] = {}
-        for name in (
-            "container_cpu_usage_seconds_total",
-            "container_memory_working_set_bytes",
-            "container_spec_memory_limit_bytes",
-        ):
-            for sample in index.get(name, ()):
-                labels = sample.label_dict
-                key = (
-                    labels.get("namespace", ""),
-                    labels.get("pod", ""),
-                    labels.get("container", ""),
-                )
-                if key not in allowed:
-                    continue
-                identity = coordinates[key]
-                cadvisor_id = labels.get("id", "")
-                if not cadvisor_id.startswith("/"):
-                    raise RawCollectionError(
-                        "cAdvisor container lacks a cgroup path"
-                    )
-                path = self._node_cgroup_root / cadvisor_id.lstrip("/")
-                if not path.is_dir():
-                    raise RawCollectionError(
-                        "container cgroup path is unavailable"
-                    )
-                previous = cgroup_paths.setdefault(
-                    identity.container_id, path
-                )
-                if previous != path:
-                    raise RawCollectionError(
-                        "container resolves to multiple cgroup paths"
-                    )
-                source_key = (
-                    name, identity.namespace, identity.pod, identity.container,
-                )
-                if source_key in selected:
-                    raise RawCollectionError(
-                        "cAdvisor returns duplicate container primitives"
-                    )
-                selected[source_key] = sample
         output = []
         for identity in inventory.containers:
             labels = self._resource_labels(identity)
-
-            def value(name: str) -> float:
-                key = (
-                    name, identity.namespace,
-                    identity.pod, identity.container,
-                )
-                if key not in selected:
-                    raise RawCollectionError(
-                        f"cAdvisor lacks {name} for a monitored container"
-                    )
-                return selected[key].value
-
-            cpu_seconds = value("container_cpu_usage_seconds_total")
-            working_set = value("container_memory_working_set_bytes")
-            memory_limit = value("container_spec_memory_limit_bytes")
             path = cgroup_paths.get(identity.container_id)
             if path is None:
                 raise RawCollectionError(
@@ -862,9 +816,18 @@ class FinalPrimitiveExporter:
                 cpu_max_fields = (path / "cpu.max").read_text(
                     encoding="utf-8"
                 ).split()
+                memory_current_text = (path / "memory.current").read_text(
+                    encoding="utf-8"
+                ).strip()
+                memory_max_text = (path / "memory.max").read_text(
+                    encoding="utf-8"
+                ).strip()
+                memory_stat_lines = (path / "memory.stat").read_text(
+                    encoding="utf-8"
+                ).splitlines()
             except OSError as error:
                 raise RawCollectionError(
-                    "cannot read monitored cgroup CPU primitives"
+                    "cannot read monitored cgroup resource primitives"
                 ) from error
             cpu_stat: dict[str, int] = {}
             for line in cpu_stat_lines:
@@ -876,16 +839,36 @@ class FinalPrimitiveExporter:
                 ):
                     raise RawCollectionError("cgroup cpu.stat is invalid")
                 cpu_stat[fields[0]] = int(fields[1])
+            memory_stat: dict[str, int] = {}
+            for line in memory_stat_lines:
+                fields = line.split()
+                if (
+                    len(fields) != 2
+                    or fields[0] in memory_stat
+                    or not fields[1].isdigit()
+                ):
+                    raise RawCollectionError("cgroup memory.stat is invalid")
+                memory_stat[fields[0]] = int(fields[1])
             if (
-                "nr_throttled" not in cpu_stat
+                "usage_usec" not in cpu_stat
+                or "nr_throttled" not in cpu_stat
                 or "nr_periods" not in cpu_stat
                 or len(cpu_max_fields) != 2
                 or not cpu_max_fields[1].isdigit()
                 or int(cpu_max_fields[1]) <= 0
+                or not memory_current_text.isdigit()
+                or not memory_max_text.isdigit()
+                or "inactive_file" not in memory_stat
             ):
                 raise RawCollectionError(
-                    "cgroup CPU allocation primitives are incomplete"
+                    "cgroup resource primitives are incomplete"
                 )
+            cpu_time_ns = float(cpu_stat["usage_usec"] * 1000)
+            memory_current = int(memory_current_text)
+            working_set = float(max(
+                0, memory_current - memory_stat["inactive_file"]
+            ))
+            memory_limit = float(int(memory_max_text))
             if cpu_max_fields[0] == "max":
                 allocated_cpu = identity.cpu_request_cores
             elif cpu_max_fields[0].isdigit():
@@ -902,7 +885,7 @@ class FinalPrimitiveExporter:
                 )
             for metric_name, metric_value in (
                 ("proberca_container_cpu_time_nanoseconds_total",
-                 cpu_seconds * 1_000_000_000.0),
+                 cpu_time_ns),
                 ("proberca_container_allocated_cpu_cores", allocated_cpu),
                 ("proberca_container_cpu_throttled_periods_total", throttled),
                 ("proberca_container_cpu_periods_total", periods),
@@ -1030,6 +1013,9 @@ class FinalPrimitiveExporter:
                 "db_client_operation_duration_seconds_bucket",
             ),
         )
+        histogram_index = _histogram_index(
+            index, (item[2] for item in definitions)
+        )
         candidates: list[_RequestRow] = []
         for protocol, count_name, bucket_name in definitions:
             for count in index.get(count_name, ()):
@@ -1066,7 +1052,7 @@ class FinalPrimitiveExporter:
                     ):
                         continue
                 buckets = _bucket_rows(
-                    index, count, bucket_name
+                    histogram_index, count, bucket_name
                 )
                 candidates.append(_RequestRow(
                     protocol, count, buckets, namespace, service,
@@ -1210,7 +1196,7 @@ class FinalPrimitiveExporter:
             )
             if coordinates not in active:
                 del self._service_sample_high_water[key]
-        present = {sample.identity for sample in samples}
+        present: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
         for sample in samples:
             if not sample.name.startswith("proberca_service_"):
                 raise RawCollectionError(
@@ -1223,9 +1209,12 @@ class FinalPrimitiveExporter:
                 labels.get("container"),
             )
             if coordinates not in active:
-                raise RawCollectionError(
-                    "service persistence received an inactive container"
-                )
+                # Beyla may retain a retired Pod/container time series for a
+                # short interval after a rollout.  The immutable inventory is
+                # the authority for this snapshot, so the retired series must
+                # neither fail the exporter nor enter the high-water cache.
+                continue
+            present.add(sample.identity)
             previous = self._service_sample_high_water.get(sample.identity)
             value = (
                 sample.value
@@ -1346,8 +1335,12 @@ class FinalPrimitiveExporter:
                     "CoreDNS request count cardinality is ambiguous"
                 )
             count = counts[0]
+            histogram_index = _histogram_index(
+                index,
+                ("coredns_dns_request_duration_seconds_bucket",),
+            )
             buckets = _bucket_rows(
-                index, count,
+                histogram_index, count,
                 "coredns_dns_request_duration_seconds_bucket",
             )
             common = self._resource_labels(pod)
@@ -1581,27 +1574,13 @@ class FinalPrimitiveExporter:
     def _cgroup_identity(
         self,
         inventory: Inventory,
-        cadvisor: tuple[PrometheusSample, ...],
+        cgroup_paths: dict[str, Path],
     ) -> dict[int, ContainerIdentity]:
-        coordinates = inventory.container_by_coordinates
         output = {}
-        for sample in cadvisor:
-            if sample.name != "container_cpu_usage_seconds_total":
-                continue
-            labels = sample.label_dict
-            key = (
-                labels.get("namespace", ""),
-                labels.get("pod", ""),
-                labels.get("container", ""),
-            )
-            identity = coordinates.get(key)
-            if identity is None:
-                continue
-            path = self._node_cgroup_root / labels.get("id", "").lstrip("/")
-            if not path.is_dir():
-                raise RawCollectionError(
-                    "DNS cgroup identity path is unavailable"
-                )
+        for identity in inventory.containers:
+            path = cgroup_paths.get(identity.container_id)
+            if path is None or not path.is_dir():
+                raise RawCollectionError("cgroup identity path is unavailable")
             cgroup_id = path.stat().st_ino
             previous = output.setdefault(cgroup_id, identity)
             if previous != identity:
@@ -1620,20 +1599,15 @@ class FinalPrimitiveExporter:
         if inventory is None:
             inventory = self._inventory()
             self._inventory_cache = inventory
+        cgroup_paths = self._active_cgroup_paths(inventory)
+        cgroup_identity = self._cgroup_identity(
+            inventory, cgroup_paths
+        )
         worker_count = (
-            4 + len(inventory.node_names)
-            + len(inventory.coredns_pods)
+            4 + len(inventory.coredns_pods)
         )
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             next_inventory_future = executor.submit(self._inventory)
-            cadvisor_futures = {
-                node: executor.submit(
-                    self._cadvisor,
-                    node,
-                    inventory.node_internal_ips[node],
-                )
-                for node in inventory.node_names
-            }
             coredns_futures = {
                 pod.container_id: executor.submit(self._coredns, pod)
                 for pod in inventory.coredns_pods
@@ -1642,12 +1616,6 @@ class FinalPrimitiveExporter:
             host_future = executor.submit(
                 self._fetch_url, self.config.node_exporter_url
             )
-            cadvisor = tuple(
-                sample
-                for node in inventory.node_names
-                for sample in cadvisor_futures[node].result()
-            )
-            cgroup_identity = self._cgroup_identity(inventory, cadvisor)
             bpf_future = executor.submit(
                 self._bpf_snapshot, cgroup_identity
             )
@@ -1710,7 +1678,7 @@ class FinalPrimitiveExporter:
             *edge_samples,
             *self._dns_samples(inventory, bpf, cgroup_identity),
             *self._resource_samples(
-                inventory, cadvisor, bpf, timestamp_ns
+                inventory, cgroup_paths, bpf, timestamp_ns
             ),
             *self._host_samples(inventory, host),
             PrometheusSample.create(
@@ -1758,7 +1726,13 @@ class FinalPrimitiveExporter:
                 return
             try:
                 self.snapshot_once(target)
-            except Exception:
+            except Exception as error:
+                print(
+                    "final primitive snapshot failed: "
+                    f"{type(error).__name__}: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 continue
 
     def _response(self) -> tuple[str, int, str]:

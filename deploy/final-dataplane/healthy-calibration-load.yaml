@@ -17,7 +17,11 @@ data:
 
 
     TARGET_URL = os.environ["TARGET_URL"].rstrip("/")
-    INTERVAL_SECONDS = float(os.environ["INTERVAL_SECONDS"])
+    INTERVAL_PATTERN_SECONDS = tuple(
+        float(item)
+        for item in os.environ["INTERVAL_PATTERN_SECONDS"].split(",")
+    )
+    PHASE_SECONDS = float(os.environ["PHASE_SECONDS"])
     PRODUCT_ID = "OLJCESPC7Z"
     CHECKOUT = {
         "email": "healthy-load@example.com",
@@ -33,12 +37,20 @@ data:
     }
 
 
-    if INTERVAL_SECONDS <= 0:
-        raise ValueError("INTERVAL_SECONDS must be positive")
+    if (
+        not INTERVAL_PATTERN_SECONDS
+        or any(item <= 0 for item in INTERVAL_PATTERN_SECONDS)
+        or PHASE_SECONDS <= 0
+    ):
+        raise ValueError("healthy load timing must be positive")
     session = requests.Session()
+    started = time.monotonic()
     deadline = time.monotonic()
     while True:
-        deadline += INTERVAL_SECONDS
+        phase = int(
+            (time.monotonic() - started) // PHASE_SECONDS
+        ) % len(INTERVAL_PATTERN_SECONDS)
+        deadline += INTERVAL_PATTERN_SECONDS[phase]
         try:
             response = session.post(
                 f"{TARGET_URL}/cart",
@@ -72,7 +84,7 @@ metadata:
     app.kubernetes.io/name: proberca-healthy-checkout-load
     app.kubernetes.io/part-of: proberca-final-dataplane
   annotations:
-    proberca.io/load-profile: single-vm-healthy-v1
+    proberca.io/load-profile: single-vm-healthy-v2
 spec:
   replicas: 1
   selector:
@@ -84,7 +96,7 @@ spec:
         app.kubernetes.io/name: proberca-healthy-checkout-load
         app.kubernetes.io/part-of: proberca-final-dataplane
       annotations:
-        proberca.io/load-profile: single-vm-healthy-v1
+        proberca.io/load-profile: single-vm-healthy-v2
     spec:
       containers:
         - name: checkout-load
@@ -96,8 +108,10 @@ spec:
           env:
             - name: TARGET_URL
               value: http://frontend
-            - name: INTERVAL_SECONDS
-              value: "0.4"
+            - name: INTERVAL_PATTERN_SECONDS
+              value: "0.14,0.16,0.18,0.15,0.17"
+            - name: PHASE_SECONDS
+              value: "20"
           resources:
             requests:
               cpu: 25m

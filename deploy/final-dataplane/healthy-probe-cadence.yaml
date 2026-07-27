@@ -1,0 +1,63 @@
+schema_version: proberca-healthy-probe-cadence-v1
+namespace: online-boutique
+readiness_period_seconds: 1
+probe_profiles:
+  default:
+    liveness_initial_delay_seconds: 0
+    liveness_failure_threshold: 3
+    liveness_timeout_seconds: 1
+    readiness_initial_delay_seconds: 0
+    readiness_failure_threshold: 3
+    readiness_timeout_seconds: 1
+  python_grace:
+    liveness_initial_delay_seconds: 30
+    liveness_failure_threshold: 5
+    liveness_timeout_seconds: 2
+    readiness_initial_delay_seconds: 10
+    readiness_failure_threshold: 10
+    readiness_timeout_seconds: 2
+deployments:
+  adservice:
+    container: server
+    liveness_period_seconds: 15
+    probe_profile: default
+  cartservice:
+    container: server
+    liveness_period_seconds: 10
+    probe_profile: default
+  checkoutservice:
+    container: server
+    liveness_period_seconds: 10
+    probe_profile: default
+  currencyservice:
+    container: server
+    liveness_period_seconds: 10
+    probe_profile: default
+  emailservice:
+    container: server
+    liveness_period_seconds: 5
+    probe_profile: python_grace
+  frontend:
+    container: server
+    liveness_period_seconds: 10
+    probe_profile: default
+  paymentservice:
+    container: server
+    liveness_period_seconds: 10
+    probe_profile: default
+  productcatalogservice:
+    container: server
+    liveness_period_seconds: 10
+    probe_profile: default
+  recommendationservice:
+    container: server
+    liveness_period_seconds: 5
+    probe_profile: default
+  redis-cart:
+    container: redis
+    liveness_period_seconds: 5
+    probe_profile: default
+  shippingservice:
+    container: server
+    liveness_period_seconds: 10
+    probe_profile: default

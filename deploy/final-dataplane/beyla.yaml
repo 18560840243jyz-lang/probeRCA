@@ -96,7 +96,7 @@ data:
     prometheus_export:
       port: 9400
       path: /metrics
-      ttl: 10m
+      ttl: 30s
       features:
         - application
       instrumentations: ["*"]

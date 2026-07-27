@@ -8,6 +8,7 @@ windows, run control-plane code, or inject faults.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -114,6 +115,176 @@ def _install_prometheus_job(repository: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _configure_healthy_probe_cadence(repository: Path) -> None:
+    path = (
+        repository
+        / "deploy/final-dataplane/healthy-probe-cadence.yaml"
+    )
+    configuration = _load_mapping(path)
+    if set(configuration) != {
+        "schema_version", "namespace", "readiness_period_seconds",
+        "probe_profiles", "deployments",
+    }:
+        raise SystemExit("healthy probe cadence fields are not frozen")
+    if configuration["schema_version"] \
+            != "proberca-healthy-probe-cadence-v1":
+        raise SystemExit("healthy probe cadence schema is unsupported")
+    namespace = configuration["namespace"]
+    readiness_period_seconds = configuration[
+        "readiness_period_seconds"
+    ]
+    probe_profiles = configuration["probe_profiles"]
+    deployments = configuration["deployments"]
+    probe_fields = {
+        "liveness_initial_delay_seconds",
+        "liveness_failure_threshold",
+        "liveness_timeout_seconds",
+        "readiness_initial_delay_seconds",
+        "readiness_failure_threshold",
+        "readiness_timeout_seconds",
+    }
+    if (
+        namespace != "online-boutique"
+        or readiness_period_seconds != 1
+        or not isinstance(probe_profiles, dict)
+        or not probe_profiles
+        or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(settings, dict)
+            or set(settings) != probe_fields
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in settings.values()
+            )
+            or settings["liveness_failure_threshold"] <= 0
+            or settings["liveness_timeout_seconds"] <= 0
+            or settings["readiness_failure_threshold"] <= 0
+            or settings["readiness_timeout_seconds"] <= 0
+            for name, settings in probe_profiles.items()
+        )
+        or not isinstance(deployments, dict)
+        or not deployments
+        or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(profile, dict)
+            or set(profile) != {
+                "container", "liveness_period_seconds", "probe_profile",
+            }
+            or not isinstance(profile["container"], str)
+            or not profile["container"]
+            or isinstance(profile["liveness_period_seconds"], bool)
+            or not isinstance(
+                profile["liveness_period_seconds"], int
+            )
+            or profile["liveness_period_seconds"] <= 1
+            or not isinstance(profile["probe_profile"], str)
+            or profile["probe_profile"] not in probe_profiles
+            for name, profile in deployments.items()
+        )
+    ):
+        raise SystemExit("healthy probe cadence configuration is invalid")
+    base = [
+        "kubectl",
+        "--kubeconfig", "/home/jyz/.kube/config",
+        "--context", "kind-proberca-ob",
+        "-n", namespace,
+    ]
+    for deployment, profile in sorted(deployments.items()):
+        container_name = profile["container"]
+        liveness_period_seconds = profile[
+            "liveness_period_seconds"
+        ]
+        probe_profile = profile["probe_profile"]
+        settings = probe_profiles[probe_profile]
+        result = _run(
+            [
+                *base,
+                "get", f"deployment/{deployment}",
+                "-o", "json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        current = json.loads(result.stdout)
+        containers = {
+            item["name"]: item
+            for item in current["spec"]["template"]["spec"]["containers"]
+        }
+        container = containers.get(container_name)
+        if container is None \
+                or "livenessProbe" not in container \
+                or "readinessProbe" not in container:
+            raise SystemExit(
+                f"{deployment}/{container_name} lacks frozen health probes"
+            )
+        patch = {
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            "proberca.io/healthy-probe-cadence": (
+                                f"liveness-{liveness_period_seconds}s_"
+                                f"readiness-{readiness_period_seconds}s_"
+                                f"profile-{probe_profile}"
+                            ),
+                        },
+                    },
+                    "spec": {
+                        "containers": [{
+                            "name": container_name,
+                            "livenessProbe": {
+                                "periodSeconds": (
+                                    liveness_period_seconds
+                                ),
+                                "initialDelaySeconds": settings[
+                                    "liveness_initial_delay_seconds"
+                                ],
+                                "failureThreshold": settings[
+                                    "liveness_failure_threshold"
+                                ],
+                                "timeoutSeconds": settings[
+                                    "liveness_timeout_seconds"
+                                ],
+                            },
+                            "readinessProbe": {
+                                "periodSeconds": (
+                                    readiness_period_seconds
+                                ),
+                                "initialDelaySeconds": settings[
+                                    "readiness_initial_delay_seconds"
+                                ],
+                                "failureThreshold": settings[
+                                    "readiness_failure_threshold"
+                                ],
+                                "timeoutSeconds": settings[
+                                    "readiness_timeout_seconds"
+                                ],
+                            },
+                        }],
+                    },
+                },
+            },
+        }
+        _run([
+            *base,
+            "patch", f"deployment/{deployment}",
+            "--type", "strategic",
+            "--patch", json.dumps(
+                patch, sort_keys=True, separators=(",", ":"),
+            ),
+        ])
+    for deployment in sorted(deployments):
+        _run([
+            *base,
+            "rollout", "status", f"deployment/{deployment}",
+            "--timeout=120s",
+        ])
+
+
 def install(repository: Path) -> None:
     _require_root()
     repository = repository.resolve()
@@ -131,39 +302,6 @@ def install(repository: Path) -> None:
 
     install_directory = Path("/usr/local/lib/proberca-final")
     install_directory.mkdir(parents=True, exist_ok=True)
-    exporter_config = _load_mapping(
-        repository / "configs/final_primitive_exporter.example.yaml"
-    )
-    kubelet_ca_destination = Path(
-        exporter_config["kubelet_ca_path"]
-    )
-    if kubelet_ca_destination != install_directory / "kubelet.crt":
-        raise SystemExit(
-            "final kubelet CA path must remain inside the install directory"
-        )
-    with tempfile.TemporaryDirectory(
-        prefix="proberca-kubelet-ca-"
-    ) as directory:
-        kubelet_chain = Path(directory) / "kubelet.crt"
-        _run([
-            "docker", "cp",
-            (
-                f"{exporter_config['kind_node_container']}:"
-                "/var/lib/kubelet/pki/kubelet.crt"
-            ),
-            str(kubelet_chain),
-        ])
-        if (
-            kubelet_chain.read_text(encoding="ascii").count(
-                "-----BEGIN CERTIFICATE-----"
-            ) < 2
-        ):
-            raise SystemExit(
-                "kind kubelet certificate chain lacks its pinned CA"
-            )
-        _atomic_copy(
-            kubelet_chain, kubelet_ca_destination, 0o644
-        )
     _atomic_copy(
         build_directory / "proberca-final-ebpf-loader",
         install_directory / "proberca-final-ebpf-loader",
@@ -216,6 +354,26 @@ def install(repository: Path) -> None:
         "--context", "kind-proberca-ob",
         "-n", "kube-system",
         "rollout", "status", "deployment/coredns",
+        "--timeout=120s",
+    ])
+    _configure_healthy_probe_cadence(repository)
+    _run([
+        "kubectl",
+        "--kubeconfig", "/home/jyz/.kube/config",
+        "--context", "kind-proberca-ob",
+        "apply", "-f",
+        str(
+            repository
+            / "deploy/final-dataplane/healthy-calibration-load.yaml"
+        ),
+    ])
+    _run([
+        "kubectl",
+        "--kubeconfig", "/home/jyz/.kube/config",
+        "--context", "kind-proberca-ob",
+        "-n", "online-boutique",
+        "rollout", "status",
+        "deployment/proberca-healthy-checkout-load",
         "--timeout=120s",
     ])
     _run([
