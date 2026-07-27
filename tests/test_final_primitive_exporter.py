@@ -99,6 +99,50 @@ def test_final_bpf_normal_path_is_map_aggregated_and_window_safe():
     assert "FUTEX_SNAPSHOT_ATTEMPTS" in loader
     assert "entry->completed_before_ns + entry->active_ns" in loader
     assert "--snapshot" in loader
+    assert "--cgroup-id" in loader
+
+
+def test_bpf_snapshot_filters_to_sorted_active_cgroups(monkeypatch):
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.config = SimpleNamespace(
+        bpf_loader_path="/loader",
+        bpf_map_directory="/maps",
+        dns_timeout_ms=5_000,
+        source_timeout_sec=2,
+    )
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(
+            stdout=(
+                '{"record_type":"cgroup","cgroup_id":3}\n'
+                '{"record_type":"dns","cgroup_id":9}\n'
+            )
+        )
+
+    monkeypatch.setattr(
+        "proberca.dataplane.primitive_exporter.subprocess.run",
+        fake_run,
+    )
+    records = exporter._bpf_snapshot((9, 3, 9))
+    assert [item["record_type"] for item in records] == [
+        "cgroup", "dns",
+    ]
+    assert captured["command"] == [
+        "/loader", "--snapshot", "/maps", "--timeout-ms", "5000",
+        "--cgroup-id", "3", "--cgroup-id", "9",
+    ]
+    assert captured["kwargs"]["check"] is True
+
+
+def test_bpf_snapshot_rejects_empty_active_cgroup_set():
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    with pytest.raises(
+        RawCollectionError, match="active positive cgroup IDs",
+    ):
+        exporter._bpf_snapshot(())
 
 
 def test_futex_counter_is_monotonic_and_bounded_by_thread_capacity():
@@ -246,3 +290,31 @@ def test_deployment_uses_pinned_beyla_without_unused_service_graph():
     ).read_text(encoding="utf-8"))
     assert scrape["honor_timestamps"] is True
     assert scrape["scrape_interval"] == "250ms"
+
+
+def test_healthy_calibration_load_is_frozen_and_fault_free():
+    documents = tuple(yaml.safe_load_all(Path(
+        "deploy/final-dataplane/healthy-calibration-load.yaml"
+    ).read_text(encoding="utf-8")))
+    config_map, deployment = documents
+    assert config_map["metadata"]["namespace"] == "online-boutique"
+    assert deployment["metadata"]["annotations"][
+        "proberca.io/load-profile"
+    ] == "single-vm-healthy-v1"
+    container = deployment["spec"]["template"]["spec"]["containers"][0]
+    assert "@sha256:" in container["image"]
+    environment = {
+        item["name"]: item["value"]
+        for item in container["env"]
+    }
+    assert environment == {
+        "TARGET_URL": (
+            "http://frontend"
+        ),
+        "INTERVAL_SECONDS": "0.4",
+    }
+    driver = config_map["data"]["checkout_driver.py"]
+    assert "/cart/checkout" in driver
+    assert "tc " not in driver
+    assert "iptables" not in driver
+    assert "stress" not in driver

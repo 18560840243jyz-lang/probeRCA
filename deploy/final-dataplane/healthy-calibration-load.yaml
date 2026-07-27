@@ -1,0 +1,125 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: proberca-healthy-checkout-load
+  namespace: online-boutique
+  labels:
+    app.kubernetes.io/name: proberca-healthy-checkout-load
+    app.kubernetes.io/part-of: proberca-final-dataplane
+data:
+  checkout_driver.py: |
+    from __future__ import annotations
+
+    import os
+    import time
+
+    import requests
+
+
+    TARGET_URL = os.environ["TARGET_URL"].rstrip("/")
+    INTERVAL_SECONDS = float(os.environ["INTERVAL_SECONDS"])
+    PRODUCT_ID = "OLJCESPC7Z"
+    CHECKOUT = {
+        "email": "healthy-load@example.com",
+        "street_address": "1600 Amphitheatre Parkway",
+        "zip_code": "94043",
+        "city": "Mountain View",
+        "state": "CA",
+        "country": "United States",
+        "credit_card_number": "4111111111111111",
+        "credit_card_expiration_month": "12",
+        "credit_card_expiration_year": "2030",
+        "credit_card_cvv": "123",
+    }
+
+
+    if INTERVAL_SECONDS <= 0:
+        raise ValueError("INTERVAL_SECONDS must be positive")
+    session = requests.Session()
+    deadline = time.monotonic()
+    while True:
+        deadline += INTERVAL_SECONDS
+        try:
+            response = session.post(
+                f"{TARGET_URL}/cart",
+                data={"product_id": PRODUCT_ID, "quantity": "1"},
+                timeout=5,
+            )
+            response.raise_for_status()
+            response = session.post(
+                f"{TARGET_URL}/cart/checkout",
+                data=CHECKOUT,
+                timeout=10,
+            )
+            response.raise_for_status()
+        except Exception as error:
+            print(
+                f"healthy checkout failed: {type(error).__name__}: {error}",
+                flush=True,
+            )
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        else:
+            deadline = time.monotonic()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proberca-healthy-checkout-load
+  namespace: online-boutique
+  labels:
+    app.kubernetes.io/name: proberca-healthy-checkout-load
+    app.kubernetes.io/part-of: proberca-final-dataplane
+  annotations:
+    proberca.io/load-profile: single-vm-healthy-v1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: proberca-healthy-checkout-load
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: proberca-healthy-checkout-load
+        app.kubernetes.io/part-of: proberca-final-dataplane
+      annotations:
+        proberca.io/load-profile: single-vm-healthy-v1
+    spec:
+      containers:
+        - name: checkout-load
+          image: us-central1-docker.pkg.dev/google-samples/microservices-demo/loadgenerator@sha256:3e5cf93c21e6b7d1e8bb8713aa02c7912d4c9f90fd02d477b3d911bd02a292fb
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - /config/checkout_driver.py
+          env:
+            - name: TARGET_URL
+              value: http://frontend
+            - name: INTERVAL_SECONDS
+              value: "0.4"
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          volumeMounts:
+            - name: driver
+              mountPath: /config
+              readOnly: true
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      volumes:
+        - name: driver
+          configMap:
+            name: proberca-healthy-checkout-load

@@ -26,6 +26,7 @@
 #define DEFAULT_TIMEOUT_MS 5000
 #define FUTEX_SNAPSHOT_TABLE_SIZE (PROBERCA_FINAL_MAX_CGROUPS * 2)
 #define FUTEX_SNAPSHOT_ATTEMPTS 16
+#define MAX_CGROUP_FILTERS PROBERCA_FINAL_MAX_CGROUPS
 
 struct options {
     const char *object_path;
@@ -33,6 +34,8 @@ struct options {
     const char *pin_dir;
     const char *snapshot_dir;
     uint64_t timeout_ms;
+    uint64_t cgroup_ids[MAX_CGROUP_FILTERS];
+    size_t cgroup_count;
 };
 
 struct futex_snapshot_entry {
@@ -81,6 +84,7 @@ static int parse_options(
         OPT_PIN_DIR,
         OPT_SNAPSHOT,
         OPT_TIMEOUT_MS,
+        OPT_CGROUP_ID,
     };
     static const struct option long_options[] = {
         {"object", required_argument, NULL, OPT_OBJECT},
@@ -88,8 +92,10 @@ static int parse_options(
         {"pin-dir", required_argument, NULL, OPT_PIN_DIR},
         {"snapshot", required_argument, NULL, OPT_SNAPSHOT},
         {"timeout-ms", required_argument, NULL, OPT_TIMEOUT_MS},
+        {"cgroup-id", required_argument, NULL, OPT_CGROUP_ID},
         {NULL, 0, NULL, 0},
     };
+    size_t index;
     int option;
 
     memset(options, 0, sizeof(*options));
@@ -117,6 +123,20 @@ static int parse_options(
                 options->timeout_ms > 60000)
                 return -EINVAL;
             break;
+        case OPT_CGROUP_ID:
+            if (options->cgroup_count >= MAX_CGROUP_FILTERS ||
+                parse_u64(
+                    optarg,
+                    &options->cgroup_ids[options->cgroup_count]) != 0 ||
+                !options->cgroup_ids[options->cgroup_count])
+                return -EINVAL;
+            for (index = 0; index < options->cgroup_count; index++) {
+                if (options->cgroup_ids[index] ==
+                    options->cgroup_ids[options->cgroup_count])
+                    return -EINVAL;
+            }
+            options->cgroup_count++;
+            break;
         default:
             return -EINVAL;
         }
@@ -125,6 +145,8 @@ static int parse_options(
         return -EINVAL;
     if (options->snapshot_dir)
         return options->object_path ? -EINVAL : 0;
+    if (options->cgroup_count)
+        return -EINVAL;
     return options->object_path ? 0 : -EINVAL;
 }
 
@@ -320,6 +342,51 @@ static int sweep_dns_timeouts(
     }
 }
 
+struct cgroup_key_iterator {
+    uint64_t previous;
+    size_t filter_index;
+    bool have_previous;
+};
+
+static int next_cgroup_key(
+    int map_fd,
+    const struct options *options,
+    struct cgroup_key_iterator *iterator,
+    uint64_t *key)
+{
+    uint64_t next;
+
+    if (options->cgroup_count) {
+        if (iterator->filter_index >= options->cgroup_count)
+            return 0;
+        *key = options->cgroup_ids[iterator->filter_index++];
+        return 1;
+    }
+    if (bpf_map_get_next_key(
+            map_fd,
+            iterator->have_previous ? &iterator->previous : NULL,
+            &next) != 0)
+        return errno == ENOENT ? 0 : -errno;
+    iterator->previous = next;
+    iterator->have_previous = true;
+    *key = next;
+    return 1;
+}
+
+static bool cgroup_selected(
+    const struct options *options, uint64_t cgroup_id)
+{
+    size_t index;
+
+    if (!options->cgroup_count)
+        return true;
+    for (index = 0; index < options->cgroup_count; index++) {
+        if (options->cgroup_ids[index] == cgroup_id)
+            return true;
+    }
+    return false;
+}
+
 static struct futex_snapshot_entry *futex_snapshot_entry(
     struct futex_snapshot_entry *table, uint64_t cgroup_id, bool create)
 {
@@ -359,21 +426,23 @@ static void reset_unresolved_futex_entries(
 }
 
 static int prepare_futex_snapshot(
-    int map_fd, struct futex_snapshot_entry *table)
+    int map_fd,
+    const struct options *options,
+    struct futex_snapshot_entry *table)
 {
     struct proberca_final_cgroup_counters value;
     struct futex_snapshot_entry *entry;
+    struct cgroup_key_iterator iterator = {};
     uint64_t key;
-    uint64_t next;
-    bool have_key = false;
+    int iteration;
 
-    errno = 0;
-    while (bpf_map_get_next_key(
-               map_fd, have_key ? &key : NULL, &next) == 0) {
-        key = next;
-        have_key = true;
-        if (bpf_map_lookup_elem(map_fd, &key, &value) != 0)
+    while ((iteration = next_cgroup_key(
+                map_fd, options, &iterator, &key)) > 0) {
+        if (bpf_map_lookup_elem(map_fd, &key, &value) != 0) {
+            if (errno != ENOENT)
+                return -errno;
             continue;
+        }
         entry = futex_snapshot_entry(table, key, true);
         if (!entry)
             return -ENOSPC;
@@ -382,7 +451,7 @@ static int prepare_futex_snapshot(
         entry->completed_before_ns = value.futex_wait_ns_total;
         entry->prepared = true;
     }
-    return errno == ENOENT ? 0 : -errno;
+    return iteration;
 }
 
 static int collect_active_futex_waits(
@@ -417,21 +486,23 @@ static int collect_active_futex_waits(
 }
 
 static int resolve_stable_futex_entries(
-    int map_fd, struct futex_snapshot_entry *table)
+    int map_fd,
+    const struct options *options,
+    struct futex_snapshot_entry *table)
 {
     struct proberca_final_cgroup_counters value;
     struct futex_snapshot_entry *entry;
+    struct cgroup_key_iterator iterator = {};
     uint64_t key;
-    uint64_t next;
-    bool have_key = false;
+    int iteration;
 
-    errno = 0;
-    while (bpf_map_get_next_key(
-               map_fd, have_key ? &key : NULL, &next) == 0) {
-        key = next;
-        have_key = true;
-        if (bpf_map_lookup_elem(map_fd, &key, &value) != 0)
+    while ((iteration = next_cgroup_key(
+                map_fd, options, &iterator, &key)) > 0) {
+        if (bpf_map_lookup_elem(map_fd, &key, &value) != 0) {
+            if (errno != ENOENT)
+                return -errno;
             continue;
+        }
         entry = futex_snapshot_entry(table, key, false);
         if (!entry || !entry->prepared)
             continue;
@@ -444,39 +515,45 @@ static int resolve_stable_futex_entries(
             entry->completed_before_ns + entry->active_ns;
         entry->resolved = true;
     }
-    return errno == ENOENT ? 0 : -errno;
+    return iteration;
 }
 
 static bool all_futex_entries_resolved(
-    int map_fd, struct futex_snapshot_entry *table)
+    int map_fd,
+    const struct options *options,
+    struct futex_snapshot_entry *table)
 {
+    struct proberca_final_cgroup_counters value;
     struct futex_snapshot_entry *entry;
+    struct cgroup_key_iterator iterator = {};
     uint64_t key;
-    uint64_t next;
-    bool have_key = false;
+    int iteration;
 
-    errno = 0;
-    while (bpf_map_get_next_key(
-               map_fd, have_key ? &key : NULL, &next) == 0) {
-        key = next;
-        have_key = true;
+    while ((iteration = next_cgroup_key(
+                map_fd, options, &iterator, &key)) > 0) {
+        if (bpf_map_lookup_elem(map_fd, &key, &value) != 0) {
+            if (errno == ENOENT)
+                continue;
+            return false;
+        }
         entry = futex_snapshot_entry(table, key, false);
         if (!entry || !entry->resolved)
             return false;
     }
-    return errno == ENOENT;
+    return iteration == 0;
 }
 
-static int print_cgroups(int map_fd, int futex_fd)
+static int print_cgroups(
+    int map_fd, int futex_fd, const struct options *options)
 {
     struct futex_snapshot_entry *table;
     struct futex_snapshot_entry *entry;
     struct proberca_final_cgroup_counters value;
+    struct cgroup_key_iterator iterator = {};
     uint64_t now_ns;
     uint64_t key;
-    uint64_t next;
-    bool have_key = false;
     unsigned int attempt;
+    int iteration;
     int result = 0;
 
     table = calloc(FUTEX_SNAPSHOT_TABLE_SIZE, sizeof(*table));
@@ -484,7 +561,7 @@ static int print_cgroups(int map_fd, int futex_fd)
         return -ENOMEM;
     for (attempt = 0; attempt < FUTEX_SNAPSHOT_ATTEMPTS; attempt++) {
         reset_unresolved_futex_entries(table);
-        result = prepare_futex_snapshot(map_fd, table);
+        result = prepare_futex_snapshot(map_fd, options, table);
         if (result != 0)
             break;
         now_ns = monotonic_ns();
@@ -496,8 +573,9 @@ static int print_cgroups(int map_fd, int futex_fd)
             futex_fd, now_ns, table);
         if (result != 0)
             break;
-        result = resolve_stable_futex_entries(map_fd, table);
-        if (result != 0 || all_futex_entries_resolved(map_fd, table))
+        result = resolve_stable_futex_entries(map_fd, options, table);
+        if (result != 0 ||
+            all_futex_entries_resolved(map_fd, options, table))
             break;
     }
     if (result != 0) {
@@ -505,13 +583,15 @@ static int print_cgroups(int map_fd, int futex_fd)
         return result;
     }
 
-    errno = 0;
-    while (bpf_map_get_next_key(
-               map_fd, have_key ? &key : NULL, &next) == 0) {
-        key = next;
-        have_key = true;
-        if (bpf_map_lookup_elem(map_fd, &key, &value) != 0)
+    while ((iteration = next_cgroup_key(
+                map_fd, options, &iterator, &key)) > 0) {
+        if (bpf_map_lookup_elem(map_fd, &key, &value) != 0) {
+            if (errno != ENOENT) {
+                result = -errno;
+                break;
+            }
             continue;
+        }
         entry = futex_snapshot_entry(table, key, false);
         if (!entry) {
             result = -ENOSPC;
@@ -545,13 +625,14 @@ static int print_cgroups(int map_fd, int futex_fd)
             (unsigned long long)value.socket_local_drop_total,
             (unsigned long long)value.socket_ops_total);
     }
-    if (result == 0 && errno != ENOENT)
-        result = -errno;
+    if (result == 0 && iteration < 0)
+        result = iteration;
     free(table);
     return result;
 }
 
-static int print_dns(int counters_fd, int timeout_fd)
+static int print_dns(
+    int counters_fd, int timeout_fd, const struct options *options)
 {
     struct proberca_final_dns_edge_counters value;
     struct proberca_final_dns_edge_key key;
@@ -565,6 +646,8 @@ static int print_dns(int counters_fd, int timeout_fd)
                counters_fd, have_key ? &key : NULL, &next) == 0) {
         key = next;
         have_key = true;
+        if (!cgroup_selected(options, key.cgroup_id))
+            continue;
         if (bpf_map_lookup_elem(counters_fd, &key, &value) != 0)
             continue;
         timeout_total = 0;
@@ -623,8 +706,8 @@ static int run_snapshot(const struct options *options)
         fprintf(stderr, "cannot sweep DNS timeout map\n");
         goto cleanup;
     }
-    if (print_cgroups(cgroups_fd, futex_fd) != 0 ||
-        print_dns(dns_fd, timeout_fd) != 0) {
+    if (print_cgroups(cgroups_fd, futex_fd, options) != 0 ||
+        print_dns(dns_fd, timeout_fd, options) != 0) {
         fprintf(stderr, "cannot read final BPF maps\n");
         goto cleanup;
     }
@@ -652,7 +735,8 @@ int main(int argc, char **argv)
         fprintf(
             stderr,
             "usage: %s (--object FILE [--cgroup PATH] [--pin-dir DIR] | "
-            "--snapshot DIR [--timeout-ms N])\n",
+            "--snapshot DIR [--timeout-ms N] "
+            "[--cgroup-id ID ...])\n",
             argv[0]);
         return 2;
     }

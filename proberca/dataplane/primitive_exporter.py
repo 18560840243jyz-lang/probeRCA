@@ -627,13 +627,26 @@ class FinalPrimitiveExporter:
             _select_metric_lines(text, _COREDNS_METRICS)
         )
 
-    def _bpf_snapshot(self) -> tuple[dict[str, Any], ...]:
+    def _bpf_snapshot(
+        self, cgroup_ids: Iterable[int],
+    ) -> tuple[dict[str, Any], ...]:
+        selected_ids = tuple(sorted(set(cgroup_ids)))
+        if not selected_ids or any(
+            isinstance(item, bool) or not isinstance(item, int) or item <= 0
+            for item in selected_ids
+        ):
+            raise RawCollectionError(
+                "BPF snapshot requires active positive cgroup IDs"
+            )
+        command = [
+            self.config.bpf_loader_path,
+            "--snapshot", self.config.bpf_map_directory,
+            "--timeout-ms", str(self.config.dns_timeout_ms),
+        ]
+        for cgroup_id in selected_ids:
+            command.extend(("--cgroup-id", str(cgroup_id)))
         result = subprocess.run(
-            [
-                self.config.bpf_loader_path,
-                "--snapshot", self.config.bpf_map_directory,
-                "--timeout-ms", str(self.config.dns_timeout_ms),
-            ],
+            command,
             check=True, capture_output=True, text=True,
             timeout=float(self.config.source_timeout_sec),
         )
@@ -1482,7 +1495,6 @@ class FinalPrimitiveExporter:
                 pod.container_id: executor.submit(self._coredns, pod)
                 for pod in inventory.coredns_pods
             }
-            bpf_future = executor.submit(self._bpf_snapshot)
             beyla_future = executor.submit(self._beyla, inventory)
             host_future = executor.submit(
                 self._fetch_url, self.config.node_exporter_url
@@ -1491,6 +1503,10 @@ class FinalPrimitiveExporter:
                 sample
                 for node in inventory.node_names
                 for sample in cadvisor_futures[node].result()
+            )
+            cgroup_identity = self._cgroup_identity(inventory, cadvisor)
+            bpf_future = executor.submit(
+                self._bpf_snapshot, cgroup_identity
             )
             coredns = {
                 container_id: future.result()
@@ -1534,7 +1550,6 @@ class FinalPrimitiveExporter:
             raise RawCollectionError(
                 f"Beyla/CoreDNS request coverage is incomplete: {missing}"
             )
-        cgroup_identity = self._cgroup_identity(inventory, cadvisor)
         samples = [
             *service_samples,
             *edge_samples,
