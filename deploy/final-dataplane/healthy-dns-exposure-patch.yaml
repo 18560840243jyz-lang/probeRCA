@@ -32,12 +32,18 @@ spec:
                   raise ValueError("healthy DNS exposure configuration is invalid")
               deadline = time.monotonic()
               for index, name in enumerate(itertools.cycle(names)):
-                  socket.getaddrinfo(
-                      name,
-                      None,
-                      family=socket.AF_INET,
-                      type=socket.SOCK_STREAM,
-                  )
+                  try:
+                      socket.getaddrinfo(
+                          name,
+                          None,
+                          family=socket.AF_INET,
+                          type=socket.SOCK_STREAM,
+                      )
+                  except socket.gaierror as error:
+                      print(
+                          f"healthy DNS lookup failed for {name}: {error}",
+                          flush=True,
+                      )
                   deadline += intervals[index % len(intervals)]
                   remaining = deadline - time.monotonic()
                   if remaining > 0:

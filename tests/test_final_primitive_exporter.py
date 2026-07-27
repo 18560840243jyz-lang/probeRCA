@@ -743,6 +743,8 @@ def test_healthy_dns_exposure_is_success_only_and_reproducible():
     assert "@sha256:" in exposure["image"]
     source = exposure["args"][0]
     assert "socket.getaddrinfo" in source
+    assert "except socket.gaierror as error" in source
+    assert "healthy DNS lookup failed" in source
     assert "AF_INET" in source
     assert all(
         forbidden not in source
