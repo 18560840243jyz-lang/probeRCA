@@ -84,9 +84,9 @@ metadata:
     app.kubernetes.io/name: proberca-healthy-checkout-load
     app.kubernetes.io/part-of: proberca-final-dataplane
   annotations:
-    proberca.io/load-profile: single-vm-healthy-v3
+    proberca.io/load-profile: single-vm-healthy-v4
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       app.kubernetes.io/name: proberca-healthy-checkout-load
@@ -96,7 +96,7 @@ spec:
         app.kubernetes.io/name: proberca-healthy-checkout-load
         app.kubernetes.io/part-of: proberca-final-dataplane
       annotations:
-        proberca.io/load-profile: single-vm-healthy-v3
+        proberca.io/load-profile: single-vm-healthy-v4
     spec:
       containers:
         - name: checkout-load

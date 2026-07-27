@@ -546,7 +546,8 @@ def test_single_vm_scope_freezes_v2_collection_runtime():
         "configs/final_single_vm_scope.yaml"
     ).read_text(encoding="utf-8"))
     assert scope["status"] == "frozen_before_healthy_pilot"
-    assert scope["load_profile"] == "single-vm-healthy-v3"
+    assert scope["load_profile"] == "single-vm-healthy-v4"
+    assert scope["checkout_load_replicas"] == 3
     assert scope["checkout_interval_pattern_seconds"] == [
         0.07, 0.08, 0.09, 0.075, 0.085,
     ]
@@ -625,7 +626,8 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
     assert config_map["metadata"]["namespace"] == "online-boutique"
     assert deployment["metadata"]["annotations"][
         "proberca.io/load-profile"
-    ] == "single-vm-healthy-v3"
+    ] == "single-vm-healthy-v4"
+    assert deployment["spec"]["replicas"] == 3
     containers = {
         item["name"]: item
         for item in deployment["spec"]["template"]["spec"]["containers"]
