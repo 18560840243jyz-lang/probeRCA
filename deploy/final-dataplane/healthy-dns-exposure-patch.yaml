@@ -53,12 +53,12 @@ spec:
           env:
             - name: DNS_NAMES
               value: >-
-                cartservice.online-boutique.svc.cluster.local,
-                checkoutservice.online-boutique.svc.cluster.local,
-                currencyservice.online-boutique.svc.cluster.local,
-                paymentservice.online-boutique.svc.cluster.local,
-                productcatalogservice.online-boutique.svc.cluster.local,
-                shippingservice.online-boutique.svc.cluster.local
+                cartservice.online-boutique.svc.cluster.local.,
+                checkoutservice.online-boutique.svc.cluster.local.,
+                currencyservice.online-boutique.svc.cluster.local.,
+                paymentservice.online-boutique.svc.cluster.local.,
+                productcatalogservice.online-boutique.svc.cluster.local.,
+                shippingservice.online-boutique.svc.cluster.local.
             - name: INTERVAL_PATTERN_SECONDS
               value: "0.07,0.08,0.09,0.075,0.085"
           resources:

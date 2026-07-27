@@ -761,12 +761,12 @@ def test_healthy_dns_exposure_is_success_only_and_reproducible():
         item.strip()
         for item in environment["DNS_NAMES"].split(",")
     } == {
-        "cartservice.online-boutique.svc.cluster.local",
-        "checkoutservice.online-boutique.svc.cluster.local",
-        "currencyservice.online-boutique.svc.cluster.local",
-        "paymentservice.online-boutique.svc.cluster.local",
-        "productcatalogservice.online-boutique.svc.cluster.local",
-        "shippingservice.online-boutique.svc.cluster.local",
+        "cartservice.online-boutique.svc.cluster.local.",
+        "checkoutservice.online-boutique.svc.cluster.local.",
+        "currencyservice.online-boutique.svc.cluster.local.",
+        "paymentservice.online-boutique.svc.cluster.local.",
+        "productcatalogservice.online-boutique.svc.cluster.local.",
+        "shippingservice.online-boutique.svc.cluster.local.",
     }
     installer = Path(
         "scripts/install_final_dataplane.py"
