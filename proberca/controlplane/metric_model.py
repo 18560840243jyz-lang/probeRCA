@@ -181,18 +181,23 @@ def fit_metric_propagation(
             ))
             if matrix.size else 0
         )
+        raw_design_rank_ratio = (
+            float(effective_rank / feature_count)
+            if feature_count else 0.0
+        )
         gram = (
             matrix.T @ matrix
             + config.metric_ridge * np.eye(matrix.shape[1])
             if matrix.size else None
         )
-        raw_condition = (
-            float(np.linalg.cond(matrix))
-            if matrix.size else None
+        regularized_condition = (
+            float(np.linalg.cond(gram))
+            if gram is not None else None
         )
         condition = (
-            raw_condition
-            if raw_condition is None or math.isfinite(raw_condition)
+            regularized_condition
+            if regularized_condition is None
+            or math.isfinite(regularized_condition)
             else None
         )
         reason = None
@@ -214,7 +219,9 @@ def fit_metric_propagation(
                 valid_training_rows=valid_rows,
                 minimum_training_rows=minimum_rows,
                 effective_rank=effective_rank,
+                raw_design_rank_ratio=raw_design_rank_ratio,
                 condition_number=condition,
+                regularized_gram_condition_number=condition,
                 ready=False,
                 not_ready_reason=reason,
             )
@@ -230,7 +237,9 @@ def fit_metric_propagation(
                 valid_training_rows=valid_rows,
                 minimum_training_rows=minimum_rows,
                 effective_rank=effective_rank,
+                raw_design_rank_ratio=raw_design_rank_ratio,
                 condition_number=condition,
+                regularized_gram_condition_number=condition,
                 ready=False,
                 not_ready_reason="ridge_solve_failed",
             )
@@ -243,7 +252,9 @@ def fit_metric_propagation(
                 valid_training_rows=valid_rows,
                 minimum_training_rows=minimum_rows,
                 effective_rank=effective_rank,
+                raw_design_rank_ratio=raw_design_rank_ratio,
                 condition_number=condition,
+                regularized_gram_condition_number=condition,
                 ready=False,
                 not_ready_reason="non_finite_coefficients",
             )
@@ -257,7 +268,9 @@ def fit_metric_propagation(
             valid_training_rows=valid_rows,
             minimum_training_rows=minimum_rows,
             effective_rank=effective_rank,
+            raw_design_rank_ratio=raw_design_rank_ratio,
             condition_number=condition,
+            regularized_gram_condition_number=condition,
             ready=True,
             not_ready_reason=None,
         )

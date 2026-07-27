@@ -39,7 +39,9 @@ class MetricTargetReadiness:
     valid_training_rows: int
     minimum_training_rows: int
     effective_rank: int
+    raw_design_rank_ratio: float
     condition_number: float | None
+    regularized_gram_condition_number: float | None
     ready: bool
     not_ready_reason: str | None
 

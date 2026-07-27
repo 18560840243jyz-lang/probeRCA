@@ -295,7 +295,8 @@ class FinalControlConfig:
     metric_rows_per_feature: float = 2.0
     metric_rank_tolerance: float = 1.0e-10
     metric_max_condition_number: float = 1.0e8
-    calibration_validation_windows: int = 5
+    calibration_learning_windows: int = 600
+    calibration_validation_windows: int = 300
     calibration_required_entity_types: tuple[str, ...] = (
         "edge", "host", "service",
     )
@@ -326,7 +327,8 @@ class FinalControlConfig:
         for name in (
             "window_sec", "baseline_min_windows", "metric_min_training_rows",
             "latency_min_samples", "failure_min_requests",
-            "service_min_training_updates", "calibration_validation_windows",
+            "service_min_training_updates", "calibration_learning_windows",
+            "calibration_validation_windows",
             "soft_consecutive_windows", "hard_consecutive_windows",
             "recovery_windows", "candidate_hops", "burst_window_count",
             "fista_max_iterations", "top_k",
@@ -489,6 +491,45 @@ class FinalControlConfig:
     @property
     def collection_contract_fingerprint(self) -> str:
         return fingerprint(self.collection_contract)
+
+    @property
+    def required_scope_fingerprint(self) -> str:
+        return fingerprint({
+            "entity_types": sorted(
+                self.calibration_required_entity_types
+            ),
+            "root_coordinates": sorted(
+                self.calibration_required_root_coordinates
+            ),
+        })
+
+    @property
+    def scale_config_fingerprint(self) -> str:
+        return fingerprint({
+            "numeric_epsilon": self.baseline_min_scale,
+            "family_floors": dict(sorted(
+                self.baseline_family_min_scales.items()
+            )),
+            "metric_families": [
+                {
+                    "record_type": item.record_type,
+                    "metric_name": item.metric_name,
+                    "entity_type": item.entity_type,
+                    "scopes": list(item.scopes),
+                    "protocols": list(item.protocols),
+                    "transform": item.transform,
+                    "scale_family": item.scale_family,
+                }
+                for item in sorted(
+                    self.metric_roles,
+                    key=lambda value: (
+                        value.record_type, value.metric_name,
+                        value.entity_type, value.scopes,
+                        value.protocols,
+                    ),
+                )
+            ],
+        })
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)

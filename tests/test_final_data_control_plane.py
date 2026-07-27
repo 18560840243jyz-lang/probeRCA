@@ -120,7 +120,8 @@ def _config() -> FinalControlConfig:
         service_lags=(1,),
         metric_lags=(1,),
         metric_min_training_rows=2,
-        metric_rows_per_feature=1.0,
+        metric_rows_per_feature=0.5,
+        calibration_learning_windows=6,
         calibration_validation_windows=1,
         calibration_required_root_coordinates=(
             _required_root_coordinates()
@@ -131,7 +132,7 @@ def _config() -> FinalControlConfig:
         hard_consecutive_windows=2,
         recovery_threshold=0.5,
         recovery_windows=2,
-        burst_window_count=2,
+        burst_window_count=1,
         l1_penalty=0.05,
         fista_tolerance=1.0e-9,
     )
@@ -184,14 +185,14 @@ def _values(sequence: int) -> dict[str, float]:
         "futex_wait_time_rate": 0.01 + 0.001 * variation,
         "local_socket_failure_rate": 0.01 + 0.001 * variation,
     }
-    if sequence == 9:
+    if sequence == 10:
         values.update({
             "request_latency_p95": 20.0,
             "request_failure_rate": 0.03,
             "cpu_usage_rate": 0.75,
             "cpu_throttle_ratio": 0.20,
         })
-    elif sequence >= 10:
+    elif sequence >= 11:
         values.update({
             "request_latency_p95": 30.0,
             "request_failure_rate": 0.04,
@@ -533,8 +534,21 @@ def test_checked_in_contract_and_plane_imports_are_separate():
         Path("configs/final_control.yaml").read_text(encoding="utf-8")
     )
     assert set(control_payload) == set(FinalControlConfig.__dataclass_fields__)
-    assert FinalControlConfig.from_dict(control_payload).to_dict() \
-        == FinalControlConfig().to_dict()
+    formal = FinalControlConfig.from_dict(control_payload)
+    assert formal.calibration_learning_windows == 600
+    assert formal.calibration_validation_windows == 300
+    assert len(formal.calibration_required_root_coordinates) == 108
+    assert all(
+        value is not None
+        for value in formal.baseline_family_min_scales.values()
+    )
+    scope = yaml.safe_load(Path(
+        "configs/final_single_vm_scope.yaml"
+    ).read_text(encoding="utf-8"))
+    assert scope["required_root_coordinate_count"] \
+        == len(formal.calibration_required_root_coordinates)
+    assert scope["exclusion_policy"] \
+        == "exclusions_are_fixed_before_fault_selection"
     for path in Path("proberca/dataplane").glob("*.py"):
         source = path.read_text(encoding="utf-8")
         assert "proberca.controlplane" not in source
@@ -837,6 +851,146 @@ def test_unfrozen_family_floors_keep_run_in_calibration(tmp_path):
         )
 
 
+def test_calibration_and_healthy_validation_are_independent_and_frozen(
+    tmp_path,
+):
+    archive = _healthy_archive_with_window_snapshots(
+        tmp_path / "independent-validation",
+        window_count=9,
+    )
+    control = FinalControlPlane(_config())
+
+    run = control.run(archive)
+    report = run.calibration_readiness
+
+    assert run.state_timeline[7]["state"] == "healthy_validating"
+    assert run.state_timeline[7]["baseline_frozen"] is True
+    assert run.state_timeline[8]["state"] == "ready"
+    assert run.state_timeline[8]["baseline_frozen"] is True
+    assert set(map(len, control.baseline.snapshot().values())) == {8}
+    assert report["ready"] is True
+    assert report["healthy_validation_result"] == "passed"
+    assert report["healthy_validation_windows"] == 1
+    assert report["healthy_validation_alerts"] == []
+    assert report["calibration_learning_complete"] is True
+    assert report["baseline_ready_count"] \
+        == report["baseline_required_count"]
+    assert report["As_ready_count"] == report["As_required_count"]
+    assert report["Av_ready_count"] == report["Av_required_count"]
+    for name in (
+        "collection_contract_fingerprint",
+        "scale_config_fingerprint",
+        "As_fingerprint",
+        "Av_fingerprint",
+        "required_scope_fingerprint",
+        "calibration_fingerprint",
+    ):
+        assert len(report[name]) == 64
+    baseline = next(iter(report["baseline_status"].values()))
+    assert baseline["calibration_fingerprint"] \
+        == report["calibration_fingerprint"]
+    scale = baseline["scale"]
+    assert {
+        "median", "mad", "iqr", "family_floor",
+        "final_scale", "scale_source",
+    } <= set(scale)
+    metric = next(iter(report["metric_model_status"].values()))
+    assert {
+        "target_coordinate", "feature_count",
+        "valid_training_rows", "effective_rank",
+        "raw_design_rank_ratio",
+        "regularized_gram_condition_number",
+        "ready", "not_ready_reason",
+    } <= set(metric)
+
+
+def test_sustained_alert_during_healthy_validation_blocks_ready(
+    tmp_path,
+):
+    config = replace(_config(), calibration_validation_windows=3)
+    writer = CollectionArchiveWriter(
+        tmp_path / "validation-false-alarm",
+        dataset_id=fingerprint({"dataset": "validation-false-alarm"}),
+        collection_contract=config.collection_contract,
+        source_description=config.collection_contract["source_description"],
+        collection_metadata=_collection_metadata(config),
+    )
+    for sequence in range(1, 13):
+        writer.append(_window(sequence))
+
+    control = FinalControlPlane(config)
+    run = control.run(writer.seal())
+    report = run.calibration_readiness
+
+    assert run.results == ()
+    assert report["ready"] is False
+    assert report["state"] == "healthy_validating"
+    assert report["healthy_validation_result"] == "failed"
+    assert report["healthy_validation_alerts"]
+    assert set(map(len, control.baseline.snapshot().values())) == {8}
+
+
+def test_fault_runner_requires_current_readiness_fingerprint_handshake(
+    tmp_path, monkeypatch,
+):
+    import scripts.run_final_fault_matrix as runner
+
+    payload = yaml.safe_load(
+        runner.CONTROL_CONFIG.read_text(encoding="utf-8")
+    )
+    config = FinalControlConfig.from_dict(payload)
+    snapshot = _topology()
+    graph = allowed_service_graph(snapshot)
+    readiness = {
+        "control_config_fingerprint": config.config_fingerprint,
+        "collection_contract_fingerprint": (
+            config.collection_contract_fingerprint
+        ),
+        "required_scope_fingerprint": (
+            config.required_scope_fingerprint
+        ),
+        "scale_config_fingerprint": (
+            config.scale_config_fingerprint
+        ),
+        "topology_fingerprint": graph.topology_fingerprint,
+        "runtime_identity_fingerprint": (
+            graph.runtime_identity_fingerprint
+        ),
+    }
+    archive = SimpleNamespace(
+        collection_contract_fingerprint=(
+            config.collection_contract_fingerprint
+        ),
+        dataset_id="preflight-dataset",
+        manifest_fingerprint="m" * 64,
+        iter_windows=lambda: iter((
+            SimpleNamespace(topology_events=(snapshot,)),
+        )),
+    )
+    monkeypatch.setattr(
+        runner, "run", lambda *_args, **_kwargs: SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        runner.CollectionArchive, "load", lambda _path: archive,
+    )
+
+    handshake = runner.assert_current_readiness_handshake(
+        readiness, tmp_path,
+    )
+    assert handshake["topology_fingerprint"] \
+        == graph.topology_fingerprint
+    assert handshake["runtime_identity_fingerprint"] \
+        == graph.runtime_identity_fingerprint
+
+    bad = dict(readiness)
+    bad["scale_config_fingerprint"] = "bad"
+    with pytest.raises(
+        runner.ExperimentError,
+        match="readiness/config fingerprint mismatch",
+    ):
+        runner.assert_current_readiness_handshake(bad, tmp_path)
+
+
 def test_call_identity_stays_directed_but_service_mask_is_bidirectional():
     topology = TopologySnapshot(
         schema_version="1.0",
@@ -988,8 +1142,8 @@ def test_unique_window_snapshots_keep_one_topology_epoch_and_full_history(
     assert control.service_rls.reset_count == 0
     assert control._metric_history_reset_count == 0
     assert control.service_rls.configuration_count == 1
-    assert set(map(len, control.baseline.snapshot().values())) == {120}
-    assert len(control._healthy_history) == 117
+    assert set(map(len, control.baseline.snapshot().values())) == {119}
+    assert len(control._healthy_history) == 116
 
 
 def test_real_semantic_topology_change_resets_once_at_window_61(tmp_path):
@@ -1014,7 +1168,7 @@ def test_real_semantic_topology_change_resets_once_at_window_61(tmp_path):
     assert control.service_rls.reset_count == 1
     assert control._metric_history_reset_count == 1
     assert control.service_rls.configuration_count == 2
-    assert set(map(len, control.baseline.snapshot().values())) == {60}
+    assert set(map(len, control.baseline.snapshot().values())) == {59}
     assert control._last_calibration_reset_reason \
         == "topology_fingerprint_changed"
 
@@ -1108,10 +1262,10 @@ def test_runtime_identity_change_recalibrates_without_new_topology_epoch(
 
 def test_soft_context_keeps_using_its_frozen_topology_version(tmp_path):
     config = _config()
-    old = _topology(snapshot_name="old-layout", valid_to_ns=9 * _NS)
+    old = _topology(snapshot_name="old-layout", valid_to_ns=10 * _NS)
     new = _topology(
         snapshot_name="new-layout",
-        valid_from_ns=9 * _NS,
+        valid_from_ns=10 * _NS,
         valid_to_ns=100 * _NS,
     )
     writer = CollectionArchiveWriter(
@@ -1124,7 +1278,7 @@ def test_soft_context_keeps_using_its_frozen_topology_version(tmp_path):
     for sequence in range(1, 13):
         if sequence == 1:
             window = _window(sequence, topology=old)
-        elif sequence == 10:
+        elif sequence == 11:
             window = CollectedWindow.create(
                 sequence=sequence,
                 window_start_ns=(sequence - 1) * _NS,
@@ -1140,7 +1294,7 @@ def test_soft_context_keeps_using_its_frozen_topology_version(tmp_path):
     run = FinalControlPlane(config).run(writer.seal())
     after_change = next(
         item for item in run.state_timeline
-        if item["timestamp_ns"] == 10 * _NS
+        if item["timestamp_ns"] == 11 * _NS
     )
     assert after_change["topology_snapshot_id"] == old.snapshot_id
     assert run.results[0].candidate_graph.topology_snapshot_id == old.snapshot_id

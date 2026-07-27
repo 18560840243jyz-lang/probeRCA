@@ -11,17 +11,22 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
+
+import yaml
 
 from proberca.dataplane.archive import CollectionArchive
 from proberca.dataplane.burst_archive import BurstArchive
 from proberca.dataplane.burst_collection import BURST_CHANNEL_MODES
 from proberca.controlplane import (
     CalibrationNotReadyError,
+    FinalControlConfig,
     load_ready_calibration_report,
 )
+from proberca.controlplane.service_model import allowed_service_graph
 
 
 REPOSITORY = Path(os.environ.get(
@@ -43,6 +48,7 @@ NAMESPACE = "online-boutique"
 NORMAL_CONFIG = REPOSITORY / "configs/final_live_collector.example.yaml"
 BURST_CONFIG = REPOSITORY / "configs/final_live_burst.example.yaml"
 CONTRACT = REPOSITORY / "configs/final_collection_contract.yaml"
+CONTROL_CONFIG = REPOSITORY / "configs/final_control.yaml"
 STATE_SERVICES = (
     "proberca-final-ebpf.service",
     "proberca-final-burst.service",
@@ -259,6 +265,101 @@ def wait_data_plane(root: Path, *, restart_on_failure: bool = True) -> None:
             log_event(root, "primitive_exporter_restarted")
         time.sleep(3)
     raise ExperimentError("data plane did not become ready")
+
+
+def assert_current_readiness_handshake(
+    readiness: dict[str, Any], root: Path,
+) -> dict[str, Any]:
+    payload = yaml.safe_load(CONTROL_CONFIG.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ExperimentError("final control config is not a mapping")
+    config = FinalControlConfig.from_dict(payload)
+    expected = {
+        "control_config_fingerprint": config.config_fingerprint,
+        "collection_contract_fingerprint": (
+            config.collection_contract_fingerprint
+        ),
+        "required_scope_fingerprint": (
+            config.required_scope_fingerprint
+        ),
+        "scale_config_fingerprint": (
+            config.scale_config_fingerprint
+        ),
+    }
+    mismatched = [
+        name for name, value in expected.items()
+        if readiness.get(name) != value
+    ]
+    if mismatched:
+        raise ExperimentError(
+            "fault injection refused: readiness/config fingerprint "
+            "mismatch: " + ",".join(mismatched)
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix=".readiness-preflight-", dir=root,
+    ) as temporary:
+        preflight = Path(temporary)
+        normal_root = preflight / "normal"
+        burst_root = preflight / "burst"
+        command = [
+            sys.executable, "-u", "-m", "proberca.cli.collect_final",
+            "--source-config", str(NORMAL_CONFIG),
+            "--collection-contract", str(CONTRACT),
+            "--burst-config", str(BURST_CONFIG),
+            "--output", str(normal_root),
+            "--burst-output", str(burst_root),
+            "--windows", "1",
+        ]
+        try:
+            run(
+                command,
+                timeout=WINDOW_WALL_BUDGET_SEC + 60,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) \
+                as exc:
+            raise ExperimentError(
+                "fault injection refused: readiness preflight "
+                "collection failed"
+            ) from exc
+        archive = CollectionArchive.load(normal_root)
+        windows = tuple(archive.iter_windows())
+        if len(windows) != 1 \
+                or len(windows[0].topology_events) != 1:
+            raise ExperimentError(
+                "fault injection refused: readiness preflight has "
+                "ambiguous topology"
+            )
+        graph = allowed_service_graph(
+            windows[0].topology_events[0]
+        )
+        live = {
+            "collection_contract_fingerprint": (
+                archive.collection_contract_fingerprint
+            ),
+            "topology_fingerprint": graph.topology_fingerprint,
+            "runtime_identity_fingerprint": (
+                graph.runtime_identity_fingerprint
+            ),
+        }
+        live_mismatch = [
+            name for name, value in live.items()
+            if readiness.get(name) != value
+        ]
+        if live_mismatch:
+            raise ExperimentError(
+                "fault injection refused: readiness/live fingerprint "
+                "mismatch: " + ",".join(live_mismatch)
+            )
+        return {
+            **expected,
+            **live,
+            "snapshot_id": graph.snapshot_id,
+            "preflight_dataset_id": archive.dataset_id,
+            "preflight_manifest_fingerprint": (
+                archive.manifest_fingerprint
+            ),
+        }
 
 
 def validate_archives(
@@ -856,9 +957,20 @@ def main() -> int:
     specs = experiment_specs()
     readiness_reference = {
         "report_fingerprint": readiness["report_fingerprint"],
-        "control_config_fingerprint": (
-            readiness["control_config_fingerprint"]
-        ),
+        **{
+            name: readiness[name]
+            for name in (
+                "control_config_fingerprint",
+                "collection_contract_fingerprint",
+                "required_scope_fingerprint",
+                "scale_config_fingerprint",
+                "As_fingerprint",
+                "Av_fingerprint",
+                "calibration_fingerprint",
+                "topology_fingerprint",
+                "runtime_identity_fingerprint",
+            )
+        },
         "topology_snapshot_id": readiness["topology_snapshot_id"],
     }
     manifest_path = root / "dataset-manifest.json"
@@ -917,6 +1029,17 @@ def main() -> int:
     atomic_json(root / "dataset-manifest.json", manifest)
     assert_no_stale_network_faults()
     wait_data_plane(root)
+    handshake = assert_current_readiness_handshake(readiness, root)
+    manifest["readiness_handshake"] = handshake
+    atomic_json(root / "dataset-manifest.json", manifest)
+    log_event(
+        root,
+        "readiness_handshake_passed",
+        topology_fingerprint=handshake["topology_fingerprint"],
+        runtime_identity_fingerprint=(
+            handshake["runtime_identity_fingerprint"]
+        ),
+    )
 
     for index, spec in enumerate(specs, 1):
         fault_type = spec["fault_type"]

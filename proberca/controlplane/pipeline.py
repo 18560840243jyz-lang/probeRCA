@@ -95,7 +95,12 @@ class FinalControlPlane:
         self._results = []
         self._metric_catalog = {}
         self._metric_specs = {}
+        self._calibration_learning_count = 0
         self._calibration_validation_count = 0
+        self._healthy_validation_failed = False
+        self._healthy_validation_alerts = []
+        self._latest_calibration_model = None
+        self._frozen_calibration_model = None
         self._calibration_report = {}
         self._invalid_reason_counts = Counter()
         self._rca_not_ready_events = []
@@ -160,7 +165,12 @@ class FinalControlPlane:
         self._hard_counts.clear()
         self._metric_catalog.clear()
         self._metric_specs.clear()
+        self._calibration_learning_count = 0
         self._calibration_validation_count = 0
+        self._healthy_validation_failed = False
+        self._healthy_validation_alerts = []
+        self._latest_calibration_model = None
+        self._frozen_calibration_model = None
         self._calibration_report = {}
         self.state = "calibrating"
         self._healthy_topology_fingerprint = graph.topology_fingerprint
@@ -191,6 +201,13 @@ class FinalControlPlane:
             config=self.config,
         )
 
+    @staticmethod
+    def _metric_readiness_payload(status) -> dict[str, Any]:
+        payload = asdict(status)
+        payload["target_coordinate"] = status.target_metric
+        payload["feature_count"] = status.allowed_feature_count
+        return payload
+
     def _build_calibration_report(
         self, *, graph: AllowedServiceGraph, timestamp_ns: int,
         maximum: float,
@@ -200,14 +217,17 @@ class FinalControlPlane:
         )
         candidate = self._full_candidate(graph)
         metrics = candidate_metric_nodes(self._metric_catalog, candidate)
-        model = fit_metric_propagation(
-            metrics=metrics,
-            healthy_history=self._healthy_history,
-            candidate=candidate,
-            service_graph=graph,
-            healthy_cutoff_ns=timestamp_ns,
-            config=self.config,
-        )
+        model = self._frozen_calibration_model
+        if model is None:
+            model = fit_metric_propagation(
+                metrics=metrics,
+                healthy_history=self._healthy_history,
+                candidate=candidate,
+                service_graph=graph,
+                healthy_cutoff_ns=timestamp_ns,
+                config=self.config,
+            )
+        self._latest_calibration_model = model
         configured_roots = set(
             self.config.calibration_required_root_coordinates
         )
@@ -258,14 +278,16 @@ class FinalControlPlane:
             for node_id in sorted(metrics)
         }
         all_av_status = {
-            node_id: asdict(status)
+            node_id: self._metric_readiness_payload(status)
             for node_id, status in sorted(
                 model.target_readiness.items()
             )
             if status.root_eligible
         }
         av_status = {
-            node_id: asdict(model.target_readiness[node_id])
+            node_id: self._metric_readiness_payload(
+                model.target_readiness[node_id]
+            )
             for node_id in sorted(required_roots)
             if node_id in model.target_readiness
         }
@@ -280,7 +302,11 @@ class FinalControlPlane:
                     self.config.metric_min_training_rows
                 ),
                 "effective_rank": 0,
+                "raw_design_rank_ratio": 0.0,
                 "condition_number": None,
+                "regularized_gram_condition_number": None,
+                "target_coordinate": node_id,
+                "feature_count": 0,
                 "ready": False,
                 "not_ready_reason": "metric_not_observed",
             }
@@ -338,6 +364,69 @@ class FinalControlPlane:
         core_ready = (
             scope_ready and baseline_ready and av_ready and as_ready
         )
+        required_scope_fingerprint = (
+            self.config.required_scope_fingerprint
+        )
+        scale_config_fingerprint = (
+            self.config.scale_config_fingerprint
+        )
+        service_model_fingerprint = fingerprint({
+            "coefficients": [
+                [target, parent, lag, value]
+                for (target, parent, lag), value in sorted(
+                    self.service_rls.coefficients().items()
+                )
+            ],
+            "readiness": service_status,
+        })
+        metric_model_fingerprint = fingerprint({
+            "coefficients": [
+                [target, parent, lag, value]
+                for (target, parent, lag), value in sorted(
+                    model.coefficients.items()
+                )
+            ],
+            "semantic_mask": list(model.semantic_mask),
+            "readiness": av_status,
+            "healthy_cutoff_ns": model.healthy_cutoff_ns,
+        })
+        calibration_fingerprint = fingerprint({
+            "dataset_fingerprint": self._dataset_fingerprint,
+            "topology_fingerprint": graph.topology_fingerprint,
+            "runtime_identity_fingerprint": (
+                graph.runtime_identity_fingerprint
+            ),
+            "collection_contract_fingerprint": (
+                self.config.collection_contract_fingerprint
+            ),
+            "control_config_fingerprint": self.config.config_fingerprint,
+            "required_scope_fingerprint": required_scope_fingerprint,
+            "scale_config_fingerprint": scale_config_fingerprint,
+            "As_fingerprint": service_model_fingerprint,
+            "Av_fingerprint": metric_model_fingerprint,
+        })
+        for statuses in (baseline_status, all_baseline_status):
+            for status in statuses.values():
+                status["calibration_fingerprint"] = (
+                    calibration_fingerprint
+                )
+        scale_snapshot = self.baseline.scale_snapshot()
+        for scale in scale_snapshot.values():
+            scale["calibration_fingerprint"] = (
+                calibration_fingerprint
+            )
+        validation_result = (
+            "failed"
+            if self._healthy_validation_failed
+            else "passed"
+            if (
+                self._calibration_validation_count
+                >= self.config.calibration_validation_windows
+            )
+            else "in_progress"
+            if self.state == "healthy_validating"
+            else "not_started"
+        )
         payload = {
             "schema_version": "probeRCA-calibration-readiness-v1",
             "timestamp_ns": timestamp_ns,
@@ -347,11 +436,25 @@ class FinalControlPlane:
             "baseline_ready": baseline_ready,
             "service_model_ready": as_ready,
             "metric_model_ready": av_ready,
+            "calibration_learning_windows": (
+                self._calibration_learning_count
+            ),
+            "required_calibration_learning_windows": (
+                self.config.calibration_learning_windows
+            ),
+            "calibration_learning_complete": (
+                self._calibration_learning_count
+                >= self.config.calibration_learning_windows
+            ),
             "healthy_validation_windows": (
                 self._calibration_validation_count
             ),
             "required_healthy_validation_windows": (
                 self.config.calibration_validation_windows
+            ),
+            "healthy_validation_result": validation_result,
+            "healthy_validation_alerts": list(
+                self._healthy_validation_alerts
             ),
             "maximum_symptom_score": maximum,
             "required_entity_types": sorted(required_types),
@@ -359,10 +462,26 @@ class FinalControlPlane:
             "available_root_coordinates": sorted(all_av_status),
             "planned_scope_ready": scope_ready,
             "planned_scope_status": scope_status,
-            "required_scope_fingerprint": fingerprint({
-                "entity_types": sorted(required_types),
-                "root_coordinates": sorted(configured_roots),
-            }),
+            "required_scope_fingerprint": required_scope_fingerprint,
+            "collection_contract_fingerprint": (
+                self.config.collection_contract_fingerprint
+            ),
+            "scale_config_fingerprint": scale_config_fingerprint,
+            "As_fingerprint": service_model_fingerprint,
+            "Av_fingerprint": metric_model_fingerprint,
+            "calibration_fingerprint": calibration_fingerprint,
+            "baseline_ready_count": sum(
+                item["ready"] for item in baseline_status.values()
+            ),
+            "baseline_required_count": len(baseline_status),
+            "Av_ready_count": sum(
+                item["ready"] for item in av_status.values()
+            ),
+            "Av_required_count": len(av_status),
+            "As_ready_count": sum(
+                item["ready"] for item in service_status.values()
+            ),
+            "As_required_count": len(service_status),
             **self._topology_provenance(graph),
             "topology_reset_count": self._topology_reset_count,
             "runtime_identity_reset_count": (
@@ -389,7 +508,7 @@ class FinalControlPlane:
             "latest_observation_validity": dict(sorted(
                 self.resolver.last_validity.items()
             )),
-            "scale_snapshot": self.baseline.scale_snapshot(),
+            "scale_snapshot": scale_snapshot,
             "report_fingerprint": "",
         }
         return payload | {
@@ -404,23 +523,28 @@ class FinalControlPlane:
         report = self._build_calibration_report(
             graph=graph, timestamp_ns=timestamp_ns, maximum=maximum,
         )
-        healthy_validation = (
+        learning_complete = (
+            self._calibration_learning_count
+            >= self.config.calibration_learning_windows
+        )
+        enter_validation = (
             report["core_ready"]
-            and maximum < self.config.soft_threshold
+            and learning_complete
         )
-        self._calibration_validation_count = (
-            self._calibration_validation_count + 1
-            if healthy_validation else 0
-        )
-        report["healthy_validation_windows"] = (
-            self._calibration_validation_count
-        )
-        report["ready"] = (
-            report["core_ready"]
-            and self._calibration_validation_count
-            >= self.config.calibration_validation_windows
-        )
-        self.state = "ready" if report["ready"] else "calibrating"
+        report["ready"] = False
+        if enter_validation:
+            self._frozen_calibration_model = (
+                self._latest_calibration_model
+            )
+            self._calibration_validation_count = 0
+            self._healthy_validation_failed = False
+            self._healthy_validation_alerts = []
+            self._soft_counts.clear()
+            self._hard_counts.clear()
+            self.state = "healthy_validating"
+            report["healthy_validation_result"] = "not_started"
+        else:
+            self.state = "calibrating"
         report["state"] = self.state
         report["report_fingerprint"] = ""
         report["report_fingerprint"] = fingerprint(report)
@@ -448,16 +572,103 @@ class FinalControlPlane:
                 for node_id, item in sorted(observations.items())
             },
             "reason": (
-                "calibration_ready"
-                if report["ready"]
-                else (
-                    "calibration_anomaly"
-                    if report["core_ready"] and not healthy_validation
-                    else "calibration_not_ready"
-                )
+                "calibration_models_frozen"
+                if enter_validation else "calibration_not_ready"
             ),
-            "baseline_frozen": False,
-            "service_model_frozen": False,
+            "baseline_frozen": enter_validation,
+            "service_model_frozen": enter_validation,
+            **self._topology_provenance(graph),
+            "calibration_report_fingerprint": (
+                report["report_fingerprint"]
+            ),
+        })
+
+    def _advance_healthy_validation(
+        self, *, graph: AllowedServiceGraph, timestamp_ns: int,
+        maximum: float, service_scores, edge_scores, observations,
+    ) -> None:
+        previous = self.state
+        soft, hard = self._advance_alert_counters(
+            service_scores, edge_scores,
+        )
+        if soft or hard:
+            alert = {
+                "timestamp_ns": timestamp_ns,
+                "soft_entities": [
+                    list(item) for item in sorted(soft)
+                ],
+                "hard_entities": [
+                    list(item) for item in sorted(hard)
+                ],
+            }
+            self._healthy_validation_alerts.append(alert)
+            self._healthy_validation_failed = True
+        self._calibration_validation_count += 1
+        report = self._build_calibration_report(
+            graph=graph, timestamp_ns=timestamp_ns, maximum=maximum,
+        )
+        passed = (
+            report["core_ready"]
+            and not self._healthy_validation_failed
+            and self._calibration_validation_count
+            >= self.config.calibration_validation_windows
+        )
+        self.state = "ready" if passed else "healthy_validating"
+        if passed:
+            self._soft_counts.clear()
+            self._hard_counts.clear()
+        report["state"] = self.state
+        report["ready"] = passed
+        report["healthy_validation_windows"] = (
+            self._calibration_validation_count
+        )
+        report["healthy_validation_result"] = (
+            "failed"
+            if self._healthy_validation_failed
+            else "passed" if passed else "in_progress"
+        )
+        report["healthy_validation_alerts"] = list(
+            self._healthy_validation_alerts
+        )
+        report["report_fingerprint"] = ""
+        report["report_fingerprint"] = fingerprint(report)
+        self._calibration_report = report
+        self._timeline.append({
+            "timestamp_ns": timestamp_ns,
+            "previous_state": previous,
+            "state": self.state,
+            "maximum_symptom_score": maximum,
+            "service_scores": dict(sorted(service_scores.items())),
+            "edge_scores": dict(sorted(edge_scores.items())),
+            "soft_alert_entities": [
+                list(item) for item in sorted(soft)
+            ],
+            "hard_alert_entities": [
+                list(item) for item in sorted(hard)
+            ],
+            "scale_sources": {
+                node_id: item.scale_source
+                for node_id, item in sorted(observations.items())
+            },
+            "metric_scores": {
+                node_id: {
+                    "signed_z": item.signed_z,
+                    "anomaly": item.anomaly,
+                    "quality": item.quality,
+                    "baseline_center": item.baseline_center,
+                    "baseline_scale": item.baseline_scale,
+                    "scale_source": item.scale_source,
+                }
+                for node_id, item in sorted(observations.items())
+            },
+            "reason": (
+                "healthy_validation_failed"
+                if self._healthy_validation_failed
+                else "healthy_validation_passed"
+                if passed else "healthy_validation_in_progress"
+            ),
+            "baseline_frozen": True,
+            "service_model_frozen": True,
             **self._topology_provenance(graph),
             "calibration_report_fingerprint": (
                 report["report_fingerprint"]
@@ -488,16 +699,15 @@ class FinalControlPlane:
             )
         return service_scores, edge_scores
 
-    def _baseline_ready(self, raw) -> bool:
-        alert_nodes = [
-            node_id for node_id, (_value, spec) in raw.items()
-            if spec.role in {
-                "request_latency", "request_failure", "edge_latency", "edge_failure",
+    @staticmethod
+    def _baseline_ready(observations) -> bool:
+        """Allow ready entities to alert without sparse peers blocking them."""
+        return any(
+            item.metric.role in {
+                "request_latency", "request_failure",
+                "edge_latency", "edge_failure",
             }
-        ]
-        return bool(alert_nodes) and all(
-            self.baseline.ready(node_id, raw[node_id][1])
-            for node_id in alert_nodes
+            for item in observations.values()
         )
 
     def _update_healthy_models(
@@ -892,7 +1102,8 @@ class FinalControlPlane:
             topology_reset = False
             runtime_identity_reset = False
             if self.state in {
-                "starting", "calibrating", "ready", "healthy",
+                "starting", "calibrating", "healthy_validating",
+                "ready", "healthy",
             }:
                 if self._healthy_topology_fingerprint is None:
                     self._initialize_healthy_segment(live_graph)
@@ -936,7 +1147,7 @@ class FinalControlPlane:
             }
             self._signed_history[window.sequence] = signed
             service_scores, edge_scores = self._scores(observations, graph)
-            baseline_ready = self._baseline_ready(raw)
+            baseline_ready = self._baseline_ready(observations)
             maximum = max(
                 (*service_scores.values(), *edge_scores.values()), default=0.0,
             )
@@ -952,8 +1163,21 @@ class FinalControlPlane:
                 graph=graph,
                 safe_healthy=safe_healthy,
             )
+            if self.state in {"starting", "calibrating"} \
+                    and safe_healthy:
+                self._calibration_learning_count += 1
             if self.state in {"starting", "calibrating"}:
                 self._advance_calibration(
+                    graph=graph,
+                    timestamp_ns=window.window_end_ns,
+                    maximum=maximum,
+                    service_scores=service_scores,
+                    edge_scores=edge_scores,
+                    observations=observations,
+                )
+                continue
+            if self.state == "healthy_validating":
+                self._advance_healthy_validation(
                     graph=graph,
                     timestamp_ns=window.window_end_ns,
                     maximum=maximum,

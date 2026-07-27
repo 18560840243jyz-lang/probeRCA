@@ -22,6 +22,8 @@ class MetricContractError(ValueError):
 class BaselineScale:
     sample_count: int
     center: float
+    mad: float
+    iqr: float
     mad_scale: float
     iqr_scale: float
     family_floor: float
@@ -71,7 +73,8 @@ class RobustBaselineStore:
         quartiles = statistics.quantiles(
             values, n=4, method="inclusive",
         )
-        iqr_scale = float((quartiles[2] - quartiles[0]) / 1.349)
+        iqr = float(quartiles[2] - quartiles[0])
+        iqr_scale = float(iqr / 1.349)
         if mad_scale >= floor:
             final_scale, source = mad_scale, "mad"
         elif iqr_scale >= floor:
@@ -82,6 +85,8 @@ class RobustBaselineStore:
         return BaselineScale(
             sample_count=len(values),
             center=center,
+            mad=mad,
+            iqr=iqr,
             mad_scale=mad_scale,
             iqr_scale=iqr_scale,
             family_floor=float(floor),
@@ -109,12 +114,16 @@ class RobustBaselineStore:
         return {
             "target_metric": node_id,
             "scale_family": spec.scale_family,
+            "baseline_sample_count": len(values),
             "valid_healthy_samples": len(values),
             "minimum_healthy_samples": self.config.baseline_min_windows,
             "ready": scale is not None,
             "not_ready_reason": reason,
             "scale": (
                 None if scale is None else {
+                    "median": scale.center,
+                    "mad": scale.mad,
+                    "iqr": scale.iqr,
                     "center": scale.center,
                     "mad_scale": scale.mad_scale,
                     "iqr_scale": scale.iqr_scale,
@@ -163,7 +172,11 @@ class RobustBaselineStore:
             scale = self.scale(node_id)
             if scale is not None:
                 output[node_id] = {
+                    "baseline_sample_count": scale.sample_count,
                     "sample_count": scale.sample_count,
+                    "median": scale.center,
+                    "mad": scale.mad,
+                    "iqr": scale.iqr,
                     "center": scale.center,
                     "mad_scale": scale.mad_scale,
                     "iqr_scale": scale.iqr_scale,

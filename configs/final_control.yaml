@@ -2,10 +2,10 @@ window_sec: 1
 baseline_min_windows: 6
 baseline_min_scale: 1.0e-12
 baseline_family_min_scales:
-  count: null
-  latency: null
-  psi: null
-  ratio: null
+  count: 0.5
+  latency: 0.5
+  psi: 0.0005
+  ratio: 0.0005
 latency_min_samples: 5
 failure_min_requests: 5
 service_lags:
@@ -22,12 +22,121 @@ metric_min_training_rows: 4
 metric_rows_per_feature: 2.0
 metric_rank_tolerance: 1.0e-10
 metric_max_condition_number: 100000000.0
-calibration_validation_windows: 5
+calibration_learning_windows: 600
+calibration_validation_windows: 300
 calibration_required_entity_types:
 - edge
 - host
 - service
-calibration_required_root_coordinates: []
+calibration_required_root_coordinates:
+- kind-proberca-ob::host::proberca-ob-control-plane::cpu_psi
+- kind-proberca-ob::host::proberca-ob-control-plane::io_psi
+- kind-proberca-ob::host::proberca-ob-control-plane::memory_psi
+- kind-proberca-ob::host::proberca-ob-control-plane::nic_drop_error_rate
+- kind-proberca-ob::kube-system::kube-dns::cpu_throttle_ratio
+- kind-proberca-ob::kube-system::kube-dns::cpu_usage_rate
+- kind-proberca-ob::kube-system::kube-dns::futex_wait_time_rate
+- kind-proberca-ob::kube-system::kube-dns::io_psi
+- kind-proberca-ob::kube-system::kube-dns::local_socket_failure_rate
+- kind-proberca-ob::kube-system::kube-dns::memory_working_set_ratio
+- kind-proberca-ob::online-boutique::adservice::cpu_throttle_ratio
+- kind-proberca-ob::online-boutique::adservice::cpu_usage_rate
+- kind-proberca-ob::online-boutique::adservice::futex_wait_time_rate
+- kind-proberca-ob::online-boutique::adservice::io_psi
+- kind-proberca-ob::online-boutique::adservice::local_socket_failure_rate
+- kind-proberca-ob::online-boutique::adservice::memory_working_set_ratio
+- kind-proberca-ob::online-boutique::cartservice->redis-cart::tcp::edge_failure_rate
+- kind-proberca-ob::online-boutique::cartservice->redis-cart::tcp::edge_latency_p95
+- kind-proberca-ob::online-boutique::cartservice::cpu_throttle_ratio
+- kind-proberca-ob::online-boutique::cartservice::cpu_usage_rate
+- kind-proberca-ob::online-boutique::cartservice::futex_wait_time_rate
+- kind-proberca-ob::online-boutique::cartservice::io_psi
+- kind-proberca-ob::online-boutique::cartservice::local_socket_failure_rate
+- kind-proberca-ob::online-boutique::cartservice::memory_working_set_ratio
+- kind-proberca-ob::online-boutique::checkoutservice->cartservice::tcp::edge_failure_rate
+- kind-proberca-ob::online-boutique::checkoutservice->cartservice::tcp::edge_latency_p95
+- kind-proberca-ob::online-boutique::checkoutservice->currencyservice::tcp::edge_failure_rate
+- kind-proberca-ob::online-boutique::checkoutservice->currencyservice::tcp::edge_latency_p95
+- kind-proberca-ob::online-boutique::checkoutservice->emailservice::tcp::edge_failure_rate
+- kind-proberca-ob::online-boutique::checkoutservice->emailservice::tcp::edge_latency_p95
+- kind-proberca-ob::online-boutique::checkoutservice->paymentservice::tcp::edge_failure_rate
+- kind-proberca-ob::online-boutique::checkoutservice->paymentservice::tcp::edge_latency_p95
+- kind-proberca-ob::online-boutique::checkoutservice->productcatalogservice::tcp::edge_failure_rate
+- kind-proberca-ob::online-boutique::checkoutservice->productcatalogservice::tcp::edge_latency_p95
+- kind-proberca-ob::online-boutique::checkoutservice->shippingservice::tcp::edge_failure_rate
+- kind-proberca-ob::online-boutique::checkoutservice->shippingservice::tcp::edge_latency_p95
+- kind-proberca-ob::online-boutique::checkoutservice::cpu_throttle_ratio
+- kind-proberca-ob::online-boutique::checkoutservice::cpu_usage_rate
+- kind-proberca-ob::online-boutique::checkoutservice::futex_wait_time_rate
+- kind-proberca-ob::online-boutique::checkoutservice::io_psi
+- kind-proberca-ob::online-boutique::checkoutservice::local_socket_failure_rate
+- kind-proberca-ob::online-boutique::checkoutservice::memory_working_set_ratio
+- kind-proberca-ob::online-boutique::currencyservice::cpu_throttle_ratio
+- kind-proberca-ob::online-boutique::currencyservice::cpu_usage_rate
+- kind-proberca-ob::online-boutique::currencyservice::futex_wait_time_rate
+- kind-proberca-ob::online-boutique::currencyservice::io_psi
+- kind-proberca-ob::online-boutique::currencyservice::local_socket_failure_rate
+- kind-proberca-ob::online-boutique::currencyservice::memory_working_set_ratio
+- kind-proberca-ob::online-boutique::emailservice::cpu_throttle_ratio
+- kind-proberca-ob::online-boutique::emailservice::cpu_usage_rate
+- kind-proberca-ob::online-boutique::emailservice::futex_wait_time_rate
+- kind-proberca-ob::online-boutique::emailservice::io_psi
+- kind-proberca-ob::online-boutique::emailservice::local_socket_failure_rate
+- kind-proberca-ob::online-boutique::emailservice::memory_working_set_ratio
+- kind-proberca-ob::online-boutique::frontend->adservice::tcp::edge_failure_rate
+- kind-proberca-ob::online-boutique::frontend->adservice::tcp::edge_latency_p95
+- kind-proberca-ob::online-boutique::frontend->cartservice::tcp::edge_failure_rate
+- kind-proberca-ob::online-boutique::frontend->cartservice::tcp::edge_latency_p95
+- kind-proberca-ob::online-boutique::frontend->checkoutservice::tcp::edge_failure_rate
+- kind-proberca-ob::online-boutique::frontend->checkoutservice::tcp::edge_latency_p95
+- kind-proberca-ob::online-boutique::frontend->currencyservice::tcp::edge_failure_rate
+- kind-proberca-ob::online-boutique::frontend->currencyservice::tcp::edge_latency_p95
+- kind-proberca-ob::online-boutique::frontend->kube-dns::dns::dns_failure_rate
+- kind-proberca-ob::online-boutique::frontend->kube-dns::dns::dns_latency_p95
+- kind-proberca-ob::online-boutique::frontend->productcatalogservice::tcp::edge_failure_rate
+- kind-proberca-ob::online-boutique::frontend->productcatalogservice::tcp::edge_latency_p95
+- kind-proberca-ob::online-boutique::frontend->recommendationservice::tcp::edge_failure_rate
+- kind-proberca-ob::online-boutique::frontend->recommendationservice::tcp::edge_latency_p95
+- kind-proberca-ob::online-boutique::frontend->shippingservice::tcp::edge_failure_rate
+- kind-proberca-ob::online-boutique::frontend->shippingservice::tcp::edge_latency_p95
+- kind-proberca-ob::online-boutique::frontend::cpu_throttle_ratio
+- kind-proberca-ob::online-boutique::frontend::cpu_usage_rate
+- kind-proberca-ob::online-boutique::frontend::futex_wait_time_rate
+- kind-proberca-ob::online-boutique::frontend::io_psi
+- kind-proberca-ob::online-boutique::frontend::local_socket_failure_rate
+- kind-proberca-ob::online-boutique::frontend::memory_working_set_ratio
+- kind-proberca-ob::online-boutique::paymentservice::cpu_throttle_ratio
+- kind-proberca-ob::online-boutique::paymentservice::cpu_usage_rate
+- kind-proberca-ob::online-boutique::paymentservice::futex_wait_time_rate
+- kind-proberca-ob::online-boutique::paymentservice::io_psi
+- kind-proberca-ob::online-boutique::paymentservice::local_socket_failure_rate
+- kind-proberca-ob::online-boutique::paymentservice::memory_working_set_ratio
+- kind-proberca-ob::online-boutique::productcatalogservice::cpu_throttle_ratio
+- kind-proberca-ob::online-boutique::productcatalogservice::cpu_usage_rate
+- kind-proberca-ob::online-boutique::productcatalogservice::futex_wait_time_rate
+- kind-proberca-ob::online-boutique::productcatalogservice::io_psi
+- kind-proberca-ob::online-boutique::productcatalogservice::local_socket_failure_rate
+- kind-proberca-ob::online-boutique::productcatalogservice::memory_working_set_ratio
+- kind-proberca-ob::online-boutique::recommendationservice->productcatalogservice::tcp::edge_failure_rate
+- kind-proberca-ob::online-boutique::recommendationservice->productcatalogservice::tcp::edge_latency_p95
+- kind-proberca-ob::online-boutique::recommendationservice::cpu_throttle_ratio
+- kind-proberca-ob::online-boutique::recommendationservice::cpu_usage_rate
+- kind-proberca-ob::online-boutique::recommendationservice::futex_wait_time_rate
+- kind-proberca-ob::online-boutique::recommendationservice::io_psi
+- kind-proberca-ob::online-boutique::recommendationservice::local_socket_failure_rate
+- kind-proberca-ob::online-boutique::recommendationservice::memory_working_set_ratio
+- kind-proberca-ob::online-boutique::redis-cart::cpu_throttle_ratio
+- kind-proberca-ob::online-boutique::redis-cart::cpu_usage_rate
+- kind-proberca-ob::online-boutique::redis-cart::futex_wait_time_rate
+- kind-proberca-ob::online-boutique::redis-cart::io_psi
+- kind-proberca-ob::online-boutique::redis-cart::local_socket_failure_rate
+- kind-proberca-ob::online-boutique::redis-cart::memory_working_set_ratio
+- kind-proberca-ob::online-boutique::shippingservice::cpu_throttle_ratio
+- kind-proberca-ob::online-boutique::shippingservice::cpu_usage_rate
+- kind-proberca-ob::online-boutique::shippingservice::futex_wait_time_rate
+- kind-proberca-ob::online-boutique::shippingservice::io_psi
+- kind-proberca-ob::online-boutique::shippingservice::local_socket_failure_rate
+- kind-proberca-ob::online-boutique::shippingservice::memory_working_set_ratio
 alpha_latency: 0.5
 alpha_failure: 0.5
 soft_threshold: 3.0
