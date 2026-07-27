@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Iterable
 
 from proberca.data.schema import (
@@ -192,13 +192,10 @@ class RawBurstSample:
         candidate._validate(check_source=False)
         identity = candidate.to_dict()
         identity.pop("source_record_id")
-        result = cls(
-            **(payload | {
-                "source_record_id": "source:" + fingerprint(identity),
-            })
+        return replace(
+            candidate,
+            source_record_id="source:" + fingerprint(identity),
         )
-        result.validate()
-        return result
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "RawBurstSample":
@@ -254,24 +251,28 @@ class RawBurstSample:
             raise RawCollectionError(
                 "raw Burst source_object_id must be object:SHA-256"
             )
+        payload = self.to_dict()
         if check_source:
             if not _opaque("source", self.source_record_id):
                 raise RawCollectionError(
                     "raw Burst source_record_id must be source:SHA-256"
                 )
-            payload = self.to_dict()
             supplied = payload.pop("source_record_id")
             if supplied != "source:" + fingerprint(payload):
                 raise RawCollectionError(
                     "raw Burst source identity mismatch"
                 )
-        assert_label_safe(self.to_dict())
+            payload["source_record_id"] = supplied
+        assert_label_safe(payload)
 
     def validate(self) -> None:
         self._validate(check_source=True)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+        }
 
 
 class BurstEvidenceCollector:

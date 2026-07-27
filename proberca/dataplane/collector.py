@@ -57,6 +57,14 @@ class RawBurstWindowSource(Protocol):
     ):
         ...
 
+    def begin_capture(self) -> None:
+        ...
+
+    def capture_boundary(
+        self, timestamp_ns: int, inventory_revision,
+    ) -> None:
+        ...
+
 
 class RawBurstWindowSink(Protocol):
     def append(self, window) -> None:
@@ -614,7 +622,7 @@ class FinalLiveCollectionRunner:
             window_end_ns=end_ns,
             inventory_revision=before,
         )
-        raw_window = RawCollectionWindow.create(
+        raw_window = RawCollectionWindow._create_from_validated_samples(
             sequence=sequence,
             window_start_ns=start_ns,
             window_end_ns=end_ns,
@@ -674,27 +682,63 @@ class FinalLiveCollectionRunner:
             begin_capture = getattr(
                 self.raw_burst_source, "begin_capture", None
             )
-            if not callable(begin_capture):
+            capture_boundary = getattr(
+                self.raw_burst_source, "capture_boundary", None
+            )
+            if not callable(begin_capture) or not callable(
+                capture_boundary
+            ):
                 raise RawCollectionError(
-                    "raw Burst source cannot begin a contiguous capture"
+                    "raw Burst source cannot capture exact boundaries"
                 )
             begin_capture()
-        self._wait_until(
-            bounds[-1][1] + int(
-                self.config.collection_delay_sec * 1_000_000_000
+            self._wait_until(bounds[0][0])
+            capture_boundary(bounds[0][0], before)
+            for _start_ns, end_ns in bounds:
+                self._wait_until(end_ns)
+                capture_boundary(end_ns, before)
+            self._wait_until(
+                bounds[-1][1] + int(
+                    self.config.collection_delay_sec
+                    * 1_000_000_000
+                )
             )
-        )
+        else:
+            self._wait_until(
+                bounds[-1][1] + int(
+                    self.config.collection_delay_sec
+                    * 1_000_000_000
+                )
+            )
         after = self.discovery.discover_once(
             self.wall_clock_ns()
         ).freeze(self.wall_clock_ns())
-        output = []
-        for sequence, (start_ns, end_ns) in enumerate(bounds, 1):
-            samples = self.primitive_source.collect(
-                window_start_ns=start_ns,
-                window_end_ns=end_ns,
+        collect_windows = getattr(
+            self.primitive_source, "collect_windows", None,
+        )
+        if callable(collect_windows):
+            sample_windows = collect_windows(
+                bounds=bounds,
                 inventory_revision=before,
             )
-            raw_window = RawCollectionWindow.create(
+            if len(sample_windows) != len(bounds):
+                raise RawCollectionError(
+                    "primitive batch returned the wrong window count"
+                )
+        else:
+            sample_windows = tuple(
+                self.primitive_source.collect(
+                    window_start_ns=start_ns,
+                    window_end_ns=end_ns,
+                    inventory_revision=before,
+                )
+                for start_ns, end_ns in bounds
+            )
+        output = []
+        for sequence, ((start_ns, end_ns), samples) in enumerate(
+            zip(bounds, sample_windows), 1,
+        ):
+            raw_window = RawCollectionWindow._create_from_validated_samples(
                 sequence=sequence,
                 window_start_ns=start_ns,
                 window_end_ns=end_ns,

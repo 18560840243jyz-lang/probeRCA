@@ -240,6 +240,16 @@ class PrometheusPrimitiveSource:
         config.validate()
         self.config = config
         self.session = session or requests.Session()
+        self._query_fingerprints = {
+            query.query_id: query.query_fingerprint
+            for query in config.queries
+        }
+        self._series_ids: dict[
+            tuple[str, tuple[tuple[str, str | None], ...]], str
+        ] = {}
+        self._source_object_ids: dict[
+            tuple[str, tuple[tuple[str, str], ...]], str
+        ] = {}
 
     def _instant(self, query: PrometheusPrimitiveQuery, timestamp_ns: int):
         response = self.session.get(
@@ -359,21 +369,27 @@ class PrometheusPrimitiveSource:
         node = (pod.get("spec") or {}).get("nodeName")
         return namespace, service, pod_uid, semantic.get("container_id"), node
 
-    @staticmethod
     def _series_id(
+        self,
         query: PrometheusPrimitiveQuery,
         semantic: dict[str, str | None],
     ) -> str:
-        identity = {
-            label: semantic.get(label) for label in query.series_labels
-        }
-        if any(value is None or value == "" for value in identity.values()):
+        identity = tuple(
+            (label, semantic.get(label))
+            for label in query.series_labels
+        )
+        if any(value is None or value == "" for _label, value in identity):
             raise RawCollectionError(
                 f"query {query.query_id} has incomplete series identity"
             )
-        return "series-" + fingerprint({
-            "identity": identity,
-        })
+        key = query.query_id, identity
+        result = self._series_ids.get(key)
+        if result is None:
+            result = "series-" + fingerprint({
+                "identity": dict(identity),
+            })
+            self._series_ids[key] = result
+        return result
 
     def _sample(
         self,
@@ -396,11 +412,16 @@ class PrometheusPrimitiveSource:
             "scope": component.scope,
             "series_id": self._series_id(query, semantic),
             "value": value * float(query.value_scale),
-            "source_object_id": "object:" + fingerprint({
-                "query": query.query_fingerprint,
-                "labels": labels,
-            }),
         }
+        source_key = query.query_id, tuple(sorted(labels.items()))
+        source_object_id = self._source_object_ids.get(source_key)
+        if source_object_id is None:
+            source_object_id = "object:" + fingerprint({
+                "query": self._query_fingerprints[query.query_id],
+                "labels": labels,
+            })
+            self._source_object_ids[source_key] = source_object_id
+        common["source_object_id"] = source_object_id
         if component.entity_type == "service":
             namespace, service, pod_uid, container_id, node = (
                 self._pod_identity(semantic, revision)
@@ -466,14 +487,11 @@ class PrometheusPrimitiveSource:
             )
         return RawMetricSample.create(**common)
 
-    def collect(
-        self,
-        *,
-        window_start_ns: int,
-        window_end_ns: int,
-        inventory_revision: RuntimeIdentityResolver,
-    ) -> tuple[RawMetricSample, ...]:
-        output = []
+    def _jobs(
+        self, window_start_ns: int, window_end_ns: int,
+    ) -> tuple[tuple[
+        PrometheusPrimitiveQuery, Any, int,
+    ], ...]:
         jobs = []
         for query in self.config.queries:
             spec = COMPONENTS[query.component]
@@ -484,21 +502,37 @@ class PrometheusPrimitiveSource:
                 }
                 else (window_end_ns,)
             )
-            for requested_ns in timestamps:
-                jobs.append((query, spec, requested_ns))
-        with ThreadPoolExecutor(
-            max_workers=min(64, len(jobs))
-        ) as executor:
-            responses = tuple(executor.map(
-                lambda item: self._instant(item[0], item[2]),
-                jobs,
-            ))
+            jobs.extend(
+                (query, spec, requested_ns)
+                for requested_ns in timestamps
+            )
+        return tuple(jobs)
+
+    def _samples_from_responses(
+        self,
+        *,
+        window_start_ns: int,
+        window_end_ns: int,
+        inventory_revision: RuntimeIdentityResolver,
+        response_cache: dict[
+            tuple[str, int],
+            tuple[tuple[dict[str, str], int, float], ...],
+        ],
+        sample_cache: dict[
+            tuple[
+                str, int, int, tuple[tuple[str, str], ...], float,
+            ],
+            RawMetricSample,
+        ],
+    ) -> tuple[RawMetricSample, ...]:
+        output = []
         query_counts = {
             query.query_id: 0 for query in self.config.queries
         }
-        for (query, spec, requested_ns), response in zip(
-            jobs, responses
+        for query, spec, requested_ns in self._jobs(
+            window_start_ns, window_end_ns,
         ):
+            response = response_cache[(query.query_id, requested_ns)]
             for labels, observed_ns, value in response:
                 if spec.metric_kind in {
                     "monotonic_counter", "histogram_bucket",
@@ -514,9 +548,21 @@ class PrometheusPrimitiveSource:
                     raise RawCollectionError(
                         f"query {query.query_id} returned a stale gauge"
                     )
-                output.append(self._sample(
-                    query, labels, observed_ns, value, inventory_revision
-                ))
+                cache_key = (
+                    query.query_id,
+                    requested_ns,
+                    observed_ns,
+                    tuple(sorted(labels.items())),
+                    value,
+                )
+                sample = sample_cache.get(cache_key)
+                if sample is None:
+                    sample = self._sample(
+                        query, labels, observed_ns, value,
+                        inventory_revision,
+                    )
+                    sample_cache[cache_key] = sample
+                output.append(sample)
                 query_counts[query.query_id] += 1
         for query in self.config.queries:
             if query_counts[query.query_id] == 0:
@@ -532,6 +578,77 @@ class PrometheusPrimitiveSource:
             item.timestamp_ns, item.entity_key, item.component,
             item.series_id, item.sortable_bucket_key,
         )))
+
+    def collect_windows(
+        self,
+        *,
+        bounds: tuple[tuple[int, int], ...],
+        inventory_revision: RuntimeIdentityResolver,
+    ) -> tuple[tuple[RawMetricSample, ...], ...]:
+        if not bounds or any(
+            isinstance(start_ns, bool)
+            or isinstance(end_ns, bool)
+            or not isinstance(start_ns, int)
+            or not isinstance(end_ns, int)
+            or start_ns >= end_ns
+            for start_ns, end_ns in bounds
+        ):
+            raise RawCollectionError(
+                "Prometheus batch bounds must be non-empty valid windows"
+            )
+        unique_jobs = {}
+        for start_ns, end_ns in bounds:
+            for query, spec, requested_ns in self._jobs(
+                start_ns, end_ns,
+            ):
+                unique_jobs.setdefault(
+                    (query.query_id, requested_ns),
+                    (query, spec, requested_ns),
+                )
+        ordered_jobs = tuple(
+            unique_jobs[key] for key in sorted(unique_jobs)
+        )
+        with ThreadPoolExecutor(
+            max_workers=min(64, len(ordered_jobs))
+        ) as executor:
+            responses = tuple(executor.map(
+                lambda item: self._instant(item[0], item[2]),
+                ordered_jobs,
+            ))
+        response_cache = {
+            (query.query_id, requested_ns): response
+            for (query, _spec, requested_ns), response in zip(
+                ordered_jobs, responses
+            )
+        }
+        sample_cache: dict[
+            tuple[
+                str, int, int, tuple[tuple[str, str], ...], float,
+            ],
+            RawMetricSample,
+        ] = {}
+        return tuple(
+            self._samples_from_responses(
+                window_start_ns=start_ns,
+                window_end_ns=end_ns,
+                inventory_revision=inventory_revision,
+                response_cache=response_cache,
+                sample_cache=sample_cache,
+            )
+            for start_ns, end_ns in bounds
+        )
+
+    def collect(
+        self,
+        *,
+        window_start_ns: int,
+        window_end_ns: int,
+        inventory_revision: RuntimeIdentityResolver,
+    ) -> tuple[RawMetricSample, ...]:
+        return self.collect_windows(
+            bounds=((window_start_ns, window_end_ns),),
+            inventory_revision=inventory_revision,
+        )[0]
 
 
 class CompositePrimitiveSource:

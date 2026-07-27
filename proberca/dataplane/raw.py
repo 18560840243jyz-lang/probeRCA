@@ -10,7 +10,7 @@ boundary.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable
 
 from .contracts import assert_label_safe, fingerprint
@@ -124,11 +124,10 @@ class RawMetricSample:
         candidate._validate(check_source_id=False)
         identity = candidate.to_dict()
         identity.pop("source_record_id")
-        result = cls(
-            **(payload | {"source_record_id": "source:" + fingerprint(identity)})
+        return replace(
+            candidate,
+            source_record_id="source:" + fingerprint(identity),
         )
-        result.validate()
-        return result
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "RawMetricSample":
@@ -219,18 +218,19 @@ class RawMetricSample:
             "mapping_quality",
             _probability("mapping_quality", self.mapping_quality),
         )
+        payload = self.to_dict()
         if check_source_id:
             if not _opaque("source", self.source_record_id):
                 raise RawCollectionError(
                     "source_record_id must be source:SHA-256"
                 )
-            payload = self.to_dict()
             supplied = payload.pop("source_record_id")
             if supplied != "source:" + fingerprint(payload):
                 raise RawCollectionError(
                     "source_record_id does not match raw sample content"
                 )
-        assert_label_safe(self.to_dict())
+            payload["source_record_id"] = supplied
+        assert_label_safe(payload)
 
     def validate(self) -> None:
         self._validate(check_source_id=True)
@@ -263,7 +263,10 @@ class RawMetricSample:
         return self.histogram_upper_bound
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+        }
 
 
 @dataclass(frozen=True)
@@ -296,6 +299,43 @@ class RawCollectionWindow:
                 item.source_record_id,
             ),
         ))
+        if any(not isinstance(item, RawMetricSample) for item in ordered):
+            raise RawCollectionError(
+                "raw window samples must be RawMetricSample records"
+            )
+        for item in ordered:
+            item.validate()
+        return cls._create_from_validated_samples(
+            sequence=sequence,
+            window_start_ns=window_start_ns,
+            window_end_ns=window_end_ns,
+            cluster_id=cluster_id,
+            samples=ordered,
+        )
+
+    @classmethod
+    def _create_from_validated_samples(
+        cls,
+        *,
+        sequence: int,
+        window_start_ns: int,
+        window_end_ns: int,
+        cluster_id: str,
+        samples: Iterable[RawMetricSample],
+    ) -> "RawCollectionWindow":
+        """Build a window from source-created samples already validated once."""
+        ordered = tuple(sorted(
+            samples,
+            key=lambda item: (
+                item.timestamp_ns, item.entity_key, item.component,
+                item.series_id, item.sortable_bucket_key,
+                item.source_record_id,
+            ),
+        ))
+        if any(not isinstance(item, RawMetricSample) for item in ordered):
+            raise RawCollectionError(
+                "raw window samples must be RawMetricSample records"
+            )
         payload = {
             "schema_version": RAW_WINDOW_SCHEMA_VERSION,
             "sequence": sequence,
@@ -304,9 +344,24 @@ class RawCollectionWindow:
             "cluster_id": cluster_id,
             "samples": [item.to_dict() for item in ordered],
         }
-        return cls._from_payload(
-            payload | {"raw_window_fingerprint": fingerprint(payload)}
+        result = cls(
+            schema_version=RAW_WINDOW_SCHEMA_VERSION,
+            sequence=sequence,
+            window_start_ns=window_start_ns,
+            window_end_ns=window_end_ns,
+            cluster_id=cluster_id,
+            samples=ordered,
+            raw_window_fingerprint=fingerprint(payload),
         )
+        result._validate_structure()
+        assert_label_safe({
+            "schema_version": result.schema_version,
+            "sequence": result.sequence,
+            "window_start_ns": result.window_start_ns,
+            "window_end_ns": result.window_end_ns,
+            "cluster_id": result.cluster_id,
+        })
+        return result
 
     @classmethod
     def _from_payload(cls, payload: dict[str, Any]) -> "RawCollectionWindow":
@@ -331,7 +386,7 @@ class RawCollectionWindow:
     def from_dict(cls, payload: dict[str, Any]) -> "RawCollectionWindow":
         return cls._from_payload(dict(payload))
 
-    def validate(self) -> None:
+    def _validate_structure(self) -> None:
         if self.schema_version != RAW_WINDOW_SCHEMA_VERSION:
             raise RawCollectionError("unsupported raw window schema")
         if isinstance(self.sequence, bool) or not isinstance(self.sequence, int) \
@@ -358,13 +413,27 @@ class RawCollectionWindow:
         source_ids = tuple(item.source_record_id for item in self.samples)
         if len(source_ids) != len(set(source_ids)):
             raise RawCollectionError("raw window contains duplicate source records")
+    def validate(self) -> None:
+        self._validate_structure()
         payload = self.to_dict()
         supplied = payload.pop("raw_window_fingerprint")
         if supplied != fingerprint(payload):
             raise RawCollectionError("raw window fingerprint mismatch")
-        assert_label_safe(payload)
+        assert_label_safe({
+            key: payload[key]
+            for key in (
+                "schema_version", "sequence", "window_start_ns",
+                "window_end_ns", "cluster_id",
+            )
+        })
 
     def to_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
-        payload["samples"] = [item.to_dict() for item in self.samples]
-        return payload
+        return {
+            "schema_version": self.schema_version,
+            "sequence": self.sequence,
+            "window_start_ns": self.window_start_ns,
+            "window_end_ns": self.window_end_ns,
+            "cluster_id": self.cluster_id,
+            "samples": [item.to_dict() for item in self.samples],
+            "raw_window_fingerprint": self.raw_window_fingerprint,
+        }

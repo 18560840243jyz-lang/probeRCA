@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -75,6 +75,49 @@ class RawBurstWindow:
                 item.source_record_id,
             ),
         ))
+        if any(not isinstance(item, RawBurstSample) for item in values):
+            raise RawCollectionError(
+                "raw Burst window samples must be RawBurstSample records"
+            )
+        for item in values:
+            item.validate()
+        return cls._create_from_validated_samples(
+            sequence=sequence,
+            window_start_ns=window_start_ns,
+            window_end_ns=window_end_ns,
+            cluster_id=cluster_id,
+            samples=values,
+            event_source_fingerprint=event_source_fingerprint,
+            burst_config_fingerprint=burst_config_fingerprint,
+            event_loss_rate=event_loss_rate,
+        )
+
+    @classmethod
+    def _create_from_validated_samples(
+        cls,
+        *,
+        sequence: int,
+        window_start_ns: int,
+        window_end_ns: int,
+        cluster_id: str,
+        samples: Iterable[RawBurstSample],
+        event_source_fingerprint: str,
+        burst_config_fingerprint: str,
+        event_loss_rate: float,
+    ) -> "RawBurstWindow":
+        values = tuple(sorted(
+            samples,
+            key=lambda item: (
+                item.entity_type,
+                item.entity_id,
+                item.channel_id,
+                item.source_record_id,
+            ),
+        ))
+        if any(not isinstance(item, RawBurstSample) for item in values):
+            raise RawCollectionError(
+                "raw Burst window samples must be RawBurstSample records"
+            )
         payload = {
             "schema_version": BURST_WINDOW_SCHEMA_VERSION,
             "sequence": sequence,
@@ -90,7 +133,17 @@ class RawBurstWindow:
             **{**payload, "samples": values},
             window_fingerprint=fingerprint(payload),
         )
-        result.validate()
+        result._validate_structure(validate_samples=False)
+        assert_label_safe({
+            "schema_version": result.schema_version,
+            "sequence": result.sequence,
+            "window_start_ns": result.window_start_ns,
+            "window_end_ns": result.window_end_ns,
+            "cluster_id": result.cluster_id,
+            "event_source_fingerprint": result.event_source_fingerprint,
+            "burst_config_fingerprint": result.burst_config_fingerprint,
+            "event_loss_rate": result.event_loss_rate,
+        })
         return result
 
     @classmethod
@@ -105,10 +158,11 @@ class RawBurstWindow:
             RawBurstSample.from_dict(item) for item in values["samples"]
         )
         result = cls(**values)
-        result.validate()
+        result._validate_structure(validate_samples=False)
+        result._validate_fingerprint()
         return result
 
-    def validate(self) -> None:
+    def _validate_structure(self, *, validate_samples: bool) -> None:
         if self.schema_version != BURST_WINDOW_SCHEMA_VERSION:
             raise RawCollectionError("unsupported raw Burst window schema")
         if (
@@ -127,7 +181,12 @@ class RawBurstWindow:
             raise RawCollectionError("raw Burst event_loss_rate is invalid")
         source_ids = []
         for sample in self.samples:
-            sample.validate()
+            if not isinstance(sample, RawBurstSample):
+                raise RawCollectionError(
+                    "raw Burst window contains a non-sample record"
+                )
+            if validate_samples:
+                sample.validate()
             if sample.cluster_id != self.cluster_id:
                 raise RawCollectionError("raw Burst sample cluster mismatch")
             if not (
@@ -139,16 +198,38 @@ class RawBurstWindow:
             source_ids.append(sample.source_record_id)
         if len(source_ids) != len(set(source_ids)):
             raise RawCollectionError("raw Burst window has duplicate sources")
+
+    def _validate_fingerprint(self) -> None:
         payload = self.to_dict()
         supplied = payload.pop("window_fingerprint")
         if supplied != fingerprint(payload):
             raise RawCollectionError("raw Burst window fingerprint mismatch")
-        assert_label_safe(payload)
+        assert_label_safe({
+            key: payload[key]
+            for key in (
+                "schema_version", "sequence", "window_start_ns",
+                "window_end_ns", "cluster_id", "event_source_fingerprint",
+                "burst_config_fingerprint", "event_loss_rate",
+            )
+        })
+
+    def validate(self) -> None:
+        self._validate_structure(validate_samples=True)
+        self._validate_fingerprint()
 
     def to_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
-        payload["samples"] = [item.to_dict() for item in self.samples]
-        return payload
+        return {
+            "schema_version": self.schema_version,
+            "sequence": self.sequence,
+            "window_start_ns": self.window_start_ns,
+            "window_end_ns": self.window_end_ns,
+            "cluster_id": self.cluster_id,
+            "samples": [item.to_dict() for item in self.samples],
+            "event_source_fingerprint": self.event_source_fingerprint,
+            "burst_config_fingerprint": self.burst_config_fingerprint,
+            "event_loss_rate": self.event_loss_rate,
+            "window_fingerprint": self.window_fingerprint,
+        }
 
 
 @dataclass(frozen=True)

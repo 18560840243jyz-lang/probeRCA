@@ -285,6 +285,89 @@ def test_live_burst_maps_all_29_frozen_channels(
     assert samples["dns.query_latency_p95"].value == 700
 
 
+def test_continuous_counters_use_exact_captured_window_boundaries(
+    tmp_path, monkeypatch,
+):
+    cgroup = _filesystem(tmp_path)
+    records = [
+        {
+            "record_type": "control",
+            "schema_version": 1,
+            "state": "ready",
+            "timestamp_ns": START - 1,
+            "program_count": 31,
+            "timeout_ms": 5000,
+            "sampling_profile": "low",
+        },
+        {
+            "record_type": "checkpoint",
+            "schema_version": 1,
+            "timestamp_ns": START,
+            "monotonic_ns": 0,
+            "emitted": 0,
+            "reserve_failed": 0,
+            "program_count": 31,
+            "sampling_profile": "low",
+        },
+        {
+            "record_type": "checkpoint",
+            "schema_version": 1,
+            "timestamp_ns": END,
+            "monotonic_ns": 1_000_000_000,
+            "emitted": 0,
+            "reserve_failed": 0,
+            "program_count": 31,
+            "sampling_profile": "low",
+        },
+    ]
+    Path(_config(tmp_path).event_log_path).write_text(
+        "".join(json.dumps(item) + "\n" for item in records),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "proberca.dataplane.burst_live.runtime_identities",
+        lambda revision: (_identity(),),
+    )
+    source = FinalLiveBurstSource(
+        _config(tmp_path),
+        burst_config_fingerprint=fingerprint({"burst": "contract"}),
+    )
+    source.begin_capture()
+    source.capture_boundary(START, _inventory())
+
+    (cgroup / "memory.stat").write_text(
+        "pgfault 15\npgmajfault 4\n", encoding="utf-8"
+    )
+    statistics = tmp_path / "net" / "eth0" / "statistics"
+    for name, value in {
+        "rx_packets": 110,
+        "tx_packets": 205,
+        "rx_dropped": 2,
+    }.items():
+        (statistics / name).write_text(str(value), encoding="ascii")
+    source.capture_boundary(END, _inventory())
+
+    window = source.collect_window(
+        sequence=1,
+        window_start_ns=START,
+        window_end_ns=END,
+        inventory_revision=_inventory(),
+        normal_raw_window=_normal_raw_window(),
+    )
+    samples = {
+        (sample.entity_type, sample.channel_id): sample
+        for sample in window.samples
+    }
+    memory = samples[
+        ("service", "memory.major_page_fault_rate")
+    ]
+    assert memory.value == 2
+    assert memory.exposure == 5
+    nic = samples[("host", "nic.queue_drop_rate")]
+    assert nic.value == 2
+    assert nic.exposure == 15
+
+
 def test_tcp_kernel_reverse_events_use_frozen_call_direction(
     tmp_path, monkeypatch,
 ):

@@ -841,8 +841,12 @@ def test_prometheus_source_preserves_raw_boundary_series_identity():
             }
 
     class Session:
+        def __init__(self):
+            self.timestamps = []
+
         def get(self, _url, *, params, timeout):
             assert timeout == 1.0
+            self.timestamps.append(float(params["time"]))
             return Response(float(params["time"]))
 
     class Revision(SimpleNamespace):
@@ -868,17 +872,22 @@ def test_prometheus_source_preserves_raw_boundary_series_identity():
         },
         service_uid_by_name={(NAMESPACE, "frontend"): "service-frontend"},
     )
-    samples = PrometheusPrimitiveSource(
-        config, session=Session()
-    ).collect(
-        window_start_ns=START,
-        window_end_ns=END,
+    session = Session()
+    windows = PrometheusPrimitiveSource(
+        config, session=session,
+    ).collect_windows(
+        bounds=((START, END), (END, END + (END - START))),
         inventory_revision=revision,
     )
+    samples = windows[0]
     assert len(samples) == 2
     assert {item.timestamp_ns for item in samples} == {START, END}
     assert len({item.series_id for item in samples}) == 1
     assert len({item.source_record_id for item in samples}) == 2
+    assert len(windows[1]) == 2
+    assert sorted(session.timestamps) == [1.0, 2.0, 3.0]
+    assert windows[0][-1].source_record_id \
+        == windows[1][0].source_record_id
 
 
 def test_dataplane_does_not_import_control_or_algorithm_modules():

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 from proberca.data.schema import (
@@ -191,7 +191,23 @@ class CollectedWindow:
             "collection_metadata": metadata,
         }
         assert_label_safe(payload)
-        return cls._from_payload(payload | {"window_fingerprint": fingerprint(payload)})
+        result = cls(
+            schema_version=payload["schema_version"],
+            sequence=sequence,
+            window_start_ns=window_start_ns,
+            window_end_ns=window_end_ns,
+            cluster_id=payload["cluster_id"],
+            node_metrics=nodes,
+            edge_metrics=edges,
+            topology_events=topology,
+            burst_evidence=evidence,
+            source_record_ids=sources,
+            residual_source_record_ids=residual_sources,
+            collection_metadata=metadata,
+            window_fingerprint=fingerprint(payload),
+        )
+        result._validate_structure()
+        return result
 
     @classmethod
     def _from_payload(cls, payload: dict[str, Any]) -> "CollectedWindow":
@@ -230,7 +246,7 @@ class CollectedWindow:
     def from_dict(cls, payload: dict[str, Any]) -> "CollectedWindow":
         return cls._from_payload(dict(payload))
 
-    def validate(self) -> None:
+    def _validate_structure(self) -> None:
         if self.schema_version != "probeRCA-dataplane-window-v2":
             raise ValueError("unsupported CollectedWindow schema_version")
         if isinstance(self.sequence, bool) or not isinstance(self.sequence, int) \
@@ -288,20 +304,38 @@ class CollectedWindow:
                     "Burst evidence source overlaps residual metric source: "
                     + ",".join(sorted(overlap))
                 )
+    def validate(self) -> None:
+        self._validate_structure()
         payload = self.to_dict()
         supplied = payload.pop("window_fingerprint")
         if supplied != fingerprint(payload):
             raise ValueError("CollectedWindow fingerprint mismatch")
 
     def to_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
-        payload["node_metrics"] = [item.to_dict() for item in self.node_metrics]
-        payload["edge_metrics"] = [item.to_dict() for item in self.edge_metrics]
-        payload["topology_events"] = [item.to_dict() for item in self.topology_events]
-        payload["burst_evidence"] = [item.to_dict() for item in self.burst_evidence]
-        payload["source_record_ids"] = list(self.source_record_ids)
-        payload["residual_source_record_ids"] = list(
-            self.residual_source_record_ids
-        )
+        payload = {
+            "schema_version": self.schema_version,
+            "sequence": self.sequence,
+            "window_start_ns": self.window_start_ns,
+            "window_end_ns": self.window_end_ns,
+            "cluster_id": self.cluster_id,
+            "node_metrics": [
+                item.to_dict() for item in self.node_metrics
+            ],
+            "edge_metrics": [
+                item.to_dict() for item in self.edge_metrics
+            ],
+            "topology_events": [
+                item.to_dict() for item in self.topology_events
+            ],
+            "burst_evidence": [
+                item.to_dict() for item in self.burst_evidence
+            ],
+            "source_record_ids": list(self.source_record_ids),
+            "residual_source_record_ids": list(
+                self.residual_source_record_ids
+            ),
+            "collection_metadata": dict(self.collection_metadata),
+            "window_fingerprint": self.window_fingerprint,
+        }
         assert_label_safe(payload)
         return payload

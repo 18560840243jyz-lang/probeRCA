@@ -220,6 +220,11 @@ class FinalLiveBurstSource:
         self._nic_state: tuple[int, int, int] | None = None
         self._cgroup_paths: dict[str, Path] = {}
         self._ambiguous_cgroups: set[str] = set()
+        self._boundary_capture_enabled = False
+        self._boundary_memory: dict[
+            int, dict[int, tuple[int, int, int]]
+        ] = {}
+        self._boundary_nic: dict[int, tuple[int, int, int]] = {}
 
     @property
     def source_record_ids(self) -> tuple[str, ...]:
@@ -227,7 +232,117 @@ class FinalLiveBurstSource:
 
     def begin_capture(self) -> None:
         """Fix the log offset before a contiguous collection interval."""
+        self._boundary_capture_enabled = True
+        self._boundary_memory = {}
+        self._boundary_nic = {}
         self._read_log()
+
+    def _runtime_counter_paths(self, revision) -> dict[int, Path]:
+        identities = tuple(runtime_identities(revision))
+        needs_refresh = False
+        container_ids = []
+        for identity in identities:
+            if (
+                not identity.ready
+                or not identity.started
+                or not identity.full_container_id
+                or not identity.service_ids
+            ):
+                continue
+            container_id = identity.full_container_id.rsplit(
+                "://", 1
+            )[-1]
+            if (
+                len(container_id) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in container_id.lower()
+                )
+            ):
+                raise RawCollectionError(
+                    "Burst runtime container identity is invalid"
+                )
+            container_ids.append(container_id)
+            if self._cgroup_paths.get(container_id) is None:
+                needs_refresh = True
+        if needs_refresh:
+            self._refresh_cgroup_paths(Path(self.config.cgroup_root))
+        output = {}
+        for container_id in container_ids:
+            path = self._cgroup_paths.get(container_id)
+            if (
+                container_id in self._ambiguous_cgroups
+                or path is None
+                or not path.is_dir()
+            ):
+                continue
+            cgroup_id = path.stat().st_ino
+            previous = output.setdefault(cgroup_id, path)
+            if previous != path:
+                raise RawCollectionError(
+                    "Burst cgroup identity is duplicated"
+                )
+        return output
+
+    @staticmethod
+    def _memory_totals(path: Path) -> tuple[int, int, int]:
+        return (
+            _read_counter(path / "memory.stat", "pgfault"),
+            _read_counter(path / "memory.stat", "pgmajfault"),
+            _read_counter(path / "memory.events", "oom_kill"),
+        )
+
+    def _nic_totals(self) -> tuple[int, int, int]:
+        packets = drops = errors = 0
+        root = Path(self.config.network_class_path)
+        for interface in root.iterdir():
+            if interface.name == "lo":
+                continue
+            statistics = interface / "statistics"
+            packets += sum(
+                int((statistics / name).read_text(encoding="ascii"))
+                for name in ("rx_packets", "tx_packets")
+            )
+            drops += sum(
+                int((statistics / name).read_text(encoding="ascii"))
+                for name in ("rx_dropped", "tx_dropped")
+            )
+            errors += sum(
+                int((statistics / name).read_text(encoding="ascii"))
+                for name in ("rx_errors", "tx_errors")
+            )
+        return packets, drops, errors
+
+    def capture_boundary(self, timestamp_ns: int, revision) -> None:
+        """Snapshot raw cumulative counters at an exact window boundary."""
+        if not self._boundary_capture_enabled:
+            raise RawCollectionError(
+                "Burst boundary capture was not initialized"
+            )
+        if (
+            isinstance(timestamp_ns, bool)
+            or not isinstance(timestamp_ns, int)
+            or timestamp_ns <= 0
+        ):
+            raise RawCollectionError(
+                "Burst boundary timestamp must be positive"
+            )
+        if timestamp_ns in self._boundary_memory:
+            raise RawCollectionError(
+                "Burst boundary timestamp was captured twice"
+            )
+        if self._boundary_memory \
+                and timestamp_ns <= max(self._boundary_memory):
+            raise RawCollectionError(
+                "Burst boundaries must be captured in order"
+            )
+        self._read_log()
+        paths = self._runtime_counter_paths(revision)
+        self._boundary_memory[timestamp_ns] = {
+            cgroup_id: self._memory_totals(path)
+            for cgroup_id, path in paths.items()
+        }
+        self._boundary_nic[timestamp_ns] = self._nic_totals()
 
     def _refresh_cgroup_paths(self, root: Path) -> None:
         prefix = "cri-containerd-"
@@ -459,25 +574,7 @@ class FinalLiveBurstSource:
         return output
 
     def _nic_delta(self) -> tuple[int, int, int]:
-        packets = drops = errors = 0
-        root = Path(self.config.network_class_path)
-        for interface in root.iterdir():
-            if interface.name == "lo":
-                continue
-            statistics = interface / "statistics"
-            packets += sum(
-                int((statistics / name).read_text(encoding="ascii"))
-                for name in ("rx_packets", "tx_packets")
-            )
-            drops += sum(
-                int((statistics / name).read_text(encoding="ascii"))
-                for name in ("rx_dropped", "tx_dropped")
-            )
-            errors += sum(
-                int((statistics / name).read_text(encoding="ascii"))
-                for name in ("rx_errors", "tx_errors")
-            )
-        current = (packets, drops, errors)
+        current = self._nic_totals()
         previous = self._nic_state
         self._nic_state = current
         if previous is None:
@@ -485,6 +582,46 @@ class FinalLiveBurstSource:
         if any(now < old for now, old in zip(current, previous)):
             raise RawCollectionError("Burst NIC counter decreased")
         return tuple(now - old for now, old in zip(current, previous))
+
+    def _captured_memory_deltas(
+        self, start_ns: int, end_ns: int, cgroups,
+    ) -> dict[int, tuple[int, int]]:
+        before = self._boundary_memory.get(start_ns)
+        after = self._boundary_memory.get(end_ns)
+        if before is None or after is None:
+            raise RawCollectionError(
+                "Burst window lacks exact memory boundary snapshots"
+            )
+        output = {}
+        for cgroup_id in cgroups:
+            left = before.get(cgroup_id)
+            right = after.get(cgroup_id)
+            if left is None or right is None:
+                raise RawCollectionError(
+                    "Burst cgroup changed inside a captured window"
+                )
+            if any(now < old for now, old in zip(right, left)):
+                raise RawCollectionError(
+                    "Burst memory counter decreased"
+                )
+            output[cgroup_id] = (
+                right[1] - left[1],
+                right[0] - left[0],
+            )
+        return output
+
+    def _captured_nic_delta(
+        self, start_ns: int, end_ns: int,
+    ) -> tuple[int, int, int]:
+        before = self._boundary_nic.get(start_ns)
+        after = self._boundary_nic.get(end_ns)
+        if before is None or after is None:
+            raise RawCollectionError(
+                "Burst window lacks exact NIC boundary snapshots"
+            )
+        if any(now < old for now, old in zip(after, before)):
+            raise RawCollectionError("Burst NIC counter decreased")
+        return tuple(now - old for now, old in zip(after, before))
 
     def _sample(
         self,
@@ -754,8 +891,24 @@ class FinalLiveBurstSource:
                 elif event_type == EVENT_DNS_TIMEOUT:
                     dns[entity]["timeout"].append(1)
                 continue
-        memory = self._memory_deltas(cgroups)
-        packet_delta, sysfs_drop_delta, sysfs_error_delta = self._nic_delta()
+        if self._boundary_capture_enabled:
+            memory = self._captured_memory_deltas(
+                window_start_ns, window_end_ns, cgroups,
+            )
+            (
+                packet_delta,
+                sysfs_drop_delta,
+                sysfs_error_delta,
+            ) = self._captured_nic_delta(
+                window_start_ns, window_end_ns,
+            )
+        else:
+            memory = self._memory_deltas(cgroups)
+            (
+                packet_delta,
+                sysfs_drop_delta,
+                sysfs_error_delta,
+            ) = self._nic_delta()
         by_host["nic_drop"].extend([1] * sysfs_drop_delta)
         by_host["nic_error"].extend([1] * sysfs_error_delta)
         samples = []
@@ -967,7 +1120,7 @@ class FinalLiveBurstSource:
                 "dns.rcode_failure_rate", len(values["rcode"]),
                 exposure, dns_mapping,
             )
-        return RawBurstWindow.create(
+        return RawBurstWindow._create_from_validated_samples(
             sequence=sequence,
             window_start_ns=window_start_ns,
             window_end_ns=window_end_ns,
