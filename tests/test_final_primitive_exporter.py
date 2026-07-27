@@ -267,6 +267,142 @@ def test_service_series_persist_only_for_the_active_container():
     ) == ()
 
 
+def test_dynamic_service_series_merge_into_one_stable_counter():
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter._service_sample_high_water = {}
+    inventory = SimpleNamespace(containers=(
+        SimpleNamespace(
+            namespace="online-boutique",
+            pod="shipping-pod",
+            container="server",
+        ),
+    ))
+    common = {
+        "namespace": "online-boutique",
+        "pod": "shipping-pod",
+        "container": "server",
+    }
+
+    first_raw = PrometheusSample.create(
+        "proberca_service_request_total",
+        {**common, "source_series": "status-200"},
+        10,
+    )
+    first = exporter._stable_request_samples(
+        exporter._persistent_service_samples((first_raw,), inventory),
+        edge=False,
+    )
+
+    second_raw = (
+        PrometheusSample.create(
+            "proberca_service_request_total",
+            {**common, "source_series": "status-200"},
+            11,
+        ),
+        PrometheusSample.create(
+            "proberca_service_request_total",
+            {**common, "source_series": "status-500"},
+            2,
+        ),
+    )
+    second = exporter._stable_request_samples(
+        exporter._persistent_service_samples(second_raw, inventory),
+        edge=False,
+    )
+
+    assert len(first) == len(second) == 1
+    assert first[0].value == 10
+    assert second[0].value == 13
+    assert first[0].labels == second[0].labels
+    assert first[0].label_dict["source_series"] not in {
+        "status-200", "status-500",
+    }
+
+
+def test_dynamic_edge_series_merge_into_one_stable_counter():
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter._edge_sample_high_water = {}
+    common = {
+        "namespace": "online-boutique",
+        "dst_namespace": "online-boutique",
+        "src_service": "checkoutservice",
+        "dst_service": "paymentservice",
+        "protocol": "tcp",
+    }
+
+    first_raw = PrometheusSample.create(
+        "proberca_tcp_edge_request_total",
+        {**common, "source_series": "route-a"},
+        20,
+    )
+    first = exporter._stable_request_samples(
+        exporter._persistent_edge_samples((first_raw,)),
+        edge=True,
+    )
+
+    second_raw = (
+        PrometheusSample.create(
+            "proberca_tcp_edge_request_total",
+            {**common, "source_series": "route-a"},
+            21,
+        ),
+        PrometheusSample.create(
+            "proberca_tcp_edge_request_total",
+            {**common, "source_series": "route-b"},
+            3,
+        ),
+    )
+    second = exporter._stable_request_samples(
+        exporter._persistent_edge_samples(second_raw),
+        edge=True,
+    )
+
+    assert len(first) == len(second) == 1
+    assert first[0].value == 20
+    assert second[0].value == 24
+    assert first[0].labels == second[0].labels
+
+
+def test_stable_request_aggregation_keeps_histogram_buckets_separate():
+    common = {
+        "namespace": "online-boutique",
+        "pod": "shipping-pod",
+        "container": "server",
+    }
+    samples = (
+        PrometheusSample.create(
+            "proberca_service_request_latency_milliseconds_bucket",
+            {**common, "source_series": "a", "le": "10"},
+            7,
+        ),
+        PrometheusSample.create(
+            "proberca_service_request_latency_milliseconds_bucket",
+            {**common, "source_series": "b", "le": "10"},
+            5,
+        ),
+        PrometheusSample.create(
+            "proberca_service_request_latency_milliseconds_bucket",
+            {**common, "source_series": "a", "le": "+Inf"},
+            8,
+        ),
+        PrometheusSample.create(
+            "proberca_service_request_latency_milliseconds_bucket",
+            {**common, "source_series": "b", "le": "+Inf"},
+            6,
+        ),
+    )
+    stable = FinalPrimitiveExporter._stable_request_samples(
+        samples, edge=False,
+    )
+    by_boundary = {
+        item.label_dict["le"]: item.value for item in stable
+    }
+    assert by_boundary == {"10": 12, "+Inf": 14}
+    assert len({
+        item.label_dict["source_series"] for item in stable
+    }) == 1
+
+
 def test_qdisc_drop_counter_survives_qdisc_removal_and_recreation(
     monkeypatch,
 ):

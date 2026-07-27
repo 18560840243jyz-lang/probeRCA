@@ -1231,6 +1231,46 @@ class FinalPrimitiveExporter:
             for key in sorted(self._service_sample_high_water)
         )
 
+    @staticmethod
+    def _stable_request_samples(
+        samples: tuple[PrometheusSample, ...],
+        *,
+        edge: bool,
+    ) -> tuple[PrometheusSample, ...]:
+        coordinate_names = (
+            (
+                "namespace", "dst_namespace", "src_service",
+                "dst_service", "protocol",
+            )
+            if edge else ("namespace", "pod", "container")
+        )
+        totals: dict[
+            tuple[str, tuple[tuple[str, str], ...]], float
+        ] = {}
+        for sample in samples:
+            labels = sample.label_dict
+            coordinates = {
+                name: labels.get(name, "")
+                for name in coordinate_names
+            }
+            if any(not value for value in coordinates.values()):
+                raise RawCollectionError(
+                    "persistent request sample lacks stable coordinates"
+                )
+            labels["source_series"] = _series_hash(
+                "edge-aggregate" if edge else "service-aggregate",
+                tuple(sorted(coordinates.items())),
+            )
+            identity = (
+                sample.name,
+                tuple(sorted(labels.items())),
+            )
+            totals[identity] = totals.get(identity, 0.0) + sample.value
+        return tuple(
+            PrometheusSample.create(name, dict(labels), value)
+            for (name, labels), value in sorted(totals.items())
+        )
+
     def _coredns_request_samples(
         self,
         inventory: Inventory,
@@ -1593,11 +1633,17 @@ class FinalPrimitiveExporter:
         service_samples.extend(
             self._coredns_request_samples(inventory, coredns)
         )
-        service_samples = list(self._persistent_service_samples(
-            tuple(service_samples), inventory
+        service_samples = list(self._stable_request_samples(
+            self._persistent_service_samples(
+                tuple(service_samples), inventory
+            ),
+            edge=False,
         ))
-        edge_samples = self._persistent_edge_samples(
-            self._render_request_rows(edge_rows, edge=True)
+        edge_samples = self._stable_request_samples(
+            self._persistent_edge_samples(
+                self._render_request_rows(edge_rows, edge=True)
+            ),
+            edge=True,
         )
         covered_services = {
             (item.label_dict["namespace"],
