@@ -546,7 +546,10 @@ def test_single_vm_scope_freezes_v2_collection_runtime():
         "configs/final_single_vm_scope.yaml"
     ).read_text(encoding="utf-8"))
     assert scope["status"] == "frozen_before_healthy_pilot"
-    assert scope["load_profile"] == "single-vm-healthy-v2"
+    assert scope["load_profile"] == "single-vm-healthy-v3"
+    assert scope["checkout_interval_pattern_seconds"] == [
+        0.07, 0.08, 0.09, 0.075, 0.085,
+    ]
     assert scope["primitive_exporter_schema"] == (
         FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION
     )
@@ -622,7 +625,7 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
     assert config_map["metadata"]["namespace"] == "online-boutique"
     assert deployment["metadata"]["annotations"][
         "proberca.io/load-profile"
-    ] == "single-vm-healthy-v2"
+    ] == "single-vm-healthy-v3"
     containers = {
         item["name"]: item
         for item in deployment["spec"]["template"]["spec"]["containers"]
@@ -641,7 +644,7 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
         "TARGET_URL": (
             "http://frontend"
         ),
-        "INTERVAL_PATTERN_SECONDS": "0.14,0.16,0.18,0.15,0.17",
+        "INTERVAL_PATTERN_SECONDS": "0.07,0.08,0.09,0.075,0.085",
         "PHASE_SECONDS": "20",
     }
     driver = config_map["data"]["checkout_driver.py"]

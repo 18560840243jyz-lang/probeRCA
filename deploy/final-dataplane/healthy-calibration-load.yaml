@@ -84,7 +84,7 @@ metadata:
     app.kubernetes.io/name: proberca-healthy-checkout-load
     app.kubernetes.io/part-of: proberca-final-dataplane
   annotations:
-    proberca.io/load-profile: single-vm-healthy-v2
+    proberca.io/load-profile: single-vm-healthy-v3
 spec:
   replicas: 1
   selector:
@@ -96,7 +96,7 @@ spec:
         app.kubernetes.io/name: proberca-healthy-checkout-load
         app.kubernetes.io/part-of: proberca-final-dataplane
       annotations:
-        proberca.io/load-profile: single-vm-healthy-v2
+        proberca.io/load-profile: single-vm-healthy-v3
     spec:
       containers:
         - name: checkout-load
@@ -109,7 +109,7 @@ spec:
             - name: TARGET_URL
               value: http://frontend
             - name: INTERVAL_PATTERN_SECONDS
-              value: "0.14,0.16,0.18,0.15,0.17"
+              value: "0.07,0.08,0.09,0.075,0.085"
             - name: PHASE_SECONDS
               value: "20"
           resources:
