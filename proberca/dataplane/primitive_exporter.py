@@ -418,7 +418,13 @@ class FinalPrimitiveExporter:
         self._edge_sample_high_water: dict[
             tuple[str, tuple[tuple[str, str], ...]], PrometheusSample
         ] = {}
+        self._edge_sample_raw: dict[
+            tuple[str, tuple[tuple[str, str], ...]], PrometheusSample
+        ] = {}
         self._service_sample_high_water: dict[
+            tuple[str, tuple[tuple[str, str], ...]], PrometheusSample
+        ] = {}
+        self._service_sample_raw: dict[
             tuple[str, tuple[tuple[str, str], ...]], PrometheusSample
         ] = {}
         self._qdisc_drop_state: dict[str, tuple[float, float]] = {}
@@ -1147,6 +1153,10 @@ class FinalPrimitiveExporter:
     def _persistent_edge_samples(
         self, samples: tuple[PrometheusSample, ...],
     ) -> tuple[PrometheusSample, ...]:
+        raw_samples = getattr(self, "_edge_sample_raw", None)
+        if raw_samples is None:
+            raw_samples = {}
+            self._edge_sample_raw = raw_samples
         present = {sample.identity for sample in samples}
         for sample in samples:
             if not sample.name.startswith("proberca_tcp_edge_"):
@@ -1154,16 +1164,29 @@ class FinalPrimitiveExporter:
                     "edge persistence received a non-edge metric"
                 )
             previous = self._edge_sample_high_water.get(sample.identity)
-            value = (
-                sample.value
-                if previous is None
-                else max(previous.value, sample.value)
-            )
+            previous_raw = raw_samples.get(sample.identity)
+            if previous is None or previous_raw is None:
+                value = sample.value
+            elif sample.value >= previous_raw.value:
+                value = (
+                    previous.value
+                    + sample.value
+                    - previous_raw.value
+                )
+            else:
+                # Beyla retires inactive series after its frozen TTL.  When
+                # the same semantic series reappears, its Prometheus counter
+                # starts again from zero.  Preserve every post-reset event by
+                # rebasing the new raw counter onto the logical cumulative
+                # total; max(old, new) would silently discard those events and
+                # can make cumulative histogram bucket deltas non-monotonic.
+                value = previous.value + sample.value
             self._edge_sample_high_water[sample.identity] = (
                 PrometheusSample(
                     sample.name, sample.labels, value
                 )
             )
+            raw_samples[sample.identity] = sample
         output = []
         for key in sorted(self._edge_sample_high_water):
             sample = self._edge_sample_high_water[key]
@@ -1181,6 +1204,10 @@ class FinalPrimitiveExporter:
         samples: tuple[PrometheusSample, ...],
         inventory: Inventory,
     ) -> tuple[PrometheusSample, ...]:
+        raw_samples = getattr(self, "_service_sample_raw", None)
+        if raw_samples is None:
+            raw_samples = {}
+            self._service_sample_raw = raw_samples
         active = {
             (item.namespace, item.pod, item.container)
             for item in inventory.containers
@@ -1196,6 +1223,7 @@ class FinalPrimitiveExporter:
             )
             if coordinates not in active:
                 del self._service_sample_high_water[key]
+                raw_samples.pop(key, None)
         present: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
         for sample in samples:
             if not sample.name.startswith("proberca_service_"):
@@ -1216,14 +1244,21 @@ class FinalPrimitiveExporter:
                 continue
             present.add(sample.identity)
             previous = self._service_sample_high_water.get(sample.identity)
-            value = (
-                sample.value
-                if previous is None
-                else max(previous.value, sample.value)
-            )
+            previous_raw = raw_samples.get(sample.identity)
+            if previous is None or previous_raw is None:
+                value = sample.value
+            elif sample.value >= previous_raw.value:
+                value = (
+                    previous.value
+                    + sample.value
+                    - previous_raw.value
+                )
+            else:
+                value = previous.value + sample.value
             self._service_sample_high_water[sample.identity] = (
                 PrometheusSample(sample.name, sample.labels, value)
             )
+            raw_samples[sample.identity] = sample
         output = []
         for key in sorted(self._service_sample_high_water):
             sample = self._service_sample_high_water[key]

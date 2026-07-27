@@ -203,9 +203,10 @@ def test_dns_query_counter_is_completed_responses_plus_timeouts():
     ] == 6
 
 
-def test_directed_edge_series_persist_at_their_high_water_mark():
+def test_directed_edge_series_rebase_after_counter_reset():
     exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
     exporter._edge_sample_high_water = {}
+    exporter._edge_sample_raw = {}
     labels = {
         "namespace": "online-boutique",
         "dst_namespace": "online-boutique",
@@ -226,16 +227,71 @@ def test_directed_edge_series_persist_at_their_high_water_mark():
     reset = PrometheusSample.create(
         "proberca_tcp_edge_request_total", labels, 2
     )
-    assert exporter._persistent_edge_samples((reset,))[0].value == 10
+    assert exporter._persistent_edge_samples((reset,))[0].value == 12
     advanced = PrometheusSample.create(
         "proberca_tcp_edge_request_total", labels, 12
     )
-    assert exporter._persistent_edge_samples((advanced,))[0].value == 12
+    assert exporter._persistent_edge_samples((advanced,))[0].value == 22
+
+
+def test_histogram_buckets_remain_cumulative_across_series_reset():
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter._edge_sample_high_water = {}
+    exporter._edge_sample_raw = {}
+    common = {
+        "namespace": "online-boutique",
+        "dst_namespace": "online-boutique",
+        "src_service": "checkoutservice",
+        "dst_service": "paymentservice",
+        "protocol": "tcp",
+        "source_series": "series-a",
+    }
+
+    def histogram(values):
+        return tuple(
+            PrometheusSample.create(
+                "proberca_tcp_edge_latency_milliseconds_bucket",
+                {**common, "le": bound},
+                value,
+            )
+            for bound, value in zip(("1", "10", "+Inf"), values)
+        )
+
+    first = exporter._persistent_edge_samples(
+        histogram((2, 7, 10))
+    )
+    reset = exporter._persistent_edge_samples(
+        histogram((1, 2, 3))
+    )
+    advanced = exporter._persistent_edge_samples(
+        histogram((2, 4, 6))
+    )
+
+    def by_bound(samples):
+        return {
+            item.label_dict["le"]: item.value
+            for item in samples
+        }
+
+    assert by_bound(first) == {"1": 2, "10": 7, "+Inf": 10}
+    assert by_bound(reset) == {"1": 3, "10": 9, "+Inf": 13}
+    assert by_bound(advanced) == {"1": 4, "10": 11, "+Inf": 16}
+    reset_values = by_bound(reset)
+    assert [
+        reset_values["1"], reset_values["10"], reset_values["+Inf"],
+    ] == sorted(reset_values.values())
+    reset_values = by_bound(reset)
+    advanced_values = by_bound(advanced)
+    assert [
+        advanced_values[bound] - reset_values[bound]
+        for bound in ("1", "10", "+Inf")
+    ] == [1, 2, 3]
 
 
 def test_service_series_persist_only_for_the_active_container():
     exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
     exporter._service_sample_high_water = {}
+    exporter._service_sample_raw = {}
     inventory = SimpleNamespace(containers=(
         SimpleNamespace(
             namespace="online-boutique",
@@ -267,7 +323,7 @@ def test_service_series_persist_only_for_the_active_container():
     )
     assert exporter._persistent_service_samples(
         (reset,), inventory
-    )[0].value == 10
+    )[0].value == 12
     assert exporter._persistent_service_samples(
         (), SimpleNamespace(containers=())
     ) == ()
@@ -369,6 +425,7 @@ def test_dynamic_service_series_merge_into_one_stable_counter():
 def test_dynamic_edge_series_merge_into_one_stable_counter():
     exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
     exporter._edge_sample_high_water = {}
+    exporter._edge_sample_raw = {}
     common = {
         "namespace": "online-boutique",
         "dst_namespace": "online-boutique",
