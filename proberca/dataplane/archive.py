@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import time
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -406,17 +407,9 @@ def _topology_endpoint(snapshot, explicit_namespace: str | None, service: str) -
     return f"{snapshot.cluster_id}::{matches[0]}"
 
 
-def _validate_topology_coverage(window: CollectedWindow, snapshots: list) -> None:
-    active = [
-        item for item in snapshots
-        if item.valid_from_ns <= window.window_start_ns
-        and window.window_end_ns <= item.valid_to_ns
-    ]
-    if len(active) != 1:
-        raise CollectionArchiveError(
-            f"window {window.sequence} has {len(active)} active topology snapshots"
-        )
-    snapshot = active[0]
+def _validate_topology_snapshot_coverage(
+    window: CollectedWindow, snapshot,
+) -> None:
     expected_services = {
         f"{snapshot.cluster_id}::{item}" for item in snapshot.services
     }
@@ -468,40 +461,123 @@ def _validate_topology_coverage(window: CollectedWindow, snapshots: list) -> Non
             )
 
 
-def _validate_topology_versions(snapshots: list) -> None:
-    for snapshot in snapshots:
-        _require_sha256("topology snapshot_id", snapshot.snapshot_id)
-        _require_sha256(
-            "topology structure_fingerprint", snapshot.structure_fingerprint,
+def _validate_topology_snapshot(snapshot) -> None:
+    _require_sha256("topology snapshot_id", snapshot.snapshot_id)
+    _require_sha256(
+        "topology structure_fingerprint", snapshot.structure_fingerprint,
+    )
+    expected_structure_fingerprint = fingerprint({
+        "cluster": snapshot.cluster_id,
+        "services": snapshot.services,
+        "calls": [item.to_dict() for item in snapshot.call_edges],
+        "hosts": [item.to_dict() for item in snapshot.host_edges],
+        "bindings": [item.to_dict() for item in snapshot.service_resources],
+    })
+    if snapshot.structure_fingerprint != expected_structure_fingerprint:
+        raise CollectionArchiveError(
+            "topology structure_fingerprint does not match its structure"
         )
-        expected_structure_fingerprint = fingerprint({
-            "cluster": snapshot.cluster_id,
-            "services": snapshot.services,
-            "calls": [item.to_dict() for item in snapshot.call_edges],
-            "hosts": [item.to_dict() for item in snapshot.host_edges],
-            "bindings": [item.to_dict() for item in snapshot.service_resources],
-        })
-        if snapshot.structure_fingerprint != expected_structure_fingerprint:
+    for name in ("inventory_revision_id", "call_edge_provider_fingerprint"):
+        value = getattr(snapshot, name)
+        if value is not None:
+            _require_sha256(f"topology {name}", value)
+    for key, value in snapshot.resource_version_vector.items():
+        _require_sha256(f"topology resource_version_vector.{key}", value)
+    if snapshot.topology_build_issues:
+        raise CollectionArchiveError(
+            "topology with unresolved build issues cannot be sealed"
+        )
+
+
+class _TopologyVersionTracker:
+    """Validate each topology version once and query coverage in O(log n)."""
+
+    def __init__(self) -> None:
+        self._starts: list[int] = []
+        self._snapshots: list[Any] = []
+        self._identities: set[str] = set()
+
+    def prepare(self, snapshots: Iterable) -> tuple:
+        additions = tuple(sorted(
+            snapshots,
+            key=lambda item: (item.valid_from_ns, item.valid_to_ns),
+        ))
+        identities = [item.snapshot_id for item in additions]
+        if (
+            len(identities) != len(set(identities))
+            or self._identities & set(identities)
+        ):
             raise CollectionArchiveError(
-                "topology structure_fingerprint does not match its structure"
+                "topology snapshot_id must identify one version"
             )
-        for name in ("inventory_revision_id", "call_edge_provider_fingerprint"):
-            value = getattr(snapshot, name)
-            if value is not None:
-                _require_sha256(f"topology {name}", value)
-        for key, value in snapshot.resource_version_vector.items():
-            _require_sha256(f"topology resource_version_vector.{key}", value)
-        if snapshot.topology_build_issues:
+        for snapshot in additions:
+            _validate_topology_snapshot(snapshot)
+        for previous, current in zip(additions, additions[1:]):
+            if current.valid_from_ns < previous.valid_to_ns:
+                raise CollectionArchiveError(
+                    "topology versions must not overlap"
+                )
+        for snapshot in additions:
+            position = bisect_left(
+                self._starts, snapshot.valid_from_ns,
+            )
+            if (
+                position
+                and snapshot.valid_from_ns
+                < self._snapshots[position - 1].valid_to_ns
+            ) or (
+                position < len(self._snapshots)
+                and self._snapshots[position].valid_from_ns
+                < snapshot.valid_to_ns
+            ):
+                raise CollectionArchiveError(
+                    "topology versions must not overlap"
+                )
+        return additions
+
+    def active_for(self, window: CollectedWindow, additions: tuple = ()):
+        active = [
+            item for item in additions
+            if item.valid_from_ns <= window.window_start_ns
+            and window.window_end_ns <= item.valid_to_ns
+        ]
+        position = bisect_right(
+            self._starts, window.window_start_ns,
+        ) - 1
+        if position >= 0:
+            candidate = self._snapshots[position]
+            if window.window_end_ns <= candidate.valid_to_ns:
+                active.append(candidate)
+        if len(active) != 1:
             raise CollectionArchiveError(
-                "topology with unresolved build issues cannot be sealed"
+                f"window {window.sequence} has {len(active)} "
+                "active topology snapshots"
             )
-    identities = [item.snapshot_id for item in snapshots]
-    if len(identities) != len(set(identities)):
-        raise CollectionArchiveError("topology snapshot_id must identify one version")
-    ordered = sorted(snapshots, key=lambda item: (item.valid_from_ns, item.valid_to_ns))
-    for previous, current in zip(ordered, ordered[1:]):
-        if current.valid_from_ns < previous.valid_to_ns:
-            raise CollectionArchiveError("topology versions must not overlap")
+        return active[0]
+
+    def commit(self, additions: tuple) -> None:
+        for snapshot in additions:
+            position = bisect_left(
+                self._starts, snapshot.valid_from_ns,
+            )
+            self._starts.insert(position, snapshot.valid_from_ns)
+            self._snapshots.insert(position, snapshot)
+            self._identities.add(snapshot.snapshot_id)
+
+
+def _validate_topology_versions(snapshots: list) -> None:
+    tracker = _TopologyVersionTracker()
+    additions = tracker.prepare(snapshots)
+    tracker.commit(additions)
+
+
+def _validate_topology_coverage(
+    window: CollectedWindow, snapshots: list,
+) -> None:
+    tracker = _TopologyVersionTracker()
+    additions = tracker.prepare(snapshots)
+    snapshot = tracker.active_for(window, additions)
+    _validate_topology_snapshot_coverage(window, snapshot)
 
 
 @dataclass(frozen=True)
@@ -593,7 +669,7 @@ class CollectionArchive:
         previous_sequence = 0
         previous_end = None
         count = 0
-        topology_snapshots = []
+        topology_tracker = _TopologyVersionTracker()
         normal_source_ids: set[str] = set()
         burst_source_ids: set[str] = set()
         with (self.root / self.windows_file).open("r", encoding="utf-8") as handle:
@@ -618,9 +694,16 @@ class CollectionArchive:
                         != self.window_sec * 1_000_000_000:
                     raise CollectionArchiveIntegrityError("window duration conflicts with archive")
                 _validate_window_contract(window, self.collection_contract)
-                topology_snapshots.extend(window.topology_events)
-                _validate_topology_versions(topology_snapshots)
-                _validate_topology_coverage(window, topology_snapshots)
+                additions = topology_tracker.prepare(
+                    window.topology_events
+                )
+                active_topology = topology_tracker.active_for(
+                    window, additions,
+                )
+                _validate_topology_snapshot_coverage(
+                    window, active_topology,
+                )
+                topology_tracker.commit(additions)
                 current_normal = {
                     *window.residual_source_record_ids,
                 }
@@ -663,7 +746,7 @@ class CollectionArchiveWriter:
         self.collection_metadata = dict(collection_metadata or {})
         self.clock_ns = clock_ns
         self._windows: list[CollectedWindow] = []
-        self._topology_snapshots = []
+        self._topology_tracker = _TopologyVersionTracker()
         self._normal_source_ids: set[str] = set()
         self._burst_source_ids: set[str] = set()
         self._sealed = False
@@ -693,9 +776,13 @@ class CollectionArchiveWriter:
             raise TypeError("data plane accepts only CollectedWindow")
         window.validate()
         _validate_window_contract(window, self.collection_contract)
-        topology_snapshots = [*self._topology_snapshots, *window.topology_events]
-        _validate_topology_versions(topology_snapshots)
-        _validate_topology_coverage(window, topology_snapshots)
+        topology_additions = self._topology_tracker.prepare(
+            window.topology_events
+        )
+        active_topology = self._topology_tracker.active_for(
+            window, topology_additions,
+        )
+        _validate_topology_snapshot_coverage(window, active_topology)
         current_normal = {
             *window.residual_source_record_ids,
         }
@@ -723,7 +810,7 @@ class CollectionArchiveWriter:
         elif window.sequence != 1:
             raise CollectionArchiveError("first data-plane sequence must be 1")
         self._windows.append(window)
-        self._topology_snapshots = topology_snapshots
+        self._topology_tracker.commit(topology_additions)
         self._normal_source_ids.update(current_normal)
         self._burst_source_ids.update(current_burst)
 

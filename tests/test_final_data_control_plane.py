@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+import proberca.dataplane.archive as archive_module
 
 from proberca.cli.analyze_collection import main as analyze_main
 from proberca.cli.seal_collection import main as seal_main
@@ -1112,6 +1113,36 @@ def test_topology_must_cover_the_entire_half_open_window(tmp_path):
     )
     with pytest.raises(CollectionArchiveError, match="active topology snapshots"):
         writer.append(window)
+
+
+def test_topology_validation_is_incremental_for_1100_window_versions(
+    monkeypatch,
+):
+    validated = 0
+    original = archive_module._validate_topology_snapshot
+
+    def counted(snapshot):
+        nonlocal validated
+        validated += 1
+        return original(snapshot)
+
+    monkeypatch.setattr(
+        archive_module, "_validate_topology_snapshot", counted,
+    )
+    tracker = archive_module._TopologyVersionTracker()
+    for sequence in range(1, 1101):
+        additions = tracker.prepare((
+            _per_window_topology(sequence),
+        ))
+        window = SimpleNamespace(
+            sequence=sequence,
+            window_start_ns=(sequence - 1) * _NS,
+            window_end_ns=sequence * _NS,
+        )
+        assert tracker.active_for(window, additions) is additions[0]
+        tracker.commit(additions)
+
+    assert validated == 1100
 
 
 def test_unique_window_snapshots_keep_one_topology_epoch_and_full_history(
