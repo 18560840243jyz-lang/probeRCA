@@ -38,50 +38,52 @@ prometheus:
     # cumulative buckets; rate() and histogram_quantile() are forbidden here.
     - query_id: service-request-total
       component: request_total
-      promql: 'proberca_service_request_total'
-      label_mapping: &service_labels
+      promql: 'proberca_service_request_total{source_coverage=~"0|1"}'
+      label_mapping: &service_request_labels
         namespace: namespace
         pod: pod
         container: container
         source_series: source_series
-      required_labels: &service_required [namespace, pod, container, source_series]
+        source_coverage: source_coverage
+      required_labels: &service_request_required [namespace, pod, container, source_series, source_coverage]
       optional_labels: &service_optional [job, instance]
-      series_labels: &service_series [namespace, pod, container, source_series]
+      series_labels: &service_request_series [namespace, pod, container, source_series]
       histogram_le_label: null
       value_scale: 1.0
       histogram_bound_scale: 1.0
     - query_id: service-request-error-total
       component: request_error_total
-      promql: 'proberca_service_request_error_total'
-      label_mapping: *service_labels
-      required_labels: *service_required
+      promql: 'proberca_service_request_error_total{source_coverage=~"0|1"}'
+      label_mapping: *service_request_labels
+      required_labels: *service_request_required
       optional_labels: *service_optional
-      series_labels: *service_series
+      series_labels: *service_request_series
       histogram_le_label: null
       value_scale: 1.0
       histogram_bound_scale: 1.0
     - query_id: service-request-timeout-total
       component: request_timeout_total
-      promql: 'proberca_service_request_timeout_total'
-      label_mapping: *service_labels
-      required_labels: *service_required
+      promql: 'proberca_service_request_timeout_total{source_coverage=~"0|1"}'
+      label_mapping: *service_request_labels
+      required_labels: *service_request_required
       optional_labels: *service_optional
-      series_labels: *service_series
+      series_labels: *service_request_series
       histogram_le_label: null
       value_scale: 1.0
       histogram_bound_scale: 1.0
     - query_id: service-request-latency-histogram
       component: request_latency_histogram
-      promql: 'proberca_service_request_latency_milliseconds_bucket'
+      promql: 'proberca_service_request_latency_milliseconds_bucket{source_coverage=~"0|1"}'
       label_mapping: &service_histogram_labels
         namespace: namespace
         pod: pod
         container: container
         source_series: source_series
+        source_coverage: source_coverage
         histogram_upper_bound: le
-      required_labels: &service_histogram_required [namespace, pod, container, source_series, le]
+      required_labels: &service_histogram_required [namespace, pod, container, source_series, source_coverage, le]
       optional_labels: *service_optional
-      series_labels: *service_series
+      series_labels: *service_request_series
       histogram_le_label: le
       value_scale: 1.0
       histogram_bound_scale: 1.0
@@ -90,10 +92,14 @@ prometheus:
     - query_id: service-cpu-time
       component: cpu_time_ns_total
       promql: 'proberca_container_cpu_time_nanoseconds_total'
-      label_mapping: *service_labels
-      required_labels: *service_required
+      label_mapping: &service_labels
+        namespace: namespace
+        pod: pod
+        container: container
+        source_series: source_series
+      required_labels: &service_required [namespace, pod, container, source_series]
       optional_labels: *service_optional
-      series_labels: *service_series
+      series_labels: &service_series [namespace, pod, container, source_series]
       histogram_le_label: null
       value_scale: 1.0
       histogram_bound_scale: 1.0
@@ -315,43 +321,44 @@ prometheus:
     # TCP service-pair primitives.
     - query_id: tcp-edge-request-total
       component: edge_request_total
-      promql: 'proberca_tcp_edge_request_total'
-      label_mapping: &edge_labels
+      promql: 'proberca_tcp_edge_request_total{source_coverage=~"0|1"}'
+      label_mapping: &tcp_edge_labels
         namespace: namespace
         src_service: src_service
         dst_namespace: dst_namespace
         dst_service: dst_service
         protocol: protocol
         source_series: source_series
-      required_labels: &edge_required [namespace, src_service, dst_namespace, dst_service, protocol, source_series]
+        source_coverage: source_coverage
+      required_labels: &tcp_edge_required [namespace, src_service, dst_namespace, dst_service, protocol, source_series, source_coverage]
       optional_labels: &edge_optional [job, instance]
-      series_labels: &edge_series [namespace, src_service, dst_namespace, dst_service, protocol, source_series]
+      series_labels: &tcp_edge_series [namespace, src_service, dst_namespace, dst_service, protocol, source_series]
       histogram_le_label: null
       value_scale: 1.0
       histogram_bound_scale: 1.0
     - query_id: tcp-edge-error-total
       component: edge_error_total
-      promql: 'proberca_tcp_edge_error_total'
-      label_mapping: *edge_labels
-      required_labels: *edge_required
+      promql: 'proberca_tcp_edge_error_total{source_coverage=~"0|1"}'
+      label_mapping: *tcp_edge_labels
+      required_labels: *tcp_edge_required
       optional_labels: *edge_optional
-      series_labels: *edge_series
+      series_labels: *tcp_edge_series
       histogram_le_label: null
       value_scale: 1.0
       histogram_bound_scale: 1.0
     - query_id: tcp-edge-timeout-total
       component: edge_timeout_total
-      promql: 'proberca_tcp_edge_timeout_total'
-      label_mapping: *edge_labels
-      required_labels: *edge_required
+      promql: 'proberca_tcp_edge_timeout_total{source_coverage=~"0|1"}'
+      label_mapping: *tcp_edge_labels
+      required_labels: *tcp_edge_required
       optional_labels: *edge_optional
-      series_labels: *edge_series
+      series_labels: *tcp_edge_series
       histogram_le_label: null
       value_scale: 1.0
       histogram_bound_scale: 1.0
     - query_id: tcp-edge-latency-histogram
       component: edge_latency_histogram
-      promql: 'proberca_tcp_edge_latency_milliseconds_bucket'
+      promql: 'proberca_tcp_edge_latency_milliseconds_bucket{source_coverage=~"0|1"}'
       label_mapping: &edge_histogram_labels
         namespace: namespace
         src_service: src_service
@@ -359,10 +366,11 @@ prometheus:
         dst_service: dst_service
         protocol: protocol
         source_series: source_series
+        source_coverage: source_coverage
         histogram_upper_bound: le
-      required_labels: &edge_histogram_required [namespace, src_service, dst_namespace, dst_service, protocol, source_series, le]
+      required_labels: &edge_histogram_required [namespace, src_service, dst_namespace, dst_service, protocol, source_series, source_coverage, le]
       optional_labels: *edge_optional
-      series_labels: *edge_series
+      series_labels: *tcp_edge_series
       histogram_le_label: le
       value_scale: 1.0
       histogram_bound_scale: 1.0
@@ -371,40 +379,53 @@ prometheus:
     - query_id: dns-query-total
       component: dns_query_total
       promql: 'proberca_dns_edge_query_total'
-      label_mapping: *edge_labels
-      required_labels: *edge_required
+      label_mapping: &dns_edge_labels
+        namespace: namespace
+        src_service: src_service
+        dst_namespace: dst_namespace
+        dst_service: dst_service
+        protocol: protocol
+        source_series: source_series
+      required_labels: &dns_edge_required [namespace, src_service, dst_namespace, dst_service, protocol, source_series]
       optional_labels: *edge_optional
-      series_labels: *edge_series
+      series_labels: &dns_edge_series [namespace, src_service, dst_namespace, dst_service, protocol, source_series]
       histogram_le_label: null
       value_scale: 1.0
       histogram_bound_scale: 1.0
     - query_id: dns-timeout-total
       component: dns_timeout_total
       promql: 'proberca_dns_edge_timeout_total'
-      label_mapping: *edge_labels
-      required_labels: *edge_required
+      label_mapping: *dns_edge_labels
+      required_labels: *dns_edge_required
       optional_labels: *edge_optional
-      series_labels: *edge_series
+      series_labels: *dns_edge_series
       histogram_le_label: null
       value_scale: 1.0
       histogram_bound_scale: 1.0
     - query_id: dns-error-rcode-total
       component: dns_error_rcode_total
       promql: 'proberca_dns_edge_error_rcode_total'
-      label_mapping: *edge_labels
-      required_labels: *edge_required
+      label_mapping: *dns_edge_labels
+      required_labels: *dns_edge_required
       optional_labels: *edge_optional
-      series_labels: *edge_series
+      series_labels: *dns_edge_series
       histogram_le_label: null
       value_scale: 1.0
       histogram_bound_scale: 1.0
     - query_id: dns-latency-histogram
       component: dns_latency_histogram
       promql: 'proberca_dns_edge_latency_milliseconds_bucket'
-      label_mapping: *edge_histogram_labels
-      required_labels: *edge_histogram_required
+      label_mapping: &dns_edge_histogram_labels
+        namespace: namespace
+        src_service: src_service
+        dst_namespace: dst_namespace
+        dst_service: dst_service
+        protocol: protocol
+        source_series: source_series
+        histogram_upper_bound: le
+      required_labels: &dns_edge_histogram_required [namespace, src_service, dst_namespace, dst_service, protocol, source_series, le]
       optional_labels: *edge_optional
-      series_labels: *edge_series
+      series_labels: *dns_edge_series
       histogram_le_label: le
       value_scale: 1.0
       histogram_bound_scale: 1.0

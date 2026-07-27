@@ -219,8 +219,12 @@ def test_directed_edge_series_persist_at_their_high_water_mark():
     first = PrometheusSample.create(
         "proberca_tcp_edge_request_total", labels, 10
     )
-    assert exporter._persistent_edge_samples((first,))[0].value == 10
-    assert exporter._persistent_edge_samples(())[0].value == 10
+    present = exporter._persistent_edge_samples((first,))[0]
+    assert present.value == 10
+    assert present.label_dict["source_coverage"] == "1"
+    absent = exporter._persistent_edge_samples(())[0]
+    assert absent.value == 10
+    assert absent.label_dict["source_coverage"] == "0"
     reset = PrometheusSample.create(
         "proberca_tcp_edge_request_total", labels, 2
     )
@@ -250,12 +254,16 @@ def test_service_series_persist_only_for_the_active_container():
     first = PrometheusSample.create(
         "proberca_service_request_total", labels, 10
     )
-    assert exporter._persistent_service_samples(
+    present = exporter._persistent_service_samples(
         (first,), inventory
-    )[0].value == 10
-    assert exporter._persistent_service_samples(
+    )[0]
+    assert present.value == 10
+    assert present.label_dict["source_coverage"] == "1"
+    absent = exporter._persistent_service_samples(
         (), inventory
-    )[0].value == 10
+    )[0]
+    assert absent.value == 10
+    assert absent.label_dict["source_coverage"] == "0"
     reset = PrometheusSample.create(
         "proberca_service_request_total", labels, 2
     )
@@ -368,6 +376,7 @@ def test_stable_request_aggregation_keeps_histogram_buckets_separate():
         "namespace": "online-boutique",
         "pod": "shipping-pod",
         "container": "server",
+        "source_coverage": "1",
     }
     samples = (
         PrometheusSample.create(

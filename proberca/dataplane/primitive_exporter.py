@@ -1161,6 +1161,7 @@ class FinalPrimitiveExporter:
     def _persistent_edge_samples(
         self, samples: tuple[PrometheusSample, ...],
     ) -> tuple[PrometheusSample, ...]:
+        present = {sample.identity for sample in samples}
         for sample in samples:
             if not sample.name.startswith("proberca_tcp_edge_"):
                 raise RawCollectionError(
@@ -1177,10 +1178,17 @@ class FinalPrimitiveExporter:
                     sample.name, sample.labels, value
                 )
             )
-        return tuple(
-            self._edge_sample_high_water[key]
-            for key in sorted(self._edge_sample_high_water)
-        )
+        output = []
+        for key in sorted(self._edge_sample_high_water):
+            sample = self._edge_sample_high_water[key]
+            labels = sample.label_dict
+            labels["source_coverage"] = (
+                "1" if key in present else "0"
+            )
+            output.append(PrometheusSample.create(
+                sample.name, labels, sample.value,
+            ))
+        return tuple(output)
 
     def _persistent_service_samples(
         self,
@@ -1202,6 +1210,7 @@ class FinalPrimitiveExporter:
             )
             if coordinates not in active:
                 del self._service_sample_high_water[key]
+        present = {sample.identity for sample in samples}
         for sample in samples:
             if not sample.name.startswith("proberca_service_"):
                 raise RawCollectionError(
@@ -1226,10 +1235,17 @@ class FinalPrimitiveExporter:
             self._service_sample_high_water[sample.identity] = (
                 PrometheusSample(sample.name, sample.labels, value)
             )
-        return tuple(
-            self._service_sample_high_water[key]
-            for key in sorted(self._service_sample_high_water)
-        )
+        output = []
+        for key in sorted(self._service_sample_high_water):
+            sample = self._service_sample_high_water[key]
+            labels = sample.label_dict
+            labels["source_coverage"] = (
+                "1" if key in present else "0"
+            )
+            output.append(PrometheusSample.create(
+                sample.name, labels, sample.value,
+            ))
+        return tuple(output)
 
     @staticmethod
     def _stable_request_samples(
@@ -1247,8 +1263,23 @@ class FinalPrimitiveExporter:
         totals: dict[
             tuple[str, tuple[tuple[str, str], ...]], float
         ] = {}
+        coverages: dict[
+            tuple[str, tuple[tuple[str, str], ...]], float
+        ] = {}
         for sample in samples:
             labels = sample.label_dict
+            try:
+                source_coverage = float(
+                    labels.pop("source_coverage")
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise RawCollectionError(
+                    "persistent request sample lacks source coverage"
+                ) from error
+            if source_coverage not in {0.0, 1.0}:
+                raise RawCollectionError(
+                    "request source coverage must be zero or one"
+                )
             coordinates = {
                 name: labels.get(name, "")
                 for name in coordinate_names
@@ -1266,8 +1297,20 @@ class FinalPrimitiveExporter:
                 tuple(sorted(labels.items())),
             )
             totals[identity] = totals.get(identity, 0.0) + sample.value
+            coverages[identity] = max(
+                coverages.get(identity, 0.0), source_coverage,
+            )
         return tuple(
-            PrometheusSample.create(name, dict(labels), value)
+            PrometheusSample.create(
+                name,
+                {
+                    **dict(labels),
+                    "source_coverage": (
+                        "1" if coverages[(name, labels)] else "0"
+                    ),
+                },
+                value,
+            )
             for (name, labels), value in sorted(totals.items())
         )
 

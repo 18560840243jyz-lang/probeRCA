@@ -803,8 +803,11 @@ def test_prometheus_source_preserves_raw_boundary_series_identity():
             "namespace": "namespace",
             "pod": "pod",
             "container_id": "container",
+            "source_coverage": "source_coverage",
         },
-        "required_labels": ["namespace", "pod", "container"],
+        "required_labels": [
+            "namespace", "pod", "container", "source_coverage",
+        ],
         "optional_labels": ["job", "instance"],
         "series_labels": ["namespace", "pod", "container_id"],
         "histogram_le_label": None,
@@ -832,6 +835,9 @@ def test_prometheus_source_preserves_raw_boundary_series_identity():
                             "namespace": NAMESPACE,
                             "pod": "frontend-pod",
                             "container": "frontend",
+                            "source_coverage": (
+                                "1" if self.timestamp == 1.0 else "0"
+                            ),
                             "job": "proberca",
                             "instance": "127.0.0.1:9999",
                         },
@@ -883,6 +889,8 @@ def test_prometheus_source_preserves_raw_boundary_series_identity():
     assert len(samples) == 2
     assert {item.timestamp_ns for item in samples} == {START, END}
     assert len({item.series_id for item in samples}) == 1
+    assert {item.coverage for item in samples} == {0.0, 1.0}
+    assert len({item.source_object_id for item in samples}) == 1
     assert len({item.source_record_id for item in samples}) == 2
     assert len(windows[1]) == 2
     assert sorted(session.timestamps) == [1.0, 2.0, 3.0]

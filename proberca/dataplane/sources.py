@@ -413,12 +413,34 @@ class PrometheusPrimitiveSource:
             "series_id": self._series_id(query, semantic),
             "value": value * float(query.value_scale),
         }
-        source_key = query.query_id, tuple(sorted(labels.items()))
+        raw_coverage = semantic.get("source_coverage")
+        if raw_coverage is not None:
+            try:
+                coverage = float(raw_coverage)
+            except (TypeError, ValueError) as error:
+                raise RawCollectionError(
+                    "raw source coverage is not numeric"
+                ) from error
+            if coverage not in {0.0, 1.0}:
+                raise RawCollectionError(
+                    "raw source coverage must be zero or one"
+                )
+            common["coverage"] = coverage
+        coverage_label = query.label_mapping.get("source_coverage")
+        source_identity_labels = {
+            key: item
+            for key, item in labels.items()
+            if key != coverage_label
+        }
+        source_key = (
+            query.query_id,
+            tuple(sorted(source_identity_labels.items())),
+        )
         source_object_id = self._source_object_ids.get(source_key)
         if source_object_id is None:
             source_object_id = "object:" + fingerprint({
                 "query": self._query_fingerprints[query.query_id],
-                "labels": labels,
+                "labels": source_identity_labels,
             })
             self._source_object_ids[source_key] = source_object_id
         common["source_object_id"] = source_object_id
