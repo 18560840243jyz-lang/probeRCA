@@ -218,6 +218,31 @@ class ServiceRLS:
             for relation in relations
         }
 
+    def readiness(self) -> dict[str, dict[str, int | bool | str | None]]:
+        """Report per-service Healthy A_s update readiness."""
+        output = {}
+        for target, model in sorted(self._models.items()):
+            required = (
+                self.config.service_min_training_updates
+                if model.feature_keys else 0
+            )
+            ready = model.updates >= required
+            output[target] = {
+                "allowed_feature_count": len(model.feature_keys),
+                "valid_training_rows": model.updates,
+                "minimum_training_rows": required,
+                "ready": ready,
+                "not_ready_reason": (
+                    None if ready else "insufficient_valid_history"
+                ),
+            }
+        return output
+
+    @property
+    def ready(self) -> bool:
+        status = self.readiness()
+        return bool(status) and all(item["ready"] for item in status.values())
+
 
 def build_candidate_graph(
     *,

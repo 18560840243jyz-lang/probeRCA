@@ -18,6 +18,10 @@ from typing import Any, Callable
 from proberca.dataplane.archive import CollectionArchive
 from proberca.dataplane.burst_archive import BurstArchive
 from proberca.dataplane.burst_collection import BURST_CHANNEL_MODES
+from proberca.controlplane import (
+    CalibrationNotReadyError,
+    load_ready_calibration_report,
+)
 
 
 REPOSITORY = Path(os.environ.get(
@@ -812,6 +816,15 @@ def assert_no_stale_network_faults() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--calibration-readiness",
+        type=Path,
+        required=True,
+        help=(
+            "validated calibration-readiness.json from an independent "
+            "Healthy Pilot"
+        ),
+    )
     parser.add_argument("--normal-windows", type=int, default=60)
     parser.add_argument("--abnormal-windows", type=int, default=60)
     parser.add_argument(
@@ -820,6 +833,14 @@ def main() -> int:
         help="resume an interrupted matrix and preserve failed attempts",
     )
     arguments = parser.parse_args()
+    try:
+        readiness = load_ready_calibration_report(
+            arguments.calibration_readiness
+        )
+    except CalibrationNotReadyError as exc:
+        raise SystemExit(
+            f"fault injection refused: {exc}"
+        ) from exc
     if os.geteuid() != 0:
         raise SystemExit("runner must execute as root")
     if not KUBECONFIG.is_file():
@@ -833,6 +854,13 @@ def main() -> int:
         raise SystemExit("each phase requires at least five windows")
     root = arguments.output.resolve()
     specs = experiment_specs()
+    readiness_reference = {
+        "report_fingerprint": readiness["report_fingerprint"],
+        "control_config_fingerprint": (
+            readiness["control_config_fingerprint"]
+        ),
+        "topology_snapshot_id": readiness["topology_snapshot_id"],
+    }
     manifest_path = root / "dataset-manifest.json"
     if root.exists():
         if not arguments.resume:
@@ -856,6 +884,10 @@ def main() -> int:
             != arguments.abnormal_windows
         ):
             raise SystemExit("resume window counts differ from original run")
+        if manifest.get("calibration_readiness") != readiness_reference:
+            raise SystemExit(
+                "resume calibration readiness differs from original run"
+            )
         if manifest.get("status") == "complete":
             raise SystemExit("dataset is already complete")
         manifest["status"] = "running"
@@ -868,6 +900,7 @@ def main() -> int:
             "platform": "Google Online Boutique",
             "cluster": KUBE_CONTEXT,
             "control_plane_executed": False,
+            "calibration_readiness": readiness_reference,
             "phase_variable": "experiment_phase",
             "phase_values": {
                 "normal": "fault is not active",

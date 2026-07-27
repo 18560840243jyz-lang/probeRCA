@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+import math
 
 import numpy as np
 
 from .config import FinalControlConfig
-from .model import CandidateEntityGraph, MetricNode, MetricPropagationModel
+from .model import (
+    CandidateEntityGraph,
+    MetricNode,
+    MetricPropagationModel,
+    MetricTargetReadiness,
+)
 from .service_model import AllowedServiceGraph
 
 
@@ -102,9 +107,13 @@ def candidate_metric_nodes(
 ) -> dict[str, MetricNode]:
     entities = set(candidate.services) | set(candidate.hosts) | set(candidate.edges)
     return {
-        node_id: item.metric
+        node_id: (
+            item if isinstance(item, MetricNode) else item.metric
+        )
         for node_id, item in observations.items()
-        if item.metric.entity_id in entities
+        if (
+            item if isinstance(item, MetricNode) else item.metric
+        ).entity_id in entities
     }
 
 
@@ -126,7 +135,7 @@ def fit_metric_propagation(
     ))
     coefficients: dict[tuple[str, str, int], float] = {}
     row_counts = []
-    missing_required = []
+    target_readiness = {}
     sequences = sorted(healthy_history)
     for target_id in node_ids:
         parent_ids = sorted(
@@ -154,26 +163,103 @@ def fit_metric_propagation(
             if complete and features:
                 rows.append(values)
                 targets.append(current[target_id])
-        row_counts.append(len(rows))
-        if not features or len(rows) < config.metric_min_training_rows:
-            if metrics[target_id].root_eligible:
-                missing_required.append(target_id)
+        feature_count = len(features)
+        minimum_rows = max(
+            config.metric_min_training_rows,
+            int(math.ceil(config.metric_rows_per_feature * feature_count)),
+        )
+        valid_rows = len(rows)
+        row_counts.append(valid_rows)
+        matrix = (
+            np.asarray(rows, dtype=float)
+            if rows and features
+            else np.empty((0, feature_count), dtype=float)
+        )
+        effective_rank = (
+            int(np.linalg.matrix_rank(
+                matrix, tol=config.metric_rank_tolerance,
+            ))
+            if matrix.size else 0
+        )
+        gram = (
+            matrix.T @ matrix
+            + config.metric_ridge * np.eye(matrix.shape[1])
+            if matrix.size else None
+        )
+        raw_condition = (
+            float(np.linalg.cond(matrix))
+            if matrix.size else None
+        )
+        condition = (
+            raw_condition
+            if raw_condition is None or math.isfinite(raw_condition)
+            else None
+        )
+        reason = None
+        if not features:
+            reason = "no_allowed_features"
+        elif valid_rows < minimum_rows:
+            reason = "insufficient_valid_history"
+        elif effective_rank < feature_count:
+            reason = "rank_deficient"
+        elif condition is None:
+            reason = "non_finite_condition_number"
+        elif condition > config.metric_max_condition_number:
+            reason = "ill_conditioned"
+        if reason is not None:
+            target_readiness[target_id] = MetricTargetReadiness(
+                target_metric=target_id,
+                root_eligible=metrics[target_id].root_eligible,
+                allowed_feature_count=feature_count,
+                valid_training_rows=valid_rows,
+                minimum_training_rows=minimum_rows,
+                effective_rank=effective_rank,
+                condition_number=condition,
+                ready=False,
+                not_ready_reason=reason,
+            )
             continue
-        matrix = np.asarray(rows, dtype=float)
         vector = np.asarray(targets, dtype=float)
-        gram = matrix.T @ matrix + config.metric_ridge * np.eye(matrix.shape[1])
         try:
             solved = np.linalg.solve(gram, matrix.T @ vector)
-        except np.linalg.LinAlgError as error:
-            raise ValueError(f"metric Ridge failed for {target_id}") from error
+        except np.linalg.LinAlgError:
+            target_readiness[target_id] = MetricTargetReadiness(
+                target_metric=target_id,
+                root_eligible=metrics[target_id].root_eligible,
+                allowed_feature_count=feature_count,
+                valid_training_rows=valid_rows,
+                minimum_training_rows=minimum_rows,
+                effective_rank=effective_rank,
+                condition_number=condition,
+                ready=False,
+                not_ready_reason="ridge_solve_failed",
+            )
+            continue
         if not np.isfinite(solved).all():
-            raise ValueError(f"metric Ridge produced non-finite coefficients for {target_id}")
+            target_readiness[target_id] = MetricTargetReadiness(
+                target_metric=target_id,
+                root_eligible=metrics[target_id].root_eligible,
+                allowed_feature_count=feature_count,
+                valid_training_rows=valid_rows,
+                minimum_training_rows=minimum_rows,
+                effective_rank=effective_rank,
+                condition_number=condition,
+                ready=False,
+                not_ready_reason="non_finite_coefficients",
+            )
+            continue
         for (parent_id, lag), value in zip(features, solved):
             coefficients[(target_id, parent_id, lag)] = float(value)
-    if missing_required:
-        raise ValueError(
-            "metric model is not ready for root coordinates: "
-            + ",".join(sorted(missing_required))
+        target_readiness[target_id] = MetricTargetReadiness(
+            target_metric=target_id,
+            root_eligible=metrics[target_id].root_eligible,
+            allowed_feature_count=feature_count,
+            valid_training_rows=valid_rows,
+            minimum_training_rows=minimum_rows,
+            effective_rank=effective_rank,
+            condition_number=condition,
+            ready=True,
+            not_ready_reason=None,
         )
     return MetricPropagationModel(
         node_ids=node_ids,
@@ -182,4 +268,5 @@ def fit_metric_propagation(
         semantic_mask=semantic_mask,
         training_rows=min(row_counts, default=0),
         healthy_cutoff_ns=healthy_cutoff_ns,
+        target_readiness=target_readiness,
     )

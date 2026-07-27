@@ -1,6 +1,13 @@
 window_sec: 1
 baseline_min_windows: 6
-baseline_min_scale: 1.0e-06
+baseline_min_scale: 1.0e-12
+baseline_family_min_scales:
+  count: null
+  latency: null
+  psi: null
+  ratio: null
+latency_min_samples: 5
+failure_min_requests: 5
 service_lags:
 - 1
 - 2
@@ -9,8 +16,18 @@ metric_lags:
 - 2
 rls_forgetting_factor: 0.99
 rls_initial_covariance: 100.0
+service_min_training_updates: 4
 metric_ridge: 0.1
 metric_min_training_rows: 4
+metric_rows_per_feature: 2.0
+metric_rank_tolerance: 1.0e-10
+metric_max_condition_number: 100000000.0
+calibration_validation_windows: 5
+calibration_required_entity_types:
+- edge
+- host
+- service
+calibration_required_root_coordinates: []
 alpha_latency: 0.5
 alpha_failure: 0.5
 soft_threshold: 3.0

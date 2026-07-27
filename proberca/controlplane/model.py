@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any
 
 from proberca.dataplane.contracts import fingerprint
@@ -26,6 +26,22 @@ class NormalizedObservation:
     anomaly: float
     quality: float
     source_record_id: str
+    baseline_center: float
+    baseline_scale: float
+    scale_source: str
+
+
+@dataclass(frozen=True)
+class MetricTargetReadiness:
+    target_metric: str
+    root_eligible: bool
+    allowed_feature_count: int
+    valid_training_rows: int
+    minimum_training_rows: int
+    effective_rank: int
+    condition_number: float | None
+    ready: bool
+    not_ready_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -47,6 +63,7 @@ class MetricPropagationModel:
     semantic_mask: tuple[tuple[str, str], ...]
     training_rows: int
     healthy_cutoff_ns: int
+    target_readiness: dict[str, MetricTargetReadiness] = field(default_factory=dict)
 
     def cross_prediction(
         self, target_node_id: str, history: dict[int, dict[str, float]],
@@ -64,6 +81,32 @@ class MetricPropagationModel:
                 )
                 value += coefficient * row.get(parent_node_id, 0.0)
         return float(value)
+
+    @property
+    def not_ready_root_coordinates(self) -> tuple[str, ...]:
+        return tuple(sorted(
+            target
+            for target, status in self.target_readiness.items()
+            if status.root_eligible and not status.ready
+        ))
+
+    @property
+    def ready_root_coordinates(self) -> tuple[str, ...]:
+        return tuple(sorted(
+            target
+            for target, status in self.target_readiness.items()
+            if status.root_eligible and status.ready
+        ))
+
+    @property
+    def ready(self) -> bool:
+        root_statuses = tuple(
+            status for status in self.target_readiness.values()
+            if status.root_eligible
+        )
+        return bool(root_statuses) and all(
+            status.ready for status in root_statuses
+        )
 
 
 @dataclass(frozen=True)
@@ -134,12 +177,14 @@ class ControlPlaneRun:
     processed_window_count: int
     state_timeline: tuple[dict[str, Any], ...]
     results: tuple[FinalRCAResult, ...]
+    calibration_readiness: dict[str, Any]
+    rca_not_ready_events: tuple[dict[str, Any], ...]
     run_fingerprint: str
 
     @classmethod
     def create(cls, **values) -> "ControlPlaneRun":
         payload = dict(values)
-        payload["schema_version"] = "probeRCA-final-control-run-v1"
+        payload["schema_version"] = "probeRCA-final-control-run-v2"
         payload["run_fingerprint"] = ""
         return cls(**(payload | {"run_fingerprint": fingerprint(_plain(payload))}))
 

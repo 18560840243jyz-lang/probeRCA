@@ -2159,3 +2159,89 @@ A_v\text{健康传播扣除}
 \text{Sparse-Group FISTA根因选择}
 }
 ]
+
+二十七、校准与Readiness硬门禁
+
+以下规则是最终方案的强制组成部分，不能通过降低Soft/Hard阈值绕过。
+
+有效观测：
+
+- `coverage = 0`表示缺失，不能补零、前向填充、插值或复用上一窗口值。
+- 缺失指标不能进入Healthy基线、告警或(A_v)训练。
+- latency P95必须满足最小样本数。
+- failure rate必须拥有足够的请求或查询暴露量；无请求窗口是缺失，不是健康零值。
+- 数据面保留raw value、coverage、sample count、request count来源、quality和lineage；控制面判断是否可用。
+
+稳健尺度：
+
+[
+s_i^{MAD}=1.4826\operatorname{MAD}(T_i(B_i))
+]
+
+MAD正常时使用MAD尺度。MAD过小或为零时：
+
+[
+\boxed{
+s_i=
+\max\left(
+\frac{\operatorname{IQR}(T_i(B_i))}{1.349},
+s_{\min,f(i)}
+\right)
+}
+]
+
+- `epsilon`只允许作为浮点数值保护，不能承担统计尺度作用。
+- latency、ratio、count、PSI分别使用独立Healthy Pilot冻结的指标族尺度下限。
+- 必须保存`scale_source = mad / iqr / family_floor`及完整尺度数值。
+- 未冻结指标族尺度下限时，系统保持CALIBRATING。
+
+逐目标(A_v)：
+
+- Masked Ridge必须按目标坐标分别拟合。
+- 目标(i)只使用“目标值及其允许父指标滞后值均有效”的训练行。
+- 默认最低训练行数为：
+
+[
+N_i^{min}=
+\max\left(4,\left\lceil 2p_i\right\rceil\right)
+]
+
+- 每个目标必须输出allowed feature count、valid training rows、minimum rows、effective rank、condition number、ready和not-ready reason。
+- 一条稀疏边不能拖垮无关目标，也不能以未Ready坐标进入FISTA。
+- 正式计划故障范围内的根因坐标必须通过`calibration_required_root_coordinates`显式冻结并全部Ready。
+- 上述计划范围只能用于校准门禁，绝对不能进入候选排序、残差或FISTA。
+- 计划范围必须在实验前统一声明并与单次故障注入标签隔离，不能按某次真实注入结果动态改变。
+
+正式状态机：
+
+```text
+STARTING
+  -> CALIBRATING
+  -> READY
+  -> Healthy / Soft / Hard / Recovery
+```
+
+CALIBRATING阶段：
+
+- 不触发Soft；
+- 不触发Hard；
+- 不运行FISTA；
+- 故障注入入口必须拒绝启动。
+
+进入READY必须同时满足：
+
+1. 必需指标拥有足够有效Healthy样本；
+2. 所有尺度有效且指标族尺度下限已冻结；
+3. (A_s) Ready；
+4. 计划故障范围内的(A_v)根因坐标全部Ready；
+5. 拓扑和身份映射完整；
+6. 连续健康验证窗口没有伪Soft或Hard。
+
+若Hard后候选模型意外不Ready，必须输出：
+
+```text
+RCA_NOT_READY
+reason: <逐坐标真实原因>
+```
+
+此时不得静默跳过(A_v)，不得运行FISTA，也不得输出伪根因。

@@ -589,6 +589,9 @@ def test_empty_service_histogram_has_zero_coverage_not_imputation(
     metrics = {item.metric_name: item for item in result.node_metrics}
     assert len(metrics) == 9
     assert metrics["request_rate"].value == 0
+    assert metrics["request_failure_rate"].value == 0
+    assert metrics["request_failure_rate"].sample_count == 0
+    assert metrics["request_failure_rate"].coverage == 0
     latency = metrics["request_latency_p95"]
     assert latency.value == 0
     assert latency.sample_count == 0
@@ -626,6 +629,8 @@ def test_inactive_edge_keeps_stable_identity_with_missing_latency(
     }
     assert metrics["edge_request_count"].value == 0
     assert metrics["edge_failure_rate"].value == 0
+    assert metrics["edge_failure_rate"].sample_count == 0
+    assert metrics["edge_failure_rate"].coverage == 0
     assert metrics["edge_latency_p95"].coverage == 0
 
 

@@ -48,9 +48,10 @@ def aggregate_burst_evidence(
             entity_match = target in {entity_id, *(metric.node_id for metric in metrics)}
             if not exact_metric and not entity_match:
                 continue
+            if category != root_category:
+                continue
             matches.append(key)
-            if category != root_category \
-                    or metrics[0].entity_type not in channel_role["entity_types"]:
+            if metrics[0].entity_type not in channel_role["entity_types"]:
                 raise ValueError("Burst channel does not match its candidate group")
             strengths[key][item.channel_id] = max(
                 strengths[key].get(item.channel_id, 0.0), min(psi, 1.0),

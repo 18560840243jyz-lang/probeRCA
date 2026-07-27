@@ -26,6 +26,7 @@ FINAL_AGGREGATIONS = frozenset({
 })
 FINAL_AGGREGATION_OUTPUT_SOURCE = "final_window_aggregation"
 FINAL_SOURCE_DESCRIPTION = "final-window-aggregates-v1"
+SCALE_FAMILIES = frozenset({"latency", "ratio", "count", "psi"})
 
 
 def default_burst_channel_roles() -> tuple[dict[str, Any], ...]:
@@ -161,6 +162,19 @@ class MetricRoleSpec:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @property
+    def scale_family(self) -> str:
+        """Return the frozen statistical-scale family in transformed space."""
+        if self.metric_kind == "quantile":
+            return "latency"
+        if "psi" in self.metric_name:
+            return "psi"
+        if self.metric_kind == "delta_counter" or self.unit in {
+            "requests", "queries", "requests_per_second", "events_per_second",
+        }:
+            return "count"
+        return "ratio"
+
 
 def default_metric_roles() -> tuple[MetricRoleSpec, ...]:
     service_scopes = ("service",)
@@ -262,13 +276,30 @@ def default_metric_roles() -> tuple[MetricRoleSpec, ...]:
 class FinalControlConfig:
     window_sec: int = 1
     baseline_min_windows: int = 6
-    baseline_min_scale: float = 1.0e-6
+    # Numeric protection only. Statistical lower bounds are family-specific.
+    baseline_min_scale: float = 1.0e-12
+    baseline_family_min_scales: dict[str, float | None] = field(
+        default_factory=lambda: {
+            family: None for family in sorted(SCALE_FAMILIES)
+        }
+    )
+    latency_min_samples: int = 5
+    failure_min_requests: int = 5
     service_lags: tuple[int, ...] = (1, 2)
     metric_lags: tuple[int, ...] = (1, 2)
     rls_forgetting_factor: float = 0.99
     rls_initial_covariance: float = 100.0
+    service_min_training_updates: int = 4
     metric_ridge: float = 0.1
     metric_min_training_rows: int = 4
+    metric_rows_per_feature: float = 2.0
+    metric_rank_tolerance: float = 1.0e-10
+    metric_max_condition_number: float = 1.0e8
+    calibration_validation_windows: int = 5
+    calibration_required_entity_types: tuple[str, ...] = (
+        "edge", "host", "service",
+    )
+    calibration_required_root_coordinates: tuple[str, ...] = ()
     alpha_latency: float = 0.5
     alpha_failure: float = 0.5
     soft_threshold: float = 3.0
@@ -294,6 +325,8 @@ class FinalControlConfig:
     def __post_init__(self) -> None:
         for name in (
             "window_sec", "baseline_min_windows", "metric_min_training_rows",
+            "latency_min_samples", "failure_min_requests",
+            "service_min_training_updates", "calibration_validation_windows",
             "soft_consecutive_windows", "hard_consecutive_windows",
             "recovery_windows", "candidate_hops", "burst_window_count",
             "fista_max_iterations", "top_k",
@@ -310,7 +343,8 @@ class FinalControlConfig:
         finite_positive = (
             "baseline_min_scale", "rls_initial_covariance", "metric_ridge",
             "soft_threshold", "hard_threshold", "l1_penalty",
-            "fista_tolerance",
+            "fista_tolerance", "metric_rows_per_feature",
+            "metric_rank_tolerance", "metric_max_condition_number",
         )
         for name in finite_positive:
             value = getattr(self, name)
@@ -336,6 +370,39 @@ class FinalControlConfig:
             raise ValueError("candidate threshold and burst eta must be finite and non-negative")
         if type(self.strict_metric_contract) is not bool:
             raise TypeError("strict_metric_contract must be boolean")
+        if set(self.baseline_family_min_scales) != SCALE_FAMILIES:
+            raise ValueError(
+                "baseline family floors must cover every scale family"
+            )
+        for family, value in self.baseline_family_min_scales.items():
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value <= self.baseline_min_scale
+            ):
+                raise ValueError(
+                    f"baseline family floor {family} must exceed numeric epsilon"
+                )
+        if not self.calibration_required_entity_types \
+                or tuple(sorted(set(self.calibration_required_entity_types))) \
+                != self.calibration_required_entity_types \
+                or any(
+                    item not in ENTITY_TYPES
+                    for item in self.calibration_required_entity_types
+                ):
+            raise ValueError(
+                "calibration entity types must be sorted and unique"
+            )
+        if tuple(sorted(set(
+            self.calibration_required_root_coordinates
+        ))) != self.calibration_required_root_coordinates or any(
+            not isinstance(item, str) or not item
+            for item in self.calibration_required_root_coordinates
+        ):
+            raise ValueError(
+                "calibration root coordinates must be sorted, unique strings"
+            )
         if set(self.group_penalties) != ROOT_CATEGORIES \
                 or any(not math.isfinite(value) or value < 0
                        for value in self.group_penalties.values()):
@@ -363,12 +430,22 @@ class FinalControlConfig:
             raise ValueError("final control config fields mismatch")
         values["service_lags"] = tuple(values["service_lags"])
         values["metric_lags"] = tuple(values["metric_lags"])
+        values["calibration_required_entity_types"] = tuple(
+            values["calibration_required_entity_types"]
+        )
+        values["calibration_required_root_coordinates"] = tuple(
+            values["calibration_required_root_coordinates"]
+        )
         values["metric_roles"] = tuple(
             item if isinstance(item, MetricRoleSpec) else MetricRoleSpec.from_dict(item)
             for item in values["metric_roles"]
         )
         values["group_penalties"] = {
             str(key): float(value) for key, value in values["group_penalties"].items()
+        }
+        values["baseline_family_min_scales"] = {
+            str(key): (None if value is None else float(value))
+            for key, value in values["baseline_family_min_scales"].items()
         }
         return cls(**values)
 

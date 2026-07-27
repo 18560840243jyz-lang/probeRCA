@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -72,7 +73,7 @@ class FinalControlPlane:
         self.baseline = RobustBaselineStore(config)
         self.resolver = MetricResolver(config)
         self.service_rls = ServiceRLS(config)
-        self.state = "healthy"
+        self.state = "starting"
         self._soft_counts: dict[tuple[str, str], int] = {}
         self._hard_counts: dict[tuple[str, str], int] = {}
         self._recovery_count = 0
@@ -85,6 +86,12 @@ class FinalControlPlane:
         self._evidence = []
         self._timeline = []
         self._results = []
+        self._metric_catalog = {}
+        self._metric_specs = {}
+        self._calibration_validation_count = 0
+        self._calibration_report = {}
+        self._invalid_reason_counts = Counter()
+        self._rca_not_ready_events = []
         self._diagnosed_hard_sequences: set[int] = set()
         self._has_run = False
         self._dataset_id = ""
@@ -110,7 +117,295 @@ class FinalControlPlane:
         self._signed_history.clear()
         self._soft_counts.clear()
         self._hard_counts.clear()
+        self._metric_catalog.clear()
+        self._metric_specs.clear()
+        self._calibration_validation_count = 0
+        self._calibration_report = {}
+        self.state = "calibrating"
         self._healthy_topology_snapshot_id = snapshot_id
+
+    def _catalog_window(self, window) -> None:
+        for record in (*window.node_metrics, *window.edge_metrics):
+            metric, spec = self.resolver.resolve(record)
+            existing = self._metric_catalog.get(metric.node_id)
+            if existing is not None and existing != metric:
+                raise ControlPlaneError("metric identity changed during calibration")
+            self._metric_catalog[metric.node_id] = metric
+            self._metric_specs[metric.node_id] = spec
+
+    def _full_candidate(self, graph: AllowedServiceGraph):
+        return build_candidate_graph(
+            graph=graph,
+            service_strengths=self.service_rls.relation_strengths(),
+            seed_services=set(graph.services),
+            seed_edges={
+                edge_id
+                for edge_id, _source, _target, _protocol
+                in graph.physical_edges
+            },
+            config=self.config,
+        )
+
+    def _build_calibration_report(
+        self, *, graph: AllowedServiceGraph, timestamp_ns: int,
+        maximum: float,
+    ) -> dict[str, Any]:
+        required_types = set(
+            self.config.calibration_required_entity_types
+        )
+        candidate = self._full_candidate(graph)
+        metrics = candidate_metric_nodes(self._metric_catalog, candidate)
+        model = fit_metric_propagation(
+            metrics=metrics,
+            healthy_history=self._healthy_history,
+            candidate=candidate,
+            service_graph=graph,
+            healthy_cutoff_ns=timestamp_ns,
+            config=self.config,
+        )
+        configured_roots = set(
+            self.config.calibration_required_root_coordinates
+        )
+        scope_status = {}
+        for node_id in sorted(configured_roots):
+            metric = metrics.get(node_id)
+            reason = None
+            if metric is None:
+                reason = "metric_not_observed"
+            elif not metric.root_eligible:
+                reason = "not_root_eligible"
+            elif metric.entity_type not in required_types:
+                reason = "entity_type_not_enabled"
+            scope_status[node_id] = {
+                "target_metric": node_id,
+                "ready": reason is None,
+                "not_ready_reason": reason,
+            }
+        scope_ready = (
+            bool(scope_status)
+            and all(item["ready"] for item in scope_status.values())
+        )
+        required_roots = {
+            node_id for node_id, item in scope_status.items()
+            if item["ready"]
+        }
+        required_metric_ids = set(required_roots)
+        required_metric_ids.update(
+            parent_id
+            for target_id, parent_id in model.semantic_mask
+            if target_id in required_roots
+        )
+        required_metrics = {
+            node_id: metrics[node_id]
+            for node_id in sorted(required_metric_ids)
+            if node_id in metrics
+        }
+        baseline_status = {
+            node_id: self.baseline.status(
+                node_id, self._metric_specs[node_id],
+            )
+            for node_id in sorted(required_metrics)
+        }
+        all_baseline_status = {
+            node_id: self.baseline.status(
+                node_id, self._metric_specs[node_id],
+            )
+            for node_id in sorted(metrics)
+        }
+        all_av_status = {
+            node_id: asdict(status)
+            for node_id, status in sorted(
+                model.target_readiness.items()
+            )
+            if status.root_eligible
+        }
+        av_status = {
+            node_id: asdict(model.target_readiness[node_id])
+            for node_id in sorted(required_roots)
+            if node_id in model.target_readiness
+        }
+        missing_av = sorted(required_roots - set(av_status))
+        for node_id in missing_av:
+            av_status[node_id] = {
+                "target_metric": node_id,
+                "root_eligible": True,
+                "allowed_feature_count": 0,
+                "valid_training_rows": 0,
+                "minimum_training_rows": (
+                    self.config.metric_min_training_rows
+                ),
+                "effective_rank": 0,
+                "condition_number": None,
+                "ready": False,
+                "not_ready_reason": "metric_not_observed",
+            }
+        relevant_services = set()
+        physical_edges = {
+            edge_id: (source, target)
+            for edge_id, source, target, _protocol
+            in graph.physical_edges
+        }
+        for node_id in required_roots:
+            metric = metrics[node_id]
+            if metric.entity_type == "service":
+                relevant_services.add(metric.entity_id)
+            elif metric.entity_type == "edge":
+                relevant_services.update(
+                    physical_edges.get(metric.entity_id, ())
+                )
+            elif metric.entity_type == "host":
+                relevant_services.update(
+                    service
+                    for service, host in graph.placements
+                    if host == metric.entity_id
+                )
+        all_service_status = self.service_rls.readiness()
+        service_status = {
+            service: all_service_status[service]
+            for service in sorted(relevant_services)
+            if service in all_service_status
+        }
+        missing_services = sorted(
+            relevant_services - set(service_status)
+        )
+        for service in missing_services:
+            service_status[service] = {
+                "allowed_feature_count": 0,
+                "valid_training_rows": 0,
+                "minimum_training_rows": (
+                    self.config.service_min_training_updates
+                ),
+                "ready": False,
+                "not_ready_reason": "service_state_not_observed",
+            }
+        baseline_ready = (
+            bool(baseline_status)
+            and all(item["ready"] for item in baseline_status.values())
+        )
+        av_ready = (
+            bool(av_status)
+            and all(item["ready"] for item in av_status.values())
+        )
+        as_ready = (
+            bool(service_status)
+            and all(item["ready"] for item in service_status.values())
+        )
+        core_ready = (
+            scope_ready and baseline_ready and av_ready and as_ready
+        )
+        payload = {
+            "schema_version": "probeRCA-calibration-readiness-v1",
+            "timestamp_ns": timestamp_ns,
+            "state": self.state,
+            "ready": False,
+            "core_ready": core_ready,
+            "baseline_ready": baseline_ready,
+            "service_model_ready": as_ready,
+            "metric_model_ready": av_ready,
+            "healthy_validation_windows": (
+                self._calibration_validation_count
+            ),
+            "required_healthy_validation_windows": (
+                self.config.calibration_validation_windows
+            ),
+            "maximum_symptom_score": maximum,
+            "required_entity_types": sorted(required_types),
+            "required_root_coordinates": sorted(configured_roots),
+            "available_root_coordinates": sorted(all_av_status),
+            "planned_scope_ready": scope_ready,
+            "planned_scope_status": scope_status,
+            "required_scope_fingerprint": fingerprint({
+                "entity_types": sorted(required_types),
+                "root_coordinates": sorted(configured_roots),
+            }),
+            "topology_snapshot_id": graph.snapshot_id,
+            "control_config_fingerprint": self.config.config_fingerprint,
+            "baseline_status": baseline_status,
+            "all_baseline_status": all_baseline_status,
+            "service_model_status": service_status,
+            "all_service_model_status": all_service_status,
+            "metric_model_status": av_status,
+            "all_metric_model_status": all_av_status,
+            "invalid_observation_counts": dict(sorted(
+                self._invalid_reason_counts.items()
+            )),
+            "latest_observation_validity": dict(sorted(
+                self.resolver.last_validity.items()
+            )),
+            "scale_snapshot": self.baseline.scale_snapshot(),
+            "report_fingerprint": "",
+        }
+        return payload | {
+            "report_fingerprint": fingerprint(payload),
+        }
+
+    def _advance_calibration(
+        self, *, graph: AllowedServiceGraph, timestamp_ns: int,
+        maximum: float, service_scores, edge_scores, observations,
+    ) -> None:
+        previous = self.state
+        report = self._build_calibration_report(
+            graph=graph, timestamp_ns=timestamp_ns, maximum=maximum,
+        )
+        healthy_validation = (
+            report["core_ready"]
+            and maximum < self.config.soft_threshold
+        )
+        self._calibration_validation_count = (
+            self._calibration_validation_count + 1
+            if healthy_validation else 0
+        )
+        report["healthy_validation_windows"] = (
+            self._calibration_validation_count
+        )
+        report["ready"] = (
+            report["core_ready"]
+            and self._calibration_validation_count
+            >= self.config.calibration_validation_windows
+        )
+        self.state = "ready" if report["ready"] else "calibrating"
+        report["state"] = self.state
+        report["report_fingerprint"] = ""
+        report["report_fingerprint"] = fingerprint(report)
+        self._calibration_report = report
+        self._timeline.append({
+            "timestamp_ns": timestamp_ns,
+            "previous_state": previous,
+            "state": self.state,
+            "maximum_symptom_score": maximum,
+            "service_scores": dict(sorted(service_scores.items())),
+            "edge_scores": dict(sorted(edge_scores.items())),
+            "scale_sources": {
+                node_id: item.scale_source
+                for node_id, item in sorted(observations.items())
+            },
+            "metric_scores": {
+                node_id: {
+                    "signed_z": item.signed_z,
+                    "anomaly": item.anomaly,
+                    "quality": item.quality,
+                    "baseline_center": item.baseline_center,
+                    "baseline_scale": item.baseline_scale,
+                    "scale_source": item.scale_source,
+                }
+                for node_id, item in sorted(observations.items())
+            },
+            "reason": (
+                "calibration_ready"
+                if report["ready"]
+                else (
+                    "calibration_anomaly"
+                    if report["core_ready"] and not healthy_validation
+                    else "calibration_not_ready"
+                )
+            ),
+            "baseline_frozen": False,
+            "service_model_frozen": False,
+            "topology_snapshot_id": graph.snapshot_id,
+            "calibration_report_fingerprint": (
+                report["report_fingerprint"]
+            ),
+        })
 
     def _scores(self, observations, graph: AllowedServiceGraph):
         by_entity: dict[str, dict[str, float]] = {}
@@ -119,6 +414,10 @@ class FinalControlPlane:
         service_scores = {}
         for service in graph.services:
             roles = by_entity.get(service, {})
+            if not (
+                {"request_latency", "request_failure"} & set(roles)
+            ):
+                continue
             service_scores[service] = (
                 self.config.alpha_latency * roles.get("request_latency", 0.0)
                 + self.config.alpha_failure * roles.get("request_failure", 0.0)
@@ -139,7 +438,10 @@ class FinalControlPlane:
                 "request_latency", "request_failure", "edge_latency", "edge_failure",
             }
         ]
-        return bool(alert_nodes) and all(self.baseline.ready(node_id) for node_id in alert_nodes)
+        return bool(alert_nodes) and all(
+            self.baseline.ready(node_id, raw[node_id][1])
+            for node_id in alert_nodes
+        )
 
     def _update_healthy_models(
         self, *, sequence: int, raw, observations, service_scores,
@@ -147,8 +449,8 @@ class FinalControlPlane:
     ) -> None:
         if not safe_healthy:
             return
-        for node_id, (value, _spec) in raw.items():
-            self.baseline.update(node_id, value)
+        for node_id, (value, spec) in raw.items():
+            self.baseline.update(node_id, value, spec)
         if observations:
             signed = {
                 node_id: item.signed_z for node_id, item in observations.items()
@@ -198,7 +500,7 @@ class FinalControlPlane:
             seed_edges=edge_seeds,
             config=self.config,
         )
-        metrics = candidate_metric_nodes(observations, candidate)
+        metrics = candidate_metric_nodes(self._metric_catalog, candidate)
         model = fit_metric_propagation(
             metrics=metrics,
             healthy_history=self._healthy_history,
@@ -314,6 +616,21 @@ class FinalControlPlane:
             "maximum_symptom_score": maximum,
             "service_scores": dict(sorted(service_scores.items())),
             "edge_scores": dict(sorted(edge_scores.items())),
+            "scale_sources": {
+                node_id: item.scale_source
+                for node_id, item in sorted(observations.items())
+            },
+            "metric_scores": {
+                node_id: {
+                    "signed_z": item.signed_z,
+                    "anomaly": item.anomaly,
+                    "quality": item.quality,
+                    "baseline_center": item.baseline_center,
+                    "baseline_scale": item.baseline_scale,
+                    "scale_source": item.scale_source,
+                }
+                for node_id, item in sorted(observations.items())
+            },
             "soft_consecutive_counts": {
                 f"{key[0]}|{key[1]}": value
                 for key, value in sorted(self._soft_counts.items())
@@ -331,11 +648,21 @@ class FinalControlPlane:
         if self._soft is None or self._hard is None:
             raise ControlPlaneError("diagnosis requires frozen Soft and Hard contexts")
         model = self._soft.metric_model
+        if not model.ready:
+            raise ControlPlaneError(
+                "RCA_NOT_READY: " + ",".join(
+                    model.not_ready_root_coordinates
+                )
+            )
         observations = self._hard.observations
         root_metrics = [
             self._soft.metrics[node_id]
             for node_id in model.node_ids
-            if node_id in observations and self._soft.metrics[node_id].root_eligible
+            if (
+                node_id in observations
+                and self._soft.metrics[node_id].root_eligible
+                and model.target_readiness[node_id].ready
+            )
         ]
         if not root_metrics:
             raise ControlPlaneError("candidate graph has no observed root coordinates")
@@ -462,6 +789,15 @@ class FinalControlPlane:
                 "burst_role": "candidate_group_penalty_only",
                 "counterfactual_resolve": False,
                 "metric_training_rows": model.training_rows,
+                "metric_target_readiness": {
+                    node_id: asdict(status)
+                    for node_id, status
+                    in sorted(model.target_readiness.items())
+                },
+                "excluded_not_ready_root_coordinates": list(
+                    model.not_ready_root_coordinates
+                ),
+                "baseline_scales": self.baseline.scale_snapshot(),
                 "burst_evidence_ids": {
                     f"{key[0]}|{key[1]}": list(values)
                     for key, values in evidence_ids.items()
@@ -497,16 +833,25 @@ class FinalControlPlane:
             )
             live_graph = allowed_service_graph(snapshot)
             topology_reset = False
-            if self.state == "healthy" \
-                    and self._healthy_topology_snapshot_id != snapshot.snapshot_id:
+            if self.state in {
+                "starting", "calibrating", "ready", "healthy",
+            } and self._healthy_topology_snapshot_id != snapshot.snapshot_id:
                 topology_reset = self._healthy_topology_snapshot_id is not None
                 self._reset_healthy_segment(snapshot.snapshot_id)
+            elif self.state == "ready":
+                self.state = "healthy"
             graph = (
                 self._soft.service_graph
                 if self.state != "healthy" and self._soft is not None
                 else live_graph
             )
+            self._catalog_window(window)
             observations, raw = self.resolver.normalize_window(window, self.baseline)
+            self._invalid_reason_counts.update(
+                item["invalid_reason"]
+                for item in self.resolver.last_validity.values()
+                if item["invalid_reason"] is not None
+            )
             signed = {
                 node_id: item.signed_z for node_id, item in observations.items()
             }
@@ -517,7 +862,7 @@ class FinalControlPlane:
                 (*service_scores.values(), *edge_scores.values()), default=0.0,
             )
             safe_healthy = (
-                self.state == "healthy"
+                self.state in {"starting", "calibrating", "healthy"}
                 and (not baseline_ready or maximum < self.config.soft_threshold)
             )
             self._update_healthy_models(
@@ -528,6 +873,16 @@ class FinalControlPlane:
                 graph=graph,
                 safe_healthy=safe_healthy,
             )
+            if self.state in {"starting", "calibrating"}:
+                self._advance_calibration(
+                    graph=graph,
+                    timestamp_ns=window.window_end_ns,
+                    maximum=maximum,
+                    service_scores=service_scores,
+                    edge_scores=edge_scores,
+                    observations=observations,
+                )
+                continue
             if baseline_ready:
                 self._transition(
                     sequence=window.sequence,
@@ -556,7 +911,42 @@ class FinalControlPlane:
             if self._hard is not None \
                     and window.sequence >= self._hard.analysis_sequence \
                     and self._hard.sequence not in self._diagnosed_hard_sequences:
-                self._results.append(self._diagnose())
+                model = (
+                    self._soft.metric_model
+                    if self._soft is not None else None
+                )
+                if model is None or not model.ready:
+                    statuses = (
+                        {} if model is None else {
+                            node_id: asdict(status)
+                            for node_id, status
+                            in sorted(model.target_readiness.items())
+                            if status.root_eligible and not status.ready
+                        }
+                    )
+                    reasons = sorted({
+                        item["not_ready_reason"]
+                        for item in statuses.values()
+                        if item["not_ready_reason"] is not None
+                    })
+                    self._rca_not_ready_events.append({
+                        "status": "RCA_NOT_READY",
+                        "reason": (
+                            reasons[0]
+                            if len(reasons) == 1
+                            else "metric_model_not_ready"
+                        ),
+                        "not_ready_reasons": reasons,
+                        "hard_alert_timestamp_ns": (
+                            self._hard.timestamp_ns
+                        ),
+                        "analysis_cutoff_ns": (
+                            self._hard.analysis_cutoff_ns
+                        ),
+                        "metric_target_readiness": statuses,
+                    })
+                else:
+                    self._results.append(self._diagnose())
                 self._diagnosed_hard_sequences.add(self._hard.sequence)
         if self._hard is not None \
                 and self._hard.sequence not in self._diagnosed_hard_sequences:
@@ -571,6 +961,8 @@ class FinalControlPlane:
             processed_window_count=processed,
             state_timeline=tuple(self._timeline),
             results=tuple(self._results),
+            calibration_readiness=dict(self._calibration_report),
+            rca_not_ready_events=tuple(self._rca_not_ready_events),
         )
 
 
@@ -579,6 +971,10 @@ def save_control_run(output: str | Path, run: ControlPlaneRun) -> None:
     directory.mkdir(parents=True, exist_ok=False)
     (directory / "control-run.json").write_text(
         canonical_json(run.to_dict()) + "\n", encoding="utf-8",
+    )
+    (directory / "calibration-readiness.json").write_text(
+        canonical_json(run.calibration_readiness) + "\n",
+        encoding="utf-8",
     )
     with (directory / "rca-results.jsonl").open("x", encoding="utf-8") as handle:
         for result in run.results:

@@ -35,6 +35,10 @@ def main(argv=None) -> int:
         "dataset_id": run.dataset_id,
         "output": str(args.output.resolve()),
         "phase": "control_complete",
+        "calibration_ready": run.calibration_readiness.get("ready", False),
+        "calibration_readiness_report": str(
+            (args.output / "calibration-readiness.json").resolve()
+        ),
         "result_count": len(run.results),
         "run_fingerprint": run.run_fingerprint,
         "window_count": run.processed_window_count,

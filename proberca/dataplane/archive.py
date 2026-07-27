@@ -279,7 +279,8 @@ def _validate_burst_evidence(
         matched = [
             (entity_id, category)
             for (entity_id, category), metric_ids in eligible.items()
-            if target == entity_id or evidence.target_id in metric_ids
+            if category == role["root_category"]
+            and (target == entity_id or evidence.target_id in metric_ids)
         ]
         if len(matched) != 1:
             raise CollectionArchiveError("Burst target is not one eligible candidate group")

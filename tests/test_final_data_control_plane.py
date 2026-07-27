@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,9 +12,22 @@ import yaml
 from proberca.cli.analyze_collection import main as analyze_main
 from proberca.cli.seal_collection import main as seal_main
 from proberca.controlplane import FinalControlConfig, FinalControlPlane
-from proberca.controlplane.model import MetricPropagationModel
+from proberca.controlplane import (
+    CalibrationNotReadyError,
+    load_ready_calibration_report,
+)
+from proberca.controlplane.metric_model import fit_metric_propagation
+from proberca.controlplane.model import (
+    CandidateEntityGraph,
+    MetricNode,
+    MetricPropagationModel,
+)
 from proberca.controlplane.observations import MetricResolver, RobustBaselineStore
-from proberca.controlplane.service_model import ServiceRLS, allowed_service_graph
+from proberca.controlplane.service_model import (
+    AllowedServiceGraph,
+    ServiceRLS,
+    allowed_service_graph,
+)
 from proberca.data.schema import (
     EdgeMetricRecord,
     EvidenceObservationRecord,
@@ -60,22 +74,63 @@ _HOST_METRICS = (
     ("io_psi", "io"),
     ("nic_drop_error_rate", "net_local"),
 )
+_HEALTHY_PATTERNS = (
+    (-1, 1, 0, 1, -1),
+    (0, -1, 1, -1, 1),
+    (1, 0, -1, 1, 0),
+)
+
+
+def _healthy_variation(sequence: int, pattern: int) -> int:
+    if sequence <= 3:
+        return (-1, 0, 1)[sequence - 1]
+    values = _HEALTHY_PATTERNS[pattern]
+    return values[(sequence - 4) % len(values)]
+
+
+def _required_root_coordinates() -> tuple[str, ...]:
+    output = []
+    for spec in FinalControlConfig().metric_roles:
+        if not spec.root_eligible:
+            continue
+        if spec.entity_type == "service":
+            entity_id = "cluster::ns::payment"
+        elif spec.entity_type == "host":
+            entity_id = "cluster::host::node-a"
+        else:
+            continue
+        output.append(f"{entity_id}::{spec.metric_name}")
+    return tuple(sorted(output))
 
 
 def _config() -> FinalControlConfig:
     return FinalControlConfig(
         baseline_min_windows=3,
-        baseline_min_scale=0.1,
+        baseline_min_scale=1.0e-12,
+        baseline_family_min_scales={
+            "count": 0.5,
+            "latency": 0.5,
+            "psi": 0.0005,
+            "ratio": 0.0005,
+        },
+        latency_min_samples=1,
+        failure_min_requests=1,
+        service_min_training_updates=1,
         service_lags=(1,),
         metric_lags=(1,),
         metric_min_training_rows=2,
+        metric_rows_per_feature=1.0,
+        calibration_validation_windows=1,
+        calibration_required_root_coordinates=(
+            _required_root_coordinates()
+        ),
         soft_threshold=2.0,
         soft_consecutive_windows=1,
         hard_threshold=4.0,
         hard_consecutive_windows=2,
         recovery_threshold=0.5,
         recovery_windows=2,
-        burst_window_count=1,
+        burst_window_count=2,
         l1_penalty=0.05,
         fista_tolerance=1.0e-9,
     )
@@ -114,15 +169,17 @@ def _topology(
 
 
 def _values(sequence: int) -> dict[str, float]:
-    variation = ((sequence - 1) % 3) - 1
+    variation = _healthy_variation(sequence, 0)
+    cpu_variation = _healthy_variation(sequence, 1)
+    io_variation = _healthy_variation(sequence, 1)
     values = {
         "request_rate": 100.0 + 2.0 * variation,
         "request_failure_rate": 0.01 + 0.001 * variation,
         "request_latency_p95": 10.0 + variation,
-        "cpu_usage_rate": 0.30 + 0.01 * variation,
-        "cpu_throttle_ratio": 0.02 + 0.002 * variation,
+        "cpu_usage_rate": 0.30 + 0.01 * cpu_variation,
+        "cpu_throttle_ratio": 0.02 + 0.002 * cpu_variation,
         "memory_working_set_ratio": 0.40 + 0.01 * variation,
-        "io_psi": 0.02 + 0.002 * variation,
+        "io_psi": 0.02 + 0.002 * io_variation,
         "futex_wait_time_rate": 0.01 + 0.001 * variation,
         "local_socket_failure_rate": 0.01 + 0.001 * variation,
     }
@@ -185,10 +242,20 @@ def _node_records(sequence: int) -> tuple[NodeMetricRecord, ...]:
         name=name, family=family, value=values[name],
         scope="service", service="payment",
     ) for name, family in _METRICS)
-    variation = ((sequence - 1) % 3) - 1
+    host_patterns = {
+        "cpu_psi": 2,
+        "memory_psi": 1,
+        "io_psi": 2,
+        "nic_drop_error_rate": 0,
+    }
     hosts = tuple(record(
-        name=name, family=family, value=0.02 + 0.001 * variation,
-        scope="node", service="host-metrics",
+        name=name,
+        family=family,
+        value=0.02 + 0.001 * _healthy_variation(
+            sequence, host_patterns[name],
+        ),
+        scope="node",
+        service="host-metrics",
     ) for name, family in _HOST_METRICS)
     return services + hosts
 
@@ -208,7 +275,9 @@ def _evidence() -> EvidenceObservationRecord:
         cluster_id="cluster",
         namespace="ns",
         target_type="node",
-        target_id="cluster::ns::payment::cpu_usage_rate",
+        # BurstEvidenceCollector emits an entity-level target.  The frozen
+        # channel role selects the unique root-cause category on that entity.
+        target_id="cluster::ns::payment",
         channel_id="sched.runqueue_wait_p95",
         source_type="burst_event",
         normalized_strength=0.9,
@@ -413,6 +482,18 @@ def test_separate_cli_phases(tmp_path, capsys):
     control_output = capsys.readouterr().out
     assert '"phase":"control_complete"' in control_output
     assert (control_dir / "control-run.json").is_file()
+    readiness_path = control_dir / "calibration-readiness.json"
+    assert readiness_path.is_file()
+    report = load_ready_calibration_report(readiness_path)
+    assert report["ready"] is True
+    report["ready"] = False
+    readiness_path.write_text(
+        json.dumps(report), encoding="utf-8",
+    )
+    with pytest.raises(
+        CalibrationNotReadyError, match="fingerprint mismatch",
+    ):
+        load_ready_calibration_report(readiness_path)
     assert (control_dir / "rca-results.jsonl").is_file()
 
 
@@ -447,14 +528,23 @@ def test_zero_coverage_placeholder_does_not_enter_healthy_baseline():
     config = _config()
     record = replace(_node_records(1)[0], value=0.0, sample_count=0, coverage=0.0)
     window = SimpleNamespace(node_metrics=(record,), edge_metrics=())
-
-    normalized, raw = MetricResolver(config).normalize_window(
-        window,
-        RobustBaselineStore(config),
-    )
+    resolver = MetricResolver(config)
+    baseline = RobustBaselineStore(config)
+    normalized, raw = resolver.normalize_window(window, baseline)
 
     assert normalized == {}
     assert raw == {}
+    assert baseline.snapshot() == {}
+    validity = next(iter(resolver.last_validity.values()))
+    assert validity == {
+        "valid": False,
+        "invalid_reason": "zero_coverage",
+        "raw_value": 0.0,
+        "coverage": 0.0,
+        "sample_count": 0,
+        "request_count": None,
+        "quality": 0.0,
+    }
 
     model = MetricPropagationModel(
         node_ids=("a", "b"), lags=(1,),
@@ -463,6 +553,191 @@ def test_zero_coverage_placeholder_does_not_enter_healthy_baseline():
         training_rows=4, healthy_cutoff_ns=10,
     )
     assert model.cross_prediction("a", {4: {"a": 7.0, "b": 3.0}}, 5) == 6.0
+
+
+def test_zero_mad_uses_metric_family_floor_instead_of_numeric_epsilon():
+    config = replace(
+        _config(),
+        baseline_family_min_scales={
+            "count": 1.0,
+            "latency": 1.0,
+            "psi": 0.1,
+            "ratio": 0.5,
+        },
+    )
+    spec = next(
+        item for item in config.metric_roles
+        if item.metric_name == "cpu_usage_rate"
+    )
+    baseline = RobustBaselineStore(config)
+    for _ in range(config.baseline_min_windows):
+        baseline.update("service::cpu_usage_rate", 10.0, spec)
+
+    score, scale = baseline.score(
+        "service::cpu_usage_rate", 11.0, 1, spec,
+    )
+
+    assert score == pytest.approx(2.0)
+    assert scale.mad_scale == 0.0
+    assert scale.iqr_scale == 0.0
+    assert scale.final_scale == 0.5
+    assert scale.scale_source == "family_floor"
+
+
+def test_zero_mad_prefers_iqr_when_iqr_exceeds_family_floor():
+    config = replace(
+        _config(),
+        baseline_min_windows=4,
+        baseline_family_min_scales={
+            "count": 1.0,
+            "latency": 1.0,
+            "psi": 0.1,
+            "ratio": 0.5,
+        },
+    )
+    spec = next(
+        item for item in config.metric_roles
+        if item.metric_name == "cpu_usage_rate"
+    )
+    baseline = RobustBaselineStore(config)
+    for value in (0.0, 0.0, 0.0, 10.0):
+        baseline.update("service::cpu_usage_rate", value, spec)
+
+    scale = baseline.scale("service::cpu_usage_rate", spec)
+
+    assert scale is not None
+    assert scale.mad_scale == 0.0
+    assert scale.iqr_scale > scale.family_floor
+    assert scale.final_scale == scale.iqr_scale
+    assert scale.scale_source == "iqr"
+
+
+def test_metric_ridge_is_fitted_per_target_not_by_global_complete_rows():
+    service_a = "cluster::ns::a"
+    service_b = "cluster::ns::b"
+    metric_a = MetricNode(
+        node_id=f"{service_a}::cpu_usage_rate",
+        entity_id=service_a,
+        entity_type="service",
+        metric_name="cpu_usage_rate",
+        role="service_cpu_usage",
+        root_category="CPU",
+        root_eligible=True,
+    )
+    metric_b = replace(
+        metric_a,
+        node_id=f"{service_b}::cpu_usage_rate",
+        entity_id=service_b,
+    )
+    candidate = CandidateEntityGraph(
+        seed_services=(service_a, service_b),
+        seed_edges=(),
+        services=(service_a, service_b),
+        hosts=(),
+        edges=(),
+        strong_service_relations=(),
+        topology_snapshot_id="topology",
+    )
+    graph = AllowedServiceGraph(
+        services=(service_a, service_b),
+        relations=(),
+        physical_edges=(),
+        placements=(),
+        snapshot_id="topology",
+    )
+    history = {
+        1: {metric_a.node_id: 1.0, metric_b.node_id: 1.0},
+        2: {metric_a.node_id: 2.0},
+        3: {metric_a.node_id: 3.0},
+        4: {metric_a.node_id: 4.0},
+    }
+
+    model = fit_metric_propagation(
+        metrics={
+            metric_a.node_id: metric_a,
+            metric_b.node_id: metric_b,
+        },
+        healthy_history=history,
+        candidate=candidate,
+        service_graph=graph,
+        healthy_cutoff_ns=5 * _NS,
+        config=replace(
+            _config(),
+            metric_min_training_rows=2,
+            metric_rows_per_feature=2.0,
+        ),
+    )
+
+    ready = model.target_readiness[metric_a.node_id]
+    sparse = model.target_readiness[metric_b.node_id]
+    assert ready.ready is True
+    assert ready.valid_training_rows == 3
+    assert (metric_a.node_id, metric_a.node_id, 1) in model.coefficients
+    assert sparse.ready is False
+    assert sparse.valid_training_rows == 0
+    assert sparse.not_ready_reason == "insufficient_valid_history"
+    assert model.ready is False
+
+
+def test_fully_missing_service_symptom_is_not_treated_as_healthy_zero():
+    service = "cluster::ns::payment"
+    graph = AllowedServiceGraph(
+        services=(service,),
+        relations=(),
+        physical_edges=(),
+        placements=(),
+        snapshot_id="topology",
+    )
+
+    service_scores, edge_scores = FinalControlPlane(_config())._scores(
+        {}, graph,
+    )
+
+    assert service_scores == {}
+    assert edge_scores == {}
+
+
+def test_unfrozen_family_floors_keep_run_in_calibration(tmp_path):
+    config = replace(
+        _config(),
+        baseline_family_min_scales={
+            "count": None,
+            "latency": None,
+            "psi": None,
+            "ratio": None,
+        },
+    )
+    writer = CollectionArchiveWriter(
+        tmp_path / "not-ready",
+        dataset_id=fingerprint({"dataset": "not-ready"}),
+        collection_contract=config.collection_contract,
+        source_description=config.collection_contract["source_description"],
+        collection_metadata=_collection_metadata(config),
+    )
+    for sequence in range(1, 13):
+        writer.append(_window(sequence))
+
+    run = FinalControlPlane(config).run(writer.seal())
+
+    assert run.results == ()
+    assert run.rca_not_ready_events == ()
+    assert run.calibration_readiness["ready"] is False
+    assert run.calibration_readiness["baseline_ready"] is False
+    assert all(
+        item["not_ready_reason"] == "family_floor_not_frozen"
+        for item in run.calibration_readiness["baseline_status"].values()
+    )
+    assert {item["state"] for item in run.state_timeline} == {"calibrating"}
+
+    output = tmp_path / "control-output"
+    from proberca.controlplane import save_control_run
+    save_control_run(output, run)
+    with pytest.raises(
+        CalibrationNotReadyError, match="calibration is not READY",
+    ):
+        load_ready_calibration_report(
+            output / "calibration-readiness.json"
+        )
 
 
 def test_call_identity_stays_directed_but_service_mask_is_bidirectional():
@@ -510,6 +785,11 @@ def test_formal_alert_defaults_and_per_entity_consecutive_state():
     config = FinalControlConfig()
     assert (config.soft_threshold, config.soft_consecutive_windows) == (3.0, 3)
     assert (config.hard_threshold, config.hard_consecutive_windows) == (5.0, 2)
+    assert config.calibration_required_root_coordinates == ()
+    assert all(
+        value is None
+        for value in config.baseline_family_min_scales.values()
+    )
     control = FinalControlPlane(config)
     service_a = "cluster::ns::a"
     service_b = "cluster::ns::b"

@@ -403,13 +403,19 @@ class FinalWindowAggregator:
         bounded: bool = True,
     ) -> _Value:
         if denominator.value <= 0:
-            if numerator.value == 0 and name in {
-                "request_failure_rate", "cpu_throttle_ratio",
-                "local_socket_failure_rate", "edge_failure_rate",
-                "dns_failure_rate", "io_psi",
-                "futex_wait_time_rate",
-            }:
-                return _combine((numerator, denominator), 0.0)
+            if numerator.value == 0:
+                combined = _combine((numerator, denominator), 0.0)
+                # A zero denominator has no statistical exposure. Preserve
+                # lineage but mark the derived ratio explicitly missing.
+                return _Value(
+                    0.0,
+                    0,
+                    0.0,
+                    combined.event_loss_rate,
+                    combined.mapping_quality,
+                    combined.source_ids,
+                    combined.object_ids,
+                )
             raise RawCollectionError(f"{name} has a non-positive denominator")
         result = numerator.value / (denominator.value + RATIO_EPSILON)
         if not math.isfinite(result) or result < 0 \
