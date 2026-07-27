@@ -32,6 +32,7 @@ kubernetes:
 prometheus:
   base_url: http://127.0.0.1:9090
   timeout_sec: 10.0
+  maximum_sample_age_sec: 2.0
   reject_warnings: true
   queries:
     # Service request symptoms. The exporter must expose raw counters and

@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coredns
+  namespace: kube-system
+spec:
+  template:
+    metadata:
+      annotations:
+        proberca.io/cpu-accounting-profile: single-vm-v1
+    spec:
+      containers:
+        - name: coredns
+          resources:
+            requests:
+              cpu: 100m
+              memory: 70Mi
+            limits:
+              cpu: 500m
+              memory: 170Mi

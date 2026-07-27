@@ -143,6 +143,7 @@ class PrometheusPrimitiveQuery:
 class PrometheusSourceConfig:
     base_url: str
     timeout_sec: float
+    maximum_sample_age_sec: float
     reject_warnings: bool
     queries: tuple[PrometheusPrimitiveQuery, ...]
 
@@ -178,6 +179,14 @@ class PrometheusSourceConfig:
                 or not isinstance(self.timeout_sec, (int, float)) \
                 or float(self.timeout_sec) <= 0:
             raise RawCollectionError("Prometheus timeout_sec must be positive")
+        if isinstance(self.maximum_sample_age_sec, bool) \
+                or not isinstance(
+                    self.maximum_sample_age_sec, (int, float)
+                ) \
+                or not 0 < float(self.maximum_sample_age_sec) <= 5:
+            raise RawCollectionError(
+                "Prometheus maximum_sample_age_sec must be in (0, 5]"
+            )
         if type(self.reject_warnings) is not bool:
             raise RawCollectionError("reject_warnings must be boolean")
         if not self.queries:
@@ -197,6 +206,7 @@ class PrometheusSourceConfig:
         return fingerprint({
             "base_url": self.base_url,
             "timeout_sec": self.timeout_sec,
+            "maximum_sample_age_sec": self.maximum_sample_age_sec,
             "reject_warnings": self.reject_warnings,
             "queries": [item.to_dict() for item in self.queries],
         })
@@ -252,10 +262,15 @@ class PrometheusPrimitiveSource:
         ] = {}
 
     def _instant(self, query: PrometheusPrimitiveQuery, timestamp_ns: int):
+        maximum_age = float(self.config.maximum_sample_age_sec)
+        fresh_promql = (
+            f"({query.promql}) and "
+            f"((time() - timestamp({query.promql})) <= {maximum_age:.9f})"
+        )
         response = self.session.get(
             self.config.base_url.rstrip("/") + "/api/v1/query",
             params={
-                "query": query.promql,
+                "query": fresh_promql,
                 "time": f"{timestamp_ns / 1_000_000_000:.9f}",
             },
             timeout=float(self.config.timeout_sec),

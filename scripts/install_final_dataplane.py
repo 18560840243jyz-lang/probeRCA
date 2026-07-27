@@ -201,6 +201,27 @@ def install(repository: Path) -> None:
         "kubectl",
         "--kubeconfig", "/home/jyz/.kube/config",
         "--context", "kind-proberca-ob",
+        "-n", "kube-system",
+        "patch", "deployment/coredns",
+        "--type", "strategic",
+        "--patch-file",
+        str(
+            repository
+            / "deploy/final-dataplane/coredns-cpu-accounting-patch.yaml"
+        ),
+    ])
+    _run([
+        "kubectl",
+        "--kubeconfig", "/home/jyz/.kube/config",
+        "--context", "kind-proberca-ob",
+        "-n", "kube-system",
+        "rollout", "status", "deployment/coredns",
+        "--timeout=120s",
+    ])
+    _run([
+        "kubectl",
+        "--kubeconfig", "/home/jyz/.kube/config",
+        "--context", "kind-proberca-ob",
         "apply", "-f",
         str(repository / "deploy/final-dataplane/beyla.yaml"),
     ])

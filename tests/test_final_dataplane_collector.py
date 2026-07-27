@@ -815,7 +815,7 @@ def test_prometheus_source_preserves_raw_boundary_series_identity():
         "histogram_bound_scale": 1.0,
     })
     config = PrometheusSourceConfig(
-        "http://prometheus.test", 1.0, True, (query,)
+        "http://prometheus.test", 1.0, 2.0, True, (query,)
     )
 
     class Response:
@@ -849,10 +849,12 @@ def test_prometheus_source_preserves_raw_boundary_series_identity():
     class Session:
         def __init__(self):
             self.timestamps = []
+            self.queries = []
 
         def get(self, _url, *, params, timeout):
             assert timeout == 1.0
             self.timestamps.append(float(params["time"]))
+            self.queries.append(params["query"])
             return Response(float(params["time"]))
 
     class Revision(SimpleNamespace):
@@ -894,6 +896,11 @@ def test_prometheus_source_preserves_raw_boundary_series_identity():
     assert len({item.source_record_id for item in samples}) == 2
     assert len(windows[1]) == 2
     assert sorted(session.timestamps) == [1.0, 2.0, 3.0]
+    assert all(
+        "time() - timestamp(proberca_service_request_total)" in item
+        and "<= 2.000000000" in item
+        for item in session.queries
+    )
     assert windows[0][-1].source_record_id \
         == windows[1][0].source_record_id
 

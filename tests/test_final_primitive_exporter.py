@@ -498,6 +498,30 @@ def test_cadvisor_uses_pinned_direct_kubelet_transport():
     assert '"-----BEGIN CERTIFICATE-----"' in installer
 
 
+def test_coredns_cpu_accounting_profile_provides_throttle_denominator():
+    patch_path = Path(
+        "deploy/final-dataplane/coredns-cpu-accounting-patch.yaml"
+    )
+    patch = yaml.safe_load(patch_path.read_text(encoding="utf-8"))
+    assert patch["metadata"] == {
+        "name": "coredns",
+        "namespace": "kube-system",
+    }
+    template = patch["spec"]["template"]
+    assert template["metadata"]["annotations"][
+        "proberca.io/cpu-accounting-profile"
+    ] == "single-vm-v1"
+    container = template["spec"]["containers"][0]
+    assert container["name"] == "coredns"
+    assert container["resources"]["limits"]["cpu"] == "500m"
+    installer = Path(
+        "scripts/install_final_dataplane.py"
+    ).read_text(encoding="utf-8")
+    assert str(patch_path) in installer
+    assert '"patch", "deployment/coredns"' in installer
+    assert '"rollout", "status", "deployment/coredns"' in installer
+
+
 def test_healthy_calibration_load_is_frozen_and_fault_free():
     documents = tuple(yaml.safe_load_all(Path(
         "deploy/final-dataplane/healthy-calibration-load.yaml"
