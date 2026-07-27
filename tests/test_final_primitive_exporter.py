@@ -657,6 +657,60 @@ def test_active_cgroup_paths_resolve_exact_runtime_identities(tmp_path):
     assert exporter._active_cgroup_paths(inventory) == resolved
 
 
+def test_stale_runtime_inventory_refreshes_after_pod_rollout(monkeypatch):
+    stale = SimpleNamespace(containers=(
+        SimpleNamespace(container_id="a" * 64),
+    ))
+    refreshed = SimpleNamespace(containers=(
+        SimpleNamespace(container_id="b" * 64),
+    ))
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter._inventory_cache = stale
+    exporter._inventory = lambda: refreshed
+    attempts = []
+
+    def cgroup_paths(inventory):
+        attempts.append(inventory)
+        if inventory is stale:
+            raise RawCollectionError(
+                "active container cgroups are incomplete"
+            )
+        return {"b" * 64: Path("/new-cgroup")}
+
+    monkeypatch.setattr(exporter, "_active_cgroup_paths", cgroup_paths)
+
+    inventory, paths = exporter._inventory_and_cgroup_paths()
+
+    assert attempts == [stale, refreshed]
+    assert inventory is refreshed
+    assert paths == {"b" * 64: Path("/new-cgroup")}
+    assert exporter._inventory_cache is refreshed
+
+
+def test_unchanged_runtime_inventory_keeps_cgroup_failure_closed(
+    monkeypatch,
+):
+    inventory = SimpleNamespace(containers=(
+        SimpleNamespace(container_id="a" * 64),
+    ))
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter._inventory_cache = inventory
+    exporter._inventory = lambda: inventory
+
+    def fail(_inventory):
+        raise RawCollectionError(
+            "active container cgroups are incomplete"
+        )
+
+    monkeypatch.setattr(exporter, "_active_cgroup_paths", fail)
+
+    with pytest.raises(
+        RawCollectionError,
+        match="active container cgroups are incomplete",
+    ):
+        exporter._inventory_and_cgroup_paths()
+
+
 def test_coredns_cpu_accounting_profile_provides_throttle_denominator():
     patch_path = Path(
         "deploy/final-dataplane/coredns-cpu-accounting-patch.yaml"

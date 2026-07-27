@@ -1622,6 +1622,34 @@ class FinalPrimitiveExporter:
                 raise RawCollectionError("DNS cgroup identity is ambiguous")
         return output
 
+    def _inventory_and_cgroup_paths(
+        self,
+    ) -> tuple[Inventory, dict[str, Path]]:
+        inventory = self._inventory_cache
+        if inventory is None:
+            inventory = self._inventory()
+            self._inventory_cache = inventory
+        try:
+            return inventory, self._active_cgroup_paths(inventory)
+        except RawCollectionError as cached_error:
+            # A Pod rollout can remove the cached container cgroup before the
+            # concurrently prepared inventory is installed at the end of a
+            # snapshot.  Refresh once from Kubernetes and recover only when
+            # the runtime identities actually changed.  An unchanged or still
+            # incomplete mapping remains a hard failure.
+            refreshed = self._inventory()
+            cached_ids = tuple(sorted(
+                item.container_id for item in inventory.containers
+            ))
+            refreshed_ids = tuple(sorted(
+                item.container_id for item in refreshed.containers
+            ))
+            if refreshed_ids == cached_ids:
+                raise cached_error
+            paths = self._active_cgroup_paths(refreshed)
+            self._inventory_cache = refreshed
+            return refreshed, paths
+
     def collect_snapshot(
         self, timestamp_ns: int | None = None,
     ) -> str:
@@ -1630,11 +1658,7 @@ class FinalPrimitiveExporter:
             raise RawCollectionError(
                 "final primitive snapshot must align to an epoch second"
             )
-        inventory = self._inventory_cache
-        if inventory is None:
-            inventory = self._inventory()
-            self._inventory_cache = inventory
-        cgroup_paths = self._active_cgroup_paths(inventory)
+        inventory, cgroup_paths = self._inventory_and_cgroup_paths()
         cgroup_identity = self._cgroup_identity(
             inventory, cgroup_paths
         )
