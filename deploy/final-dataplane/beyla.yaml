@@ -51,6 +51,37 @@ data:
     discovery:
       instrument:
         - k8s_namespace: online-boutique
+          k8s_deployment_name: adservice
+          exports: [metrics]
+        - k8s_namespace: online-boutique
+          k8s_deployment_name: cartservice
+          exports: [metrics]
+        - k8s_namespace: online-boutique
+          k8s_deployment_name: checkoutservice
+          exports: [metrics]
+        - k8s_namespace: online-boutique
+          k8s_deployment_name: currencyservice
+          exports: [metrics]
+        - k8s_namespace: online-boutique
+          k8s_deployment_name: emailservice
+          exports: [metrics]
+        - k8s_namespace: online-boutique
+          k8s_deployment_name: frontend
+          exports: [metrics]
+        - k8s_namespace: online-boutique
+          k8s_deployment_name: paymentservice
+          exports: [metrics]
+        - k8s_namespace: online-boutique
+          k8s_deployment_name: productcatalogservice
+          exports: [metrics]
+        - k8s_namespace: online-boutique
+          k8s_deployment_name: recommendationservice
+          exports: [metrics]
+        - k8s_namespace: online-boutique
+          k8s_deployment_name: redis-cart
+          exports: [metrics]
+        - k8s_namespace: online-boutique
+          k8s_deployment_name: shippingservice
           exports: [metrics]
         - k8s_namespace: kube-system
           k8s_deployment_name: coredns

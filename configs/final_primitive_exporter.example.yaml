@@ -1,4 +1,4 @@
-schema_version: probeRCA-final-primitive-exporter-v1
+schema_version: probeRCA-final-primitive-exporter-v2
 cluster_id: kind-proberca-ob
 kubeconfig_path: /home/jyz/.kube/config
 kubernetes_context: kind-proberca-ob
@@ -19,6 +19,8 @@ include_services:
   - online-boutique/shippingservice
   - kube-system/kube-dns
 kind_node_container: proberca-ob-control-plane
+kubelet_port: 10250
+kubelet_ca_path: /usr/local/lib/proberca-final/kubelet.crt
 beyla_port: 9400
 node_exporter_url: http://127.0.0.1:9100/metrics
 bpf_loader_path: /usr/local/lib/proberca-final/proberca-final-ebpf-loader

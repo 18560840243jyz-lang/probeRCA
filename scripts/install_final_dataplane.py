@@ -131,6 +131,39 @@ def install(repository: Path) -> None:
 
     install_directory = Path("/usr/local/lib/proberca-final")
     install_directory.mkdir(parents=True, exist_ok=True)
+    exporter_config = _load_mapping(
+        repository / "configs/final_primitive_exporter.example.yaml"
+    )
+    kubelet_ca_destination = Path(
+        exporter_config["kubelet_ca_path"]
+    )
+    if kubelet_ca_destination != install_directory / "kubelet.crt":
+        raise SystemExit(
+            "final kubelet CA path must remain inside the install directory"
+        )
+    with tempfile.TemporaryDirectory(
+        prefix="proberca-kubelet-ca-"
+    ) as directory:
+        kubelet_chain = Path(directory) / "kubelet.crt"
+        _run([
+            "docker", "cp",
+            (
+                f"{exporter_config['kind_node_container']}:"
+                "/var/lib/kubelet/pki/kubelet.crt"
+            ),
+            str(kubelet_chain),
+        ])
+        if (
+            kubelet_chain.read_text(encoding="ascii").count(
+                "-----BEGIN CERTIFICATE-----"
+            ) < 2
+        ):
+            raise SystemExit(
+                "kind kubelet certificate chain lacks its pinned CA"
+            )
+        _atomic_copy(
+            kubelet_chain, kubelet_ca_destination, 0o644
+        )
     _atomic_copy(
         build_directory / "proberca-final-ebpf-loader",
         install_directory / "proberca-final-ebpf-loader",

@@ -73,12 +73,29 @@ def test_final_exporter_config_is_frozen_and_one_second():
     config = FinalPrimitiveExporterConfig.from_dict(payload)
     assert config.schema_version == FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION
     assert config.snapshot_period_sec == 1
+    assert config.kubelet_port == 10250
+    assert config.kubelet_ca_path.endswith("/kubelet.crt")
     assert "kube-system/kube-dns" in config.include_services
     assert len(config.include_services) == 12
     invalid = dict(payload)
     invalid["snapshot_period_sec"] = 2
     with pytest.raises(RawCollectionError, match="frozen range"):
         FinalPrimitiveExporterConfig.from_dict(invalid)
+
+
+def test_inventory_refresh_is_pipelined_for_the_next_snapshot():
+    source = Path(
+        "proberca/dataplane/primitive_exporter.py"
+    ).read_text(encoding="utf-8")
+    cached = source.index("inventory = self._inventory_cache")
+    refresh = source.index(
+        "next_inventory_future = executor.submit(self._inventory)"
+    )
+    publish = source.index("self._inventory_cache = next_inventory")
+    aggregate = source.index(
+        "service_rows = self._request_rows(", publish
+    )
+    assert cached < refresh < publish < aggregate
 
 
 def test_final_bpf_normal_path_is_map_aggregated_and_window_safe():
@@ -290,6 +307,50 @@ def test_deployment_uses_pinned_beyla_without_unused_service_graph():
     ).read_text(encoding="utf-8"))
     assert scrape["honor_timestamps"] is True
     assert scrape["scrape_interval"] == "250ms"
+    documents = tuple(yaml.safe_load_all(manifest))
+    beyla_map = next(
+        item for item in documents
+        if item["kind"] == "ConfigMap"
+        and item["metadata"]["name"] == "proberca-beyla"
+    )
+    discovery = yaml.safe_load(
+        beyla_map["data"]["beyla.yaml"]
+    )["discovery"]["instrument"]
+    online_deployments = {
+        item["k8s_deployment_name"]
+        for item in discovery
+        if item["k8s_namespace"] == "online-boutique"
+    }
+    assert online_deployments == {
+        "adservice",
+        "cartservice",
+        "checkoutservice",
+        "currencyservice",
+        "emailservice",
+        "frontend",
+        "paymentservice",
+        "productcatalogservice",
+        "recommendationservice",
+        "redis-cart",
+        "shippingservice",
+    }
+    assert "loadgenerator" not in online_deployments
+    assert "proberca-healthy-checkout-load" not in online_deployments
+
+
+def test_cadvisor_uses_pinned_direct_kubelet_transport():
+    source = Path(
+        "proberca/dataplane/primitive_exporter.py"
+    ).read_text(encoding="utf-8")
+    installer = Path(
+        "scripts/install_final_dataplane.py"
+    ).read_text(encoding="utf-8")
+    assert "urllib3.HTTPSConnectionPool(" in source
+    assert "assert_hostname=node" in source
+    assert "cert_reqs=ssl.CERT_REQUIRED" in source
+    assert "connect_get_node_proxy_with_path" not in source
+    assert '"/var/lib/kubelet/pki/kubelet.crt"' in installer
+    assert '"-----BEGIN CERTIFICATE-----"' in installer
 
 
 def test_healthy_calibration_load_is_frozen_and_fault_free():

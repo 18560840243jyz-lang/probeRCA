@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import re
+import ssl
 import subprocess
 import threading
 import time
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import requests
+import urllib3
 import yaml
 from kubernetes import client, config as kubernetes_config
 from kubernetes.utils.quantity import parse_quantity
@@ -36,7 +38,7 @@ from .raw import RawCollectionError
 
 
 FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION = (
-    "probeRCA-final-primitive-exporter-v1"
+    "probeRCA-final-primitive-exporter-v2"
 )
 DNS_BUCKETS_MS = (
     0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0,
@@ -112,6 +114,8 @@ class FinalPrimitiveExporterConfig:
     namespaces: tuple[str, ...]
     include_services: tuple[str, ...]
     kind_node_container: str
+    kubelet_port: int
+    kubelet_ca_path: str
     beyla_port: int
     node_exporter_url: str
     bpf_loader_path: str
@@ -145,8 +149,8 @@ class FinalPrimitiveExporterConfig:
             )
         for name in (
             "cluster_id", "kubeconfig_path", "kubernetes_context",
-            "kind_node_container", "node_exporter_url", "bpf_loader_path",
-            "bpf_map_directory", "listen_host",
+            "kind_node_container", "kubelet_ca_path", "node_exporter_url",
+            "bpf_loader_path", "bpf_map_directory", "listen_host",
         ):
             _nonempty(name, getattr(self, name))
         if not self.node_exporter_url.startswith(("http://", "https://")):
@@ -176,6 +180,7 @@ class FinalPrimitiveExporterConfig:
                 "included service references an unlisted namespace"
             )
         for name, minimum, maximum in (
+            ("kubelet_port", 1, 65535),
             ("beyla_port", 1, 65535),
             ("listen_port", 1, 65535),
             ("dns_timeout_ms", 100, 60000),
@@ -407,6 +412,10 @@ class FinalPrimitiveExporter:
         ] = {}
         self._qdisc_drop_state: dict[str, tuple[float, float]] = {}
         self._last_capacity_ns: int | None = None
+        self._inventory_cache: Inventory | None = None
+        self._kubelet_pools: dict[
+            str, urllib3.HTTPSConnectionPool
+        ] = {}
         kubernetes_config.load_kube_config(
             config_file=self.config.kubeconfig_path,
             context=self.config.kubernetes_context,
@@ -608,10 +617,53 @@ class FinalPrimitiveExporter:
             text = _select_metric_lines(text, metric_names)
         return parse_prometheus_text(text)
 
-    def _cadvisor(self, node: str) -> tuple[PrometheusSample, ...]:
-        text = self.core.connect_get_node_proxy_with_path(
-            node, "metrics/cadvisor"
-        )
+    def _cadvisor(
+        self, node: str, address: str,
+    ) -> tuple[PrometheusSample, ...]:
+        pool = self._kubelet_pools.get(node)
+        if pool is None:
+            configuration = self.core.api_client.configuration
+            if not configuration.cert_file or not configuration.key_file:
+                raise RawCollectionError(
+                    "kubeconfig client certificate is unavailable"
+                )
+            if not Path(self.config.kubelet_ca_path).is_file():
+                raise RawCollectionError(
+                    "pinned kubelet CA chain is unavailable"
+                )
+            pool = urllib3.HTTPSConnectionPool(
+                address,
+                self.config.kubelet_port,
+                cert_file=configuration.cert_file,
+                key_file=configuration.key_file,
+                ca_certs=self.config.kubelet_ca_path,
+                cert_reqs=ssl.CERT_REQUIRED,
+                assert_hostname=node,
+                maxsize=1,
+            )
+            self._kubelet_pools[node] = pool
+        try:
+            response = pool.request(
+                "GET",
+                "/metrics/cadvisor",
+                timeout=urllib3.Timeout(
+                    total=float(self.config.source_timeout_sec)
+                ),
+                retries=False,
+            )
+        except urllib3.exceptions.HTTPError as error:
+            raise RawCollectionError(
+                "direct authenticated kubelet cAdvisor scrape failed"
+            ) from error
+        try:
+            if response.status != HTTPStatus.OK:
+                raise RawCollectionError(
+                    "kubelet cAdvisor returned HTTP "
+                    f"{response.status}"
+                )
+            text = response.data.decode("utf-8", errors="strict")
+        finally:
+            response.release_conn()
         return parse_prometheus_text(
             _select_metric_lines(text, _CADVISOR_METRICS)
         )
@@ -1481,14 +1533,22 @@ class FinalPrimitiveExporter:
             raise RawCollectionError(
                 "final primitive snapshot must align to an epoch second"
             )
-        inventory = self._inventory()
+        inventory = self._inventory_cache
+        if inventory is None:
+            inventory = self._inventory()
+            self._inventory_cache = inventory
         worker_count = (
-            3 + len(inventory.node_names)
+            4 + len(inventory.node_names)
             + len(inventory.coredns_pods)
         )
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            next_inventory_future = executor.submit(self._inventory)
             cadvisor_futures = {
-                node: executor.submit(self._cadvisor, node)
+                node: executor.submit(
+                    self._cadvisor,
+                    node,
+                    inventory.node_internal_ips[node],
+                )
                 for node in inventory.node_names
             }
             coredns_futures = {
@@ -1515,6 +1575,12 @@ class FinalPrimitiveExporter:
             bpf = bpf_future.result()
             beyla = beyla_future.result()
             host = host_future.result()
+            next_inventory = next_inventory_future.result()
+        # The immutable inventory used to label this snapshot is never
+        # replaced mid-collection.  A refresh is prepared concurrently for
+        # the next snapshot; a changed Pod/container then either maps cleanly
+        # on that next window or fails closed as missing coverage.
+        self._inventory_cache = next_inventory
         service_rows = self._request_rows(
             beyla, inventory, edge=False
         )
