@@ -69,7 +69,14 @@ def load_ready_calibration_report(path: str | Path) -> dict[str, Any]:
         raise CalibrationNotReadyError(
             "healthy validation window requirement is not satisfied"
         )
-    if not report.get("topology_snapshot_id") \
+    topology_epoch = report.get("topology_epoch")
+    if not report.get("snapshot_id") \
+            or not report.get("topology_snapshot_id") \
+            or not report.get("topology_fingerprint") \
+            or not report.get("runtime_identity_fingerprint") \
+            or isinstance(topology_epoch, bool) \
+            or not isinstance(topology_epoch, int) \
+            or topology_epoch <= 0 \
             or not report.get("required_scope_fingerprint") \
             or not report.get("control_config_fingerprint"):
         raise CalibrationNotReadyError(

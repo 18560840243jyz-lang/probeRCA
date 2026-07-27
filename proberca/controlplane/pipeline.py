@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -78,7 +78,14 @@ class FinalControlPlane:
         self._hard_counts: dict[tuple[str, str], int] = {}
         self._recovery_count = 0
         self._topology = []
-        self._healthy_topology_snapshot_id: str | None = None
+        self._healthy_topology_fingerprint: str | None = None
+        self._healthy_runtime_identity_fingerprint: str | None = None
+        self._topology_epoch = 0
+        self._topology_reset_count = 0
+        self._runtime_identity_reset_count = 0
+        self._baseline_reset_count = 0
+        self._metric_history_reset_count = 0
+        self._last_calibration_reset_reason = "not_initialized"
         self._healthy_history: dict[int, dict[str, float]] = {}
         self._signed_history: dict[int, dict[str, float]] = {}
         self._soft: _FrozenSoftContext | None = None
@@ -110,10 +117,44 @@ class FinalControlPlane:
             )
         return matches[0]
 
-    def _reset_healthy_segment(self, snapshot_id: str) -> None:
+    @staticmethod
+    def _topology_provenance(graph: AllowedServiceGraph) -> dict[str, Any]:
+        return {
+            "snapshot_id": graph.snapshot_id,
+            "topology_snapshot_id": graph.snapshot_id,
+            "topology_fingerprint": graph.topology_fingerprint,
+            "runtime_identity_fingerprint": (
+                graph.runtime_identity_fingerprint
+            ),
+            "topology_epoch": graph.topology_epoch,
+        }
+
+    def _initialize_healthy_segment(self, graph: AllowedServiceGraph) -> None:
+        if self._topology_epoch != 0:
+            raise ControlPlaneError("topology epoch is already initialized")
+        self._topology_epoch = 1
+        self._healthy_topology_fingerprint = graph.topology_fingerprint
+        self._healthy_runtime_identity_fingerprint = (
+            graph.runtime_identity_fingerprint
+        )
+        self._last_calibration_reset_reason = "initial_topology_epoch"
+        self.state = "calibrating"
+
+    def _reset_healthy_segment(
+        self, graph: AllowedServiceGraph, *, reason: str,
+    ) -> None:
+        if reason == "topology_fingerprint_changed":
+            self._topology_epoch += 1
+            self._topology_reset_count += 1
+        elif reason == "runtime_identity_fingerprint_changed":
+            self._runtime_identity_reset_count += 1
+        else:
+            raise ControlPlaneError("invalid calibration reset reason")
         self.baseline.reset()
+        self._baseline_reset_count += 1
         self.service_rls.reset()
         self._healthy_history.clear()
+        self._metric_history_reset_count += 1
         self._signed_history.clear()
         self._soft_counts.clear()
         self._hard_counts.clear()
@@ -122,7 +163,11 @@ class FinalControlPlane:
         self._calibration_validation_count = 0
         self._calibration_report = {}
         self.state = "calibrating"
-        self._healthy_topology_snapshot_id = snapshot_id
+        self._healthy_topology_fingerprint = graph.topology_fingerprint
+        self._healthy_runtime_identity_fingerprint = (
+            graph.runtime_identity_fingerprint
+        )
+        self._last_calibration_reset_reason = reason
 
     def _catalog_window(self, window) -> None:
         for record in (*window.node_metrics, *window.edge_metrics):
@@ -318,7 +363,19 @@ class FinalControlPlane:
                 "entity_types": sorted(required_types),
                 "root_coordinates": sorted(configured_roots),
             }),
-            "topology_snapshot_id": graph.snapshot_id,
+            **self._topology_provenance(graph),
+            "topology_reset_count": self._topology_reset_count,
+            "runtime_identity_reset_count": (
+                self._runtime_identity_reset_count
+            ),
+            "baseline_reset_count": self._baseline_reset_count,
+            "service_model_reset_count": self.service_rls.reset_count,
+            "metric_history_reset_count": (
+                self._metric_history_reset_count
+            ),
+            "last_calibration_reset_reason": (
+                self._last_calibration_reset_reason
+            ),
             "control_config_fingerprint": self.config.config_fingerprint,
             "baseline_status": baseline_status,
             "all_baseline_status": all_baseline_status,
@@ -401,7 +458,7 @@ class FinalControlPlane:
             ),
             "baseline_frozen": False,
             "service_model_frozen": False,
-            "topology_snapshot_id": graph.snapshot_id,
+            **self._topology_provenance(graph),
             "calibration_report_fingerprint": (
                 report["report_fingerprint"]
             ),
@@ -639,7 +696,7 @@ class FinalControlPlane:
                 f"{key[0]}|{key[1]}": value
                 for key, value in sorted(self._hard_counts.items())
             },
-            "topology_snapshot_id": graph.snapshot_id,
+            **self._topology_provenance(graph),
             "baseline_frozen": not models_updated,
             "service_model_frozen": not models_updated,
         })
@@ -833,13 +890,35 @@ class FinalControlPlane:
             )
             live_graph = allowed_service_graph(snapshot)
             topology_reset = False
+            runtime_identity_reset = False
             if self.state in {
                 "starting", "calibrating", "ready", "healthy",
-            } and self._healthy_topology_snapshot_id != snapshot.snapshot_id:
-                topology_reset = self._healthy_topology_snapshot_id is not None
-                self._reset_healthy_segment(snapshot.snapshot_id)
-            elif self.state == "ready":
-                self.state = "healthy"
+            }:
+                if self._healthy_topology_fingerprint is None:
+                    self._initialize_healthy_segment(live_graph)
+                elif (
+                    self._healthy_topology_fingerprint
+                    != live_graph.topology_fingerprint
+                ):
+                    topology_reset = True
+                    self._reset_healthy_segment(
+                        live_graph,
+                        reason="topology_fingerprint_changed",
+                    )
+                elif (
+                    self._healthy_runtime_identity_fingerprint
+                    != live_graph.runtime_identity_fingerprint
+                ):
+                    runtime_identity_reset = True
+                    self._reset_healthy_segment(
+                        live_graph,
+                        reason="runtime_identity_fingerprint_changed",
+                    )
+                elif self.state == "ready":
+                    self.state = "healthy"
+            live_graph = replace(
+                live_graph, topology_epoch=self._topology_epoch,
+            )
             graph = (
                 self._soft.service_graph
                 if self.state != "healthy" and self._soft is not None
@@ -905,8 +984,10 @@ class FinalControlPlane:
                     "reason": (
                         "topology_changed_baseline_reset"
                         if topology_reset else "baseline_not_ready"
+                        if not runtime_identity_reset
+                        else "runtime_identity_changed_baseline_reset"
                     ),
-                    "topology_snapshot_id": graph.snapshot_id,
+                    **self._topology_provenance(graph),
                 })
             if self._hard is not None \
                     and window.sequence >= self._hard.analysis_sequence \

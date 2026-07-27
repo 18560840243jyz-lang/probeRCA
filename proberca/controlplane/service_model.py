@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from proberca.data.schema import TopologySnapshot
+from proberca.dataplane.contracts import fingerprint
 
 from .config import FinalControlConfig
 from .model import CandidateEntityGraph
@@ -51,6 +52,81 @@ def _edge_endpoints(snapshot: TopologySnapshot, edge) -> tuple[str, str]:
     )
 
 
+def semantic_topology_fingerprint(snapshot: TopologySnapshot) -> str:
+    """Hash only normalized deployment semantics, never snapshot provenance."""
+    if not isinstance(snapshot, TopologySnapshot):
+        raise TypeError("topology fingerprint requires TopologySnapshot")
+
+    def normalized_edge(edge) -> tuple:
+        source, target = _edge_endpoints(snapshot, edge)
+        if edge.directed is False and target < source:
+            source, target = target, source
+        return (
+            source,
+            target,
+            edge.relation_type,
+            edge.protocol or "",
+            edge.resource_type or "",
+            edge.resource_id or "",
+            bool(edge.directed),
+        )
+
+    payload = {
+        "cluster_id": snapshot.cluster_id,
+        "services": list(_topology_services(snapshot)),
+        "call_edges": sorted(
+            normalized_edge(edge) for edge in snapshot.call_edges
+        ),
+        "host_edges": sorted(
+            normalized_edge(edge) for edge in snapshot.host_edges
+        ),
+        "resource_edges": sorted(
+            normalized_edge(edge) for edge in snapshot.resource_edges
+        ),
+        # pod_uid is a runtime identity and is deliberately excluded here.
+        "service_to_host": sorted({
+            (
+                _service_id(
+                    snapshot.cluster_id,
+                    placement.namespace,
+                    placement.service_name,
+                ),
+                f"{snapshot.cluster_id}::host::{placement.node_name}",
+            )
+            for placement in snapshot.service_nodes
+        }),
+        "shared_resources": sorted({
+            (
+                _service_id(
+                    snapshot.cluster_id,
+                    binding.namespace,
+                    binding.service_name,
+                ),
+                binding.resource_type,
+                binding.resource_id,
+            )
+            for binding in snapshot.service_resources
+        }),
+    }
+    return fingerprint(payload)
+
+
+def runtime_identity_fingerprint(snapshot: TopologySnapshot) -> str:
+    """Hash runtime mappings separately from stable deployment semantics."""
+    if not isinstance(snapshot, TopologySnapshot):
+        raise TypeError("runtime fingerprint requires TopologySnapshot")
+    return fingerprint({
+        "runtime_identity_fingerprints": sorted(
+            snapshot.runtime_identity_fingerprints
+        ),
+        "pod_uids": sorted({
+            placement.pod_uid
+            for placement in snapshot.service_nodes
+            if placement.pod_uid is not None
+        }),
+    })
+
+
 @dataclass(frozen=True)
 class AllowedServiceGraph:
     services: tuple[str, ...]
@@ -58,6 +134,9 @@ class AllowedServiceGraph:
     physical_edges: tuple[tuple[str, str, str, str], ...]
     placements: tuple[tuple[str, str], ...]
     snapshot_id: str
+    topology_fingerprint: str = ""
+    runtime_identity_fingerprint: str = ""
+    topology_epoch: int = 0
 
 
 def allowed_service_graph(snapshot: TopologySnapshot) -> AllowedServiceGraph:
@@ -105,6 +184,8 @@ def allowed_service_graph(snapshot: TopologySnapshot) -> AllowedServiceGraph:
         physical_edges=tuple(sorted(physical)),
         placements=tuple(sorted(placements)),
         snapshot_id=snapshot.snapshot_id,
+        topology_fingerprint=semantic_topology_fingerprint(snapshot),
+        runtime_identity_fingerprint=runtime_identity_fingerprint(snapshot),
     )
 
 
@@ -124,12 +205,15 @@ class ServiceRLS:
         self._models: dict[str, _TargetRLS] = {}
         self._history: dict[int, dict[str, float]] = {}
         self._graph: AllowedServiceGraph | None = None
+        self._reset_count = 0
+        self._configuration_count = 0
 
     def reset(self) -> None:
         """Drop every coefficient and lag row when the deployment layout changes."""
         self._models = {}
         self._history = {}
         self._graph = None
+        self._reset_count += 1
 
     def _configure(self, graph: AllowedServiceGraph) -> None:
         self._history = {}
@@ -152,12 +236,16 @@ class ServiceRLS:
             )
         self._models = models
         self._graph = graph
+        self._configuration_count += 1
 
     def update(
         self, sequence: int, service_state: dict[str, float],
         graph: AllowedServiceGraph,
     ) -> None:
-        if self._graph is None or self._graph.snapshot_id != graph.snapshot_id:
+        if self._graph is None or (
+            self._graph.topology_fingerprint
+            != graph.topology_fingerprint
+        ):
             self._configure(graph)
         current = {key: float(value) for key, value in service_state.items()}
         for target, model in self._models.items():
@@ -196,6 +284,15 @@ class ServiceRLS:
         self._history = {
             key: value for key, value in self._history.items() if key >= cutoff
         }
+        self._graph = graph
+
+    @property
+    def reset_count(self) -> int:
+        return self._reset_count
+
+    @property
+    def configuration_count(self) -> int:
+        return self._configuration_count
 
     def coefficients(self) -> dict[tuple[str, str, int], float]:
         output = {}

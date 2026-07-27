@@ -33,6 +33,7 @@ from proberca.data.schema import (
     EvidenceObservationRecord,
     NodeMetricRecord,
     ServiceNodePlacement,
+    ServiceResourceBinding,
     TopologyEdge,
     TopologySnapshot,
 )
@@ -355,6 +356,102 @@ def _window(
         residual_source_record_ids=_residual_source_ids(sequence),
         collection_metadata=_collection_metadata(),
     )
+
+
+def _healthy_node_records(sequence: int) -> tuple[NodeMetricRecord, ...]:
+    """Repeat only the synthetic healthy patterns with the real window time."""
+    template_sequence = ((sequence - 1) % 8) + 1
+    timestamp_ns = (sequence - 1) * _NS
+    return tuple(
+        replace(record, timestamp_ns=timestamp_ns)
+        for record in _node_records(template_sequence)
+    )
+
+
+def _per_window_topology(
+    sequence: int, *, changed_structure: bool = False,
+    runtime_identity: str = "runtime-a",
+) -> TopologySnapshot:
+    snapshot = _topology(
+        snapshot_name=f"window-snapshot-{sequence}",
+        valid_from_ns=(sequence - 1) * _NS,
+        valid_to_ns=sequence * _NS,
+    )
+    resources = (
+        [ServiceResourceBinding(
+            namespace="ns",
+            service_name="payment",
+            resource_type="database",
+            resource_id="cluster/ns/database/payment-db",
+        )]
+        if changed_structure else []
+    )
+    structure_fingerprint = fingerprint({
+        "cluster": snapshot.cluster_id,
+        "services": snapshot.services,
+        "calls": [item.to_dict() for item in snapshot.call_edges],
+        "hosts": [item.to_dict() for item in snapshot.host_edges],
+        "bindings": [item.to_dict() for item in resources],
+    })
+    return replace(
+        snapshot,
+        structure_fingerprint=structure_fingerprint,
+        inventory_revision_id=fingerprint({"inventory": sequence}),
+        resource_version_vector={
+            "Pod": fingerprint({"pod-resource-version": sequence}),
+        },
+        runtime_identity_fingerprints=[
+            fingerprint({"runtime": runtime_identity}),
+        ],
+        call_edge_provider_fingerprint=fingerprint({
+            "provider-window": sequence,
+        }),
+        service_resources=resources,
+    )
+
+
+def _healthy_archive_with_window_snapshots(
+    root: Path, *, window_count: int = 120,
+    topology_change_at: int | None = None,
+    runtime_change_at: int | None = None,
+) -> CollectionArchive:
+    config = _config()
+    writer = CollectionArchiveWriter(
+        root,
+        dataset_id=fingerprint({
+            "dataset": root.name,
+            "window_count": window_count,
+            "topology_change_at": topology_change_at,
+            "runtime_change_at": runtime_change_at,
+        }),
+        collection_contract=config.collection_contract,
+        source_description=config.collection_contract["source_description"],
+        collection_metadata=_collection_metadata(config),
+    )
+    for sequence in range(1, window_count + 1):
+        topology = _per_window_topology(
+            sequence,
+            changed_structure=(
+                topology_change_at is not None
+                and sequence >= topology_change_at
+            ),
+            runtime_identity=(
+                "runtime-b"
+                if runtime_change_at is not None
+                and sequence >= runtime_change_at
+                else "runtime-a"
+            ),
+        )
+        writer.append(CollectedWindow.create(
+            sequence=sequence,
+            window_start_ns=(sequence - 1) * _NS,
+            window_end_ns=sequence * _NS,
+            node_metrics=_healthy_node_records(sequence),
+            topology_events=(topology,),
+            residual_source_record_ids=_residual_source_ids(sequence),
+            collection_metadata=_collection_metadata(config),
+        ))
+    return writer.seal()
 
 
 def _file_hash(path) -> str:
@@ -863,23 +960,150 @@ def test_topology_must_cover_the_entire_half_open_window(tmp_path):
         writer.append(window)
 
 
-def test_topology_change_resets_every_healthy_model_segment():
+def test_unique_window_snapshots_keep_one_topology_epoch_and_full_history(
+    tmp_path,
+):
+    archive = _healthy_archive_with_window_snapshots(
+        tmp_path / "stable-topology",
+    )
     control = FinalControlPlane(_config())
-    control.baseline.update("metric", 1.0)
-    control._healthy_history[1] = {"metric": 0.0}
-    control._signed_history[1] = {"metric": 0.0}
-    control._soft_counts[("service", "service-a")] = 2
-    control._hard_counts[("service", "service-a")] = 1
-    control._healthy_topology_snapshot_id = "old"
 
-    control._reset_healthy_segment("new")
+    run = control.run(archive)
 
-    assert control.baseline.snapshot() == {}
-    assert control._healthy_history == {}
-    assert control._signed_history == {}
-    assert control._soft_counts == {}
-    assert control._hard_counts == {}
-    assert control._healthy_topology_snapshot_id == "new"
+    assert run.processed_window_count == 120
+    assert len({item["snapshot_id"] for item in run.state_timeline}) == 120
+    assert len({
+        item["topology_fingerprint"] for item in run.state_timeline
+    }) == 1
+    assert len({
+        item["runtime_identity_fingerprint"]
+        for item in run.state_timeline
+    }) == 1
+    assert {
+        item["topology_epoch"] for item in run.state_timeline
+    } == {1}
+    assert control._topology_epoch == 1
+    assert control._topology_reset_count == 0
+    assert control._baseline_reset_count == 0
+    assert control.service_rls.reset_count == 0
+    assert control._metric_history_reset_count == 0
+    assert control.service_rls.configuration_count == 1
+    assert set(map(len, control.baseline.snapshot().values())) == {120}
+    assert len(control._healthy_history) == 117
+
+
+def test_real_semantic_topology_change_resets_once_at_window_61(tmp_path):
+    archive = _healthy_archive_with_window_snapshots(
+        tmp_path / "topology-change",
+        topology_change_at=61,
+    )
+    control = FinalControlPlane(_config())
+
+    run = control.run(archive)
+
+    assert run.processed_window_count == 120
+    assert [
+        item["topology_epoch"] for item in run.state_timeline[:60]
+    ] == [1] * 60
+    assert [
+        item["topology_epoch"] for item in run.state_timeline[60:]
+    ] == [2] * 60
+    assert control._topology_epoch == 2
+    assert control._topology_reset_count == 1
+    assert control._baseline_reset_count == 1
+    assert control.service_rls.reset_count == 1
+    assert control._metric_history_reset_count == 1
+    assert control.service_rls.configuration_count == 2
+    assert set(map(len, control.baseline.snapshot().values())) == {60}
+    assert control._last_calibration_reset_reason \
+        == "topology_fingerprint_changed"
+
+
+def test_service_rls_ignores_snapshot_identity_when_semantics_are_equal():
+    topology_a = TopologySnapshot(
+        schema_version="1.0",
+        snapshot_id="snapshot-a",
+        valid_from_ns=0,
+        valid_to_ns=_NS,
+        cluster_id="cluster",
+        services=["ns::caller", "ns::callee"],
+        call_edges=[TopologyEdge(
+            src_service="caller",
+            dst_service="callee",
+            relation_type="call",
+            src_namespace="ns",
+            dst_namespace="ns",
+            protocol="tcp",
+            directed=True,
+        )],
+        host_edges=[],
+        resource_edges=[],
+        service_nodes=[],
+        runtime_identity_fingerprints=["runtime-a"],
+    )
+    topology_b = replace(
+        topology_a,
+        snapshot_id="snapshot-b",
+        valid_from_ns=_NS,
+        valid_to_ns=2 * _NS,
+        services=list(reversed(topology_a.services)),
+        call_edges=list(reversed(topology_a.call_edges)),
+        inventory_revision_id="different-non-semantic-revision",
+        call_edge_provider_fingerprint="different-window-provider",
+    )
+    graph_a = allowed_service_graph(topology_a)
+    graph_b = allowed_service_graph(topology_b)
+    rls = ServiceRLS(replace(
+        _config(),
+        service_lags=(1,),
+        service_min_training_updates=1,
+    ))
+    state_a = {
+        "cluster::ns::caller": 1.0,
+        "cluster::ns::callee": 2.0,
+    }
+    state_b = {
+        "cluster::ns::caller": 1.5,
+        "cluster::ns::callee": 2.5,
+    }
+
+    rls.update(1, state_a, graph_a)
+    rls.update(2, state_b, graph_b)
+
+    assert graph_a.snapshot_id != graph_b.snapshot_id
+    assert graph_a.topology_fingerprint == graph_b.topology_fingerprint
+    assert rls.reset_count == 0
+    assert rls.configuration_count == 1
+    assert {
+        item["valid_training_rows"]
+        for item in rls.readiness().values()
+    } == {1}
+
+
+def test_runtime_identity_change_recalibrates_without_new_topology_epoch(
+    tmp_path,
+):
+    archive = _healthy_archive_with_window_snapshots(
+        tmp_path / "runtime-change",
+        window_count=8,
+        runtime_change_at=5,
+    )
+    control = FinalControlPlane(_config())
+
+    run = control.run(archive)
+
+    assert run.processed_window_count == 8
+    assert {
+        item["topology_epoch"] for item in run.state_timeline
+    } == {1}
+    assert control._topology_reset_count == 0
+    assert control._runtime_identity_reset_count == 1
+    assert control._baseline_reset_count == 1
+    assert control.service_rls.reset_count == 1
+    assert control._metric_history_reset_count == 1
+    assert set(map(len, control.baseline.snapshot().values())) == {4}
+    assert control._last_calibration_reset_reason \
+        == "runtime_identity_fingerprint_changed"
 
 
 def test_soft_context_keeps_using_its_frozen_topology_version(tmp_path):
