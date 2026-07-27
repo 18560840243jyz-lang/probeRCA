@@ -18,7 +18,7 @@ excluded:
   reason: no_valid_failure_or_latency_windows_in_30_window_load_smoke
 exclusion_policy: exclusions_are_fixed_before_fault_selection
 missing_value_policy: zero_coverage_remains_null_and_is_never_imputed
-load_profile: single-vm-healthy-v4
+load_profile: single-vm-healthy-v5
 load_manifest: deploy/final-dataplane/healthy-calibration-load.yaml
 checkout_load_replicas: 3
 checkout_interval_pattern_seconds:
@@ -31,6 +31,20 @@ load_adjustment_reason: >-
   Three independent sequential clients keep checkout-path request_count and
   histogram sample_count above the frozen five-sample validity floor in
   consecutive one-second windows without changing any validity threshold.
+dns_exposure_profile: single-vm-dns-v1
+dns_exposure_patch: deploy/final-dataplane/healthy-dns-exposure-patch.yaml
+dns_exposure_source_service: frontend
+dns_exposure_target_service: kube-dns
+dns_exposure_interval_pattern_seconds:
+- 0.07
+- 0.08
+- 0.09
+- 0.075
+- 0.085
+dns_exposure_reason: >-
+  Exercise the frozen frontend-to-kube-dns candidate edge with successful
+  service-name lookups so its request_count and latency histogram have enough
+  real observations; no delay, loss, failure, or fault actor is used.
 primitive_exporter_schema: probeRCA-final-primitive-exporter-v3
 container_resource_source: direct_cgroup_v2
 beyla_retired_series_ttl: 30s

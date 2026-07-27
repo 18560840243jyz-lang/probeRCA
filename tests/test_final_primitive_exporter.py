@@ -603,7 +603,7 @@ def test_single_vm_scope_freezes_v2_collection_runtime():
         "configs/final_single_vm_scope.yaml"
     ).read_text(encoding="utf-8"))
     assert scope["status"] == "frozen_before_healthy_pilot"
-    assert scope["load_profile"] == "single-vm-healthy-v4"
+    assert scope["load_profile"] == "single-vm-healthy-v5"
     assert scope["checkout_load_replicas"] == 3
     assert scope["checkout_interval_pattern_seconds"] == [
         0.07, 0.08, 0.09, 0.075, 0.085,
@@ -613,6 +613,12 @@ def test_single_vm_scope_freezes_v2_collection_runtime():
     )
     assert scope["container_resource_source"] == "direct_cgroup_v2"
     assert scope["beyla_retired_series_ttl"] == "30s"
+    assert scope["dns_exposure_profile"] == "single-vm-dns-v1"
+    assert scope["dns_exposure_source_service"] == "frontend"
+    assert scope["dns_exposure_target_service"] == "kube-dns"
+    assert scope["dns_exposure_interval_pattern_seconds"] == [
+        0.07, 0.08, 0.09, 0.075, 0.085,
+    ]
 
 
 def test_snapshot_loop_reports_source_failures():
@@ -683,7 +689,7 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
     assert config_map["metadata"]["namespace"] == "online-boutique"
     assert deployment["metadata"]["annotations"][
         "proberca.io/load-profile"
-    ] == "single-vm-healthy-v4"
+    ] == "single-vm-healthy-v5"
     assert deployment["spec"]["replicas"] == 3
     containers = {
         item["name"]: item
@@ -719,6 +725,52 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
     assert (
         '"deployment/proberca-healthy-checkout-load"' in installer
     )
+
+
+def test_healthy_dns_exposure_is_success_only_and_reproducible():
+    patch_path = Path(
+        "deploy/final-dataplane/healthy-dns-exposure-patch.yaml"
+    )
+    patch = yaml.safe_load(patch_path.read_text(encoding="utf-8"))
+    template = patch["spec"]["template"]
+    assert template["metadata"]["annotations"][
+        "proberca.io/healthy-dns-exposure-profile"
+    ] == "single-vm-dns-v1"
+    containers = template["spec"]["containers"]
+    assert len(containers) == 1
+    exposure = containers[0]
+    assert exposure["name"] == "proberca-healthy-dns-exposure"
+    assert "@sha256:" in exposure["image"]
+    source = exposure["args"][0]
+    assert "socket.getaddrinfo" in source
+    assert "AF_INET" in source
+    assert all(
+        forbidden not in source
+        for forbidden in ("tc ", "iptables", "stress", "fault")
+    )
+    environment = {
+        item["name"]: item["value"]
+        for item in exposure["env"]
+    }
+    assert environment["INTERVAL_PATTERN_SECONDS"] == (
+        "0.07,0.08,0.09,0.075,0.085"
+    )
+    assert {
+        item.strip()
+        for item in environment["DNS_NAMES"].split(",")
+    } == {
+        "cartservice.online-boutique.svc.cluster.local",
+        "checkoutservice.online-boutique.svc.cluster.local",
+        "currencyservice.online-boutique.svc.cluster.local",
+        "paymentservice.online-boutique.svc.cluster.local",
+        "productcatalogservice.online-boutique.svc.cluster.local",
+        "shippingservice.online-boutique.svc.cluster.local",
+    }
+    installer = Path(
+        "scripts/install_final_dataplane.py"
+    ).read_text(encoding="utf-8")
+    assert str(patch_path) in installer
+    assert '"patch", "deployment/frontend"' in installer
 
 
 def test_healthy_probe_cadence_is_explicit_and_reproducible():

@@ -1,0 +1,70 @@
+spec:
+  template:
+    metadata:
+      annotations:
+        proberca.io/healthy-dns-exposure-profile: single-vm-dns-v1
+    spec:
+      containers:
+        - name: proberca-healthy-dns-exposure
+          image: us-central1-docker.pkg.dev/google-samples/microservices-demo/loadgenerator@sha256:3e5cf93c21e6b7d1e8bb8713aa02c7912d4c9f90fd02d477b3d911bd02a292fb
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - -u
+            - -c
+          args:
+            - |
+              import itertools
+              import os
+              import socket
+              import time
+
+              names = tuple(
+                  item.strip()
+                  for item in os.environ["DNS_NAMES"].split(",")
+                  if item.strip()
+              )
+              intervals = tuple(
+                  float(item)
+                  for item in os.environ["INTERVAL_PATTERN_SECONDS"].split(",")
+              )
+              if not names or not intervals or any(item <= 0 for item in intervals):
+                  raise ValueError("healthy DNS exposure configuration is invalid")
+              deadline = time.monotonic()
+              for index, name in enumerate(itertools.cycle(names)):
+                  socket.getaddrinfo(
+                      name,
+                      None,
+                      family=socket.AF_INET,
+                      type=socket.SOCK_STREAM,
+                  )
+                  deadline += intervals[index % len(intervals)]
+                  remaining = deadline - time.monotonic()
+                  if remaining > 0:
+                      time.sleep(remaining)
+                  else:
+                      deadline = time.monotonic()
+          env:
+            - name: DNS_NAMES
+              value: >-
+                cartservice.online-boutique.svc.cluster.local,
+                checkoutservice.online-boutique.svc.cluster.local,
+                currencyservice.online-boutique.svc.cluster.local,
+                paymentservice.online-boutique.svc.cluster.local,
+                productcatalogservice.online-boutique.svc.cluster.local,
+                shippingservice.online-boutique.svc.cluster.local
+            - name: INTERVAL_PATTERN_SECONDS
+              value: "0.07,0.08,0.09,0.075,0.085"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
