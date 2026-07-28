@@ -596,6 +596,43 @@ class FinalControlConfig:
         })
 
     @property
+    def formal_entity_ids(self) -> frozenset[str]:
+        """Return the frozen formal entities implied by required root coordinates."""
+        return frozenset(
+            coordinate.rsplit("::", 1)[0]
+            for coordinate in self.calibration_required_root_coordinates
+        )
+
+    @property
+    def formal_service_entity_ids(self) -> frozenset[str]:
+        return frozenset(
+            entity_id for entity_id in self.formal_entity_ids
+            if "::host::" not in entity_id
+            and not ("->" in entity_id and entity_id.endswith("::tcp"))
+        )
+
+    @property
+    def formal_host_entity_ids(self) -> frozenset[str]:
+        return frozenset(
+            entity_id for entity_id in self.formal_entity_ids
+            if "::host::" in entity_id
+        )
+
+    @property
+    def formal_tcp_edge_entity_ids(self) -> frozenset[str]:
+        return frozenset(
+            entity_id for entity_id in self.formal_entity_ids
+            if "->" in entity_id and entity_id.endswith("::tcp")
+        )
+
+    def entity_is_in_formal_scope(self, entity_id: str) -> bool:
+        """Treat an empty required scope as unrestricted for synthetic configs."""
+        return (
+            not self.calibration_required_root_coordinates
+            or entity_id in self.formal_entity_ids
+        )
+
+    @property
     def scale_config_fingerprint(self) -> str:
         return fingerprint({
             "numeric_epsilon": self.baseline_min_scale,

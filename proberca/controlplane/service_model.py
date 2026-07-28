@@ -200,6 +200,96 @@ def allowed_service_graph(snapshot: TopologySnapshot) -> AllowedServiceGraph:
     )
 
 
+def formal_service_graph(
+    snapshot: TopologySnapshot, config: FinalControlConfig,
+) -> AllowedServiceGraph:
+    """Project collected topology onto the single frozen formal RCA scope."""
+    graph = allowed_service_graph(snapshot)
+    if not config.calibration_required_root_coordinates:
+        return graph
+
+    formal_services = set(config.formal_service_entity_ids)
+    services = tuple(
+        service for service in graph.services if service in formal_services
+    )
+    formal_edges = set(config.formal_tcp_edge_entity_ids)
+    physical_edges = tuple(
+        edge for edge in graph.physical_edges
+        if edge[0] in formal_edges
+        and edge[1] in formal_services
+        and edge[2] in formal_services
+    )
+    formal_call_relations = {
+        pair
+        for _edge_id_value, source, target, _protocol in physical_edges
+        for pair in ((source, target), (target, source))
+    }
+    relations = tuple(sorted(
+        (source, target, relation_type)
+        for source, target, relation_type in graph.relations
+        if source in formal_services
+        and target in formal_services
+        and (
+            relation_type != "call"
+            or (source, target) in formal_call_relations
+        )
+    ))
+    formal_hosts = set(config.formal_host_entity_ids)
+    placements = tuple(
+        placement for placement in graph.placements
+        if placement[0] in formal_services and placement[1] in formal_hosts
+    )
+    shared_resources = tuple(sorted(
+        (
+            _service_id(
+                snapshot.cluster_id,
+                binding.namespace,
+                binding.service_name,
+            ),
+            binding.resource_type,
+            binding.resource_id,
+        )
+        for binding in snapshot.service_resources
+        if _service_id(
+            snapshot.cluster_id,
+            binding.namespace,
+            binding.service_name,
+        ) in formal_services
+    ))
+    topology_fingerprint = fingerprint({
+        "services": services,
+        "relations": relations,
+        "physical_edges": physical_edges,
+        "placements": placements,
+        "shared_resources": shared_resources,
+    })
+    formal_pod_uids = sorted({
+        placement.pod_uid
+        for placement in snapshot.service_nodes
+        if placement.pod_uid is not None
+        and _service_id(
+            snapshot.cluster_id,
+            placement.namespace,
+            placement.service_name,
+        ) in formal_services
+    })
+    return AllowedServiceGraph(
+        services=services,
+        relations=relations,
+        physical_edges=physical_edges,
+        placements=placements,
+        snapshot_id=graph.snapshot_id,
+        topology_fingerprint=topology_fingerprint,
+        runtime_identity_fingerprint=fingerprint({
+            "formal_pod_uids": formal_pod_uids,
+            "runtime_identity_fingerprints": sorted(
+                snapshot.runtime_identity_fingerprints
+            ),
+        }),
+        topology_epoch=graph.topology_epoch,
+    )
+
+
 @dataclass
 class _TargetRLS:
     feature_keys: tuple[tuple[str, int], ...]

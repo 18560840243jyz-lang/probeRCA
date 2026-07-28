@@ -183,6 +183,13 @@ The formal ProbeRCA-BPF paper scope contains only:
 - directed TCP edge entities identified as
   `(src_service -> dst_service, TCP)`.
 
+For the frozen single-VM Online Boutique experiment, that scope is exactly
+11 Service-backed business services, one host, and 15 directed TCP edges.
+It contains 100 required root coordinates
+(`11 * 6 + 1 * 4 + 15 * 2`). `kube-dns` is infrastructure and
+`loadgenerator` is an experiment load producer; neither is alert-eligible,
+root-eligible, or required for Readiness.
+
 The final normal metric contract is `9/4/3`: nine metrics per service, four
 metrics per host, and three metrics per directed TCP edge
 (`count`, `latency_p95`, and `failure_rate`). TCP edge alert state is

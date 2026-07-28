@@ -35,6 +35,7 @@ from proberca.controlplane.service_model import (
     ServiceRLS,
     allowed_service_graph,
     build_candidate_graph,
+    formal_service_graph,
 )
 from proberca.data.schema import (
     EdgeMetricRecord,
@@ -557,7 +558,10 @@ def test_checked_in_contract_and_plane_imports_are_separate():
     formal = FinalControlConfig.from_dict(control_payload)
     assert formal.calibration_learning_windows == 600
     assert formal.calibration_validation_windows == 300
-    assert len(formal.calibration_required_root_coordinates) == 106
+    assert len(formal.calibration_required_root_coordinates) == 100
+    assert len(formal.formal_service_entity_ids) == 11
+    assert len(formal.formal_host_entity_ids) == 1
+    assert len(formal.formal_tcp_edge_entity_ids) == 15
     assert all(
         "::dns::" not in coordinate
         for coordinate in formal.calibration_required_root_coordinates
@@ -684,6 +688,10 @@ def test_zero_coverage_placeholder_does_not_enter_healthy_baseline():
         "sample_count": 0,
         "request_count": None,
         "quality": 0.0,
+        "formal_scope": "included",
+        "alert_eligible": True,
+        "root_eligible": False,
+        "readiness_required": False,
     }
 
     model = MetricPropagationModel(
@@ -1738,7 +1746,18 @@ def test_formal_scope_and_contract_are_dns_free_9_4_3():
     contract = config.collection_contract
     roles = contract["normal_metric_roles"]
 
-    assert len(config.calibration_required_root_coordinates) == 106
+    assert len(config.calibration_required_root_coordinates) == 100
+    assert len(config.formal_service_entity_ids) == 11
+    assert len(config.formal_host_entity_ids) == 1
+    assert len(config.formal_tcp_edge_entity_ids) == 15
+    assert not any(
+        entity_id.endswith("::kube-dns")
+        for entity_id in config.formal_service_entity_ids
+    )
+    assert not any(
+        entity_id.endswith("::loadgenerator")
+        for entity_id in config.formal_service_entity_ids
+    )
     assert not any(
         "::dns::" in coordinate
         for coordinate in config.calibration_required_root_coordinates
@@ -1758,6 +1777,161 @@ def test_formal_scope_and_contract_are_dns_free_9_4_3():
         role["root_category"] != "DNS"
         for role in contract["burst_channel_roles"]
     )
+
+
+def _formal_service_scope_topology(
+    config: FinalControlConfig,
+) -> TopologySnapshot:
+    services = [
+        entity_id.split("::", 1)[1]
+        for entity_id in sorted(config.formal_service_entity_ids)
+    ]
+    services.append("kube-system::kube-dns")
+    placements = [
+        ServiceNodePlacement(
+            namespace=service.split("::", 1)[0],
+            service_name=service.split("::", 1)[1],
+            node_name="proberca-ob-control-plane",
+            pod_uid=f"pod-{index}",
+        )
+        for index, service in enumerate(services)
+    ]
+    return TopologySnapshot(
+        schema_version="1.0",
+        snapshot_id="formal-scope-snapshot",
+        valid_from_ns=0,
+        valid_to_ns=10 * _NS,
+        cluster_id="kind-proberca-ob",
+        services=services,
+        call_edges=[],
+        host_edges=[],
+        resource_edges=[],
+        service_nodes=placements,
+        structure_fingerprint=fingerprint({
+            "services": services,
+            "placements": [
+                item.to_dict() for item in placements
+            ],
+        }),
+    )
+
+
+def test_frozen_scope_excludes_infrastructure_from_models_and_alerts():
+    config = FinalControlConfig.from_dict(yaml.safe_load(
+        Path("configs/final_control.yaml").read_text(encoding="utf-8")
+    ))
+    full_graph = allowed_service_graph(
+        _formal_service_scope_topology(config)
+    )
+    graph = formal_service_graph(
+        _formal_service_scope_topology(config), config,
+    )
+    infrastructure = "kind-proberca-ob::kube-system::kube-dns"
+    frontend = "kind-proberca-ob::online-boutique::frontend"
+
+    assert infrastructure in full_graph.services
+    assert infrastructure not in graph.services
+    assert len(graph.services) == 11
+
+    observations = {
+        "infrastructure-latency": NormalizedObservation(
+            metric=MetricNode(
+                node_id=f"{infrastructure}::request_latency_p95",
+                entity_id=infrastructure,
+                entity_type="service",
+                metric_name="request_latency_p95",
+                role="request_latency",
+                root_category=None,
+                root_eligible=False,
+            ),
+            signed_z=1000.0,
+            anomaly=1000.0,
+            quality=1.0,
+            source_record_id="source:" + "3" * 64,
+            baseline_center=0.0,
+            baseline_scale=1.0,
+            scale_source="mad",
+        ),
+        "frontend-latency": NormalizedObservation(
+            metric=MetricNode(
+                node_id=f"{frontend}::request_latency_p95",
+                entity_id=frontend,
+                entity_type="service",
+                metric_name="request_latency_p95",
+                role="request_latency",
+                root_category=None,
+                root_eligible=False,
+            ),
+            signed_z=12.0,
+            anomaly=12.0,
+            quality=1.0,
+            source_record_id="source:" + "4" * 64,
+            baseline_center=0.0,
+            baseline_scale=1.0,
+            scale_source="mad",
+        ),
+    }
+    control = FinalControlPlane(config)
+    service_scores, edge_scores = control._scores(observations, graph)
+
+    assert set(service_scores) == {frontend}
+    assert service_scores[frontend] == pytest.approx(6.0)
+    assert edge_scores == {}
+    for _ in range(2):
+        soft, hard = control._advance_alert_counters(
+            service_scores, edge_scores,
+        )
+    assert ("service", frontend) in hard
+    assert ("service", infrastructure) not in hard
+    soft, hard = control._advance_alert_counters(
+        service_scores, edge_scores,
+    )
+    assert ("service", frontend) in soft
+    assert ("service", infrastructure) not in soft
+
+    with pytest.raises(
+        ValueError, match="at least one valid alert seed",
+    ):
+        build_candidate_graph(
+            graph=graph,
+            service_strengths={},
+            seed_services={infrastructure},
+            seed_edges=set(),
+            config=config,
+        )
+
+
+def test_out_of_scope_service_records_keep_diagnostic_scope_flags():
+    config = FinalControlConfig.from_dict(yaml.safe_load(
+        Path("configs/final_control.yaml").read_text(encoding="utf-8")
+    ))
+    resolver = MetricResolver(config)
+    baseline = RobustBaselineStore(config)
+    records = tuple(
+        replace(
+            record,
+            cluster_id="kind-proberca-ob",
+            namespace="kube-system",
+            service_name="kube-dns",
+        )
+        for record in _node_records(1)
+        if record.scope == "service"
+    )
+
+    observations, raw = resolver.normalize_window(
+        SimpleNamespace(node_metrics=records, edge_metrics=()),
+        baseline,
+    )
+
+    assert observations == {}
+    assert raw == {}
+    assert len(resolver.last_validity) == 9
+    for item in resolver.last_validity.values():
+        assert item["formal_scope"] == "excluded"
+        assert item["alert_eligible"] is False
+        assert item["root_eligible"] is False
+        assert item["readiness_required"] is False
+        assert item["exclusion_reason"] == "excluded_from_formal_scope"
 
 
 def test_formal_fault_matrix_keeps_tcp_and_excludes_dns():

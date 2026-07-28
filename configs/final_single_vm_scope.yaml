@@ -1,12 +1,21 @@
 schema_version: probeRCA-final-single-vm-scope-v1
 status: frozen_before_healthy_pilot
 cluster_id: kind-proberca-ob
-required_root_coordinate_count: 106
+required_root_coordinate_count: 100
 required_scope_source: configs/final_control.yaml
 included:
-  service_roots: all_root_eligible_metrics_for_all_12_services
+  service_roots: all_root_eligible_metrics_for_11_service_backed_business_services
   host_roots: all_4_root_eligible_metrics_for_proberca-ob-control-plane
   tcp_edges: all_15_observed_high_coverage_directed_edges
+excluded_entities:
+  infrastructure_services:
+  - kind-proberca-ob::kube-system::kube-dns
+  load_generators:
+  - kind-proberca-ob::online-boutique::loadgenerator
+  formal_scope: excluded
+  alert_eligible: false
+  root_eligible: false
+  readiness_required: false
 experimental_dns:
   enabled: false
   formal_scope: excluded_from_formal_rca

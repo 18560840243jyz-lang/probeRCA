@@ -204,6 +204,21 @@ class MetricResolver:
     def is_excluded_from_formal_rca(self, spec: MetricRoleSpec) -> bool:
         return spec in self._excluded_roles
 
+    def formal_scope_metadata(
+        self, metric: MetricNode,
+    ) -> dict[str, bool | str]:
+        included = self.config.entity_is_in_formal_scope(metric.entity_id)
+        return {
+            "formal_scope": "included" if included else "excluded",
+            "alert_eligible": included,
+            "root_eligible": included and metric.root_eligible,
+            "readiness_required": (
+                included
+                and metric.node_id
+                in self.config.calibration_required_root_coordinates
+            ),
+        }
+
     def resolve(self, record) -> tuple[MetricNode, MetricRoleSpec]:
         record_type = getattr(record, "record_type", None)
         matches = []
@@ -283,16 +298,24 @@ class MetricResolver:
                 )
             seen.add(metric.node_id)
             quality = float(record.coverage * (1.0 - record.event_loss_rate))
-            if self.is_excluded_from_formal_rca(spec):
+            scope = self.formal_scope_metadata(metric)
+            if self.is_excluded_from_formal_rca(spec) \
+                    or scope["formal_scope"] == "excluded":
+                reason = (
+                    "excluded_from_formal_rca"
+                    if self.is_excluded_from_formal_rca(spec)
+                    else "excluded_from_formal_scope"
+                )
                 validity[metric.node_id] = {
                     "valid": False,
-                    "invalid_reason": "excluded_from_formal_rca",
-                    "exclusion_reason": "excluded_from_formal_rca",
+                    "invalid_reason": reason,
+                    "exclusion_reason": reason,
                     "raw_value": record.value,
                     "coverage": record.coverage,
                     "sample_count": record.sample_count,
                     "request_count": count_by_entity.get(metric.entity_id),
                     "quality": quality,
+                    **scope,
                 }
                 continue
             reason = None
@@ -315,6 +338,7 @@ class MetricResolver:
                 "sample_count": record.sample_count,
                 "request_count": count_by_entity.get(metric.entity_id),
                 "quality": quality,
+                **scope,
             }
             if reason is not None:
                 continue

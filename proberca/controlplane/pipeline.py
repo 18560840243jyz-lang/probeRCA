@@ -24,8 +24,8 @@ from .observations import MetricResolver, RobustBaselineStore
 from .service_model import (
     AllowedServiceGraph,
     ServiceRLS,
-    allowed_service_graph,
     build_candidate_graph,
+    formal_service_graph,
 )
 from .solver import solve_nonnegative_sparse_group
 
@@ -182,7 +182,10 @@ class FinalControlPlane:
     def _catalog_window(self, window) -> None:
         for record in (*window.node_metrics, *window.edge_metrics):
             metric, spec = self.resolver.resolve(record)
-            if self.resolver.is_excluded_from_formal_rca(spec):
+            if self.resolver.is_excluded_from_formal_rca(spec) \
+                    or not self.config.entity_is_in_formal_scope(
+                        metric.entity_id
+                    ):
                 continue
             existing = self._metric_catalog.get(metric.node_id)
             if existing is not None and existing != metric:
@@ -1108,7 +1111,7 @@ class FinalControlPlane:
             snapshot = self._active_topology(
                 window.window_start_ns, window.window_end_ns,
             )
-            live_graph = allowed_service_graph(snapshot)
+            live_graph = formal_service_graph(snapshot, self.config)
             topology_reset = False
             runtime_identity_reset = False
             if self.state in {

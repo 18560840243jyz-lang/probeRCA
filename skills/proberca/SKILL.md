@@ -2275,3 +2275,11 @@ TCP边独立告警
   -> 非负Sparse-Group FISTA
   -> (src_service -> dst_service, TCP)
 ```
+
+## 正式单机实体范围
+
+- 冻结范围只包含11个有Kubernetes Service身份的Online Boutique业务服务、1个正式主机和15条有向TCP边。
+- 正式根因坐标总数固定为`11 * 6 + 1 * 4 + 15 * 2 = 100`。
+- `kube-dns`属于范围外基础设施，`loadgenerator`属于实验负载发生器；两者均须标记为`formal_scope=excluded`、`alert_eligible=false`、`root_eligible=false`和`readiness_required=false`。
+- 范围外实体可以继续采集、兼容读取和诊断展示，但不得进入Baseline、(A_s)、(A_v)、健康验证告警、候选图或FISTA。
+- 所有正式范围过滤必须从冻结scope/config推导，禁止按具体服务名硬编码。
