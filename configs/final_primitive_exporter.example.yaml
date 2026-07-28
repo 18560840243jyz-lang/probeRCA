@@ -25,6 +25,7 @@ bpf_loader_path: /usr/local/lib/proberca-final/proberca-final-ebpf-loader
 bpf_map_directory: /sys/fs/bpf/proberca-final
 dns_aggregation_policy_path: /home/jyz/probeRCA/configs/final_dns_aggregation_policy.yaml
 dns_timeout_ms: 5000
+experimental_dns_enabled: false
 listen_host: 127.0.0.1
 listen_port: 9477
 snapshot_period_sec: 1

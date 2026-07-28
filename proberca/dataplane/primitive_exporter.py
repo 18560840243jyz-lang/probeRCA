@@ -120,13 +120,16 @@ class FinalPrimitiveExporterConfig:
     listen_port: int
     snapshot_period_sec: int
     source_timeout_sec: float
+    experimental_dns_enabled: bool = False
 
     @classmethod
     def from_dict(
         cls, payload: dict[str, Any],
     ) -> "FinalPrimitiveExporterConfig":
+        normalized = dict(payload)
+        normalized.setdefault("experimental_dns_enabled", False)
         values = _strict_mapping(
-            payload, set(cls.__dataclass_fields__),
+            normalized, set(cls.__dataclass_fields__),
             "final primitive exporter config",
         )
         for name in ("namespaces", "include_services"):
@@ -146,9 +149,18 @@ class FinalPrimitiveExporterConfig:
             "cluster_id", "kubeconfig_path", "kubernetes_context",
             "kind_node_container", "node_exporter_url",
             "bpf_loader_path", "bpf_map_directory",
-            "dns_aggregation_policy_path", "listen_host",
+            "listen_host",
         ):
             _nonempty(name, getattr(self, name))
+        if type(self.experimental_dns_enabled) is not bool:
+            raise RawCollectionError(
+                "experimental_dns_enabled must be boolean"
+            )
+        if self.experimental_dns_enabled:
+            _nonempty(
+                "dns_aggregation_policy_path",
+                self.dns_aggregation_policy_path,
+            )
         if not self.node_exporter_url.startswith(("http://", "https://")):
             raise RawCollectionError("node_exporter_url must be HTTP(S)")
         if (
@@ -437,14 +449,16 @@ class FinalPrimitiveExporter:
         self._cgroup_path_cache: tuple[
             tuple[str, ...], dict[str, Path]
         ] | None = None
-        policy_payload = yaml.safe_load(Path(
-            self.config.dns_aggregation_policy_path
-        ).read_text(encoding="utf-8"))
-        self.dns_policy = DnsAggregationPolicy.from_dict(policy_payload)
-        if self.dns_policy.timeout_ms != self.config.dns_timeout_ms:
-            raise RawCollectionError(
-                "DNS timeout and aggregation policy disagree"
-            )
+        self.dns_policy: DnsAggregationPolicy | None = None
+        if self.config.experimental_dns_enabled:
+            policy_payload = yaml.safe_load(Path(
+                self.config.dns_aggregation_policy_path
+            ).read_text(encoding="utf-8"))
+            self.dns_policy = DnsAggregationPolicy.from_dict(policy_payload)
+            if self.dns_policy.timeout_ms != self.config.dns_timeout_ms:
+                raise RawCollectionError(
+                    "DNS timeout and aggregation policy disagree"
+                )
         kubernetes_config.load_kube_config(
             config_file=self.config.kubeconfig_path,
             context=self.config.kubernetes_context,
@@ -1423,6 +1437,10 @@ class FinalPrimitiveExporter:
         bpf: tuple[dict[str, Any], ...],
         cgroup_identity: dict[int, ContainerIdentity],
     ) -> tuple[PrometheusSample, ...]:
+        if self.dns_policy is None:
+            raise RawCollectionError(
+                "experimental DNS collection is not enabled"
+            )
         output = []
         for record in bpf:
             if record["record_type"] != "dns":
@@ -1842,10 +1860,15 @@ class FinalPrimitiveExporter:
             raise RawCollectionError(
                 f"Beyla/CoreDNS request coverage is incomplete: {missing}"
             )
+        dns_samples = (
+            self._dns_samples(inventory, bpf, cgroup_identity)
+            if self.config.experimental_dns_enabled
+            else ()
+        )
         samples = [
             *service_samples,
             *edge_samples,
-            *self._dns_samples(inventory, bpf, cgroup_identity),
+            *dns_samples,
             *self._resource_samples(
                 inventory, cgroup_paths, bpf, timestamp_ns
             ),
@@ -1860,9 +1883,8 @@ class FinalPrimitiveExporter:
             for item in samples
         ):
             raise RawCollectionError("Beyla returned no directed TCP edges")
-        if not any(
-            item.name == "proberca_dns_edge_query_total"
-            for item in samples
+        if self.config.experimental_dns_enabled and not any(
+            item.name == "proberca_dns_edge_query_total" for item in samples
         ):
             raise RawCollectionError("BPF returned no directed DNS edges")
         return render_prometheus_text(

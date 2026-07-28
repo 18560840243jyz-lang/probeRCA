@@ -77,12 +77,33 @@ def test_final_exporter_config_is_frozen_and_one_second():
     config = FinalPrimitiveExporterConfig.from_dict(payload)
     assert config.schema_version == FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION
     assert config.snapshot_period_sec == 1
+    assert config.experimental_dns_enabled is False
     assert "kube-system/kube-dns" in config.include_services
     assert len(config.include_services) == 12
     invalid = dict(payload)
     invalid["snapshot_period_sec"] = 2
     with pytest.raises(RawCollectionError, match="frozen range"):
         FinalPrimitiveExporterConfig.from_dict(invalid)
+
+
+def test_formal_live_collector_has_tcp_queries_but_no_dns_queries():
+    payload = yaml.safe_load(Path(
+        "configs/final_live_collector.example.yaml"
+    ).read_text(encoding="utf-8"))
+    queries = payload["prometheus"]["queries"]
+    components = {item["component"] for item in queries}
+
+    assert {
+        "edge_request_total",
+        "edge_error_total",
+        "edge_timeout_total",
+        "edge_latency_histogram",
+    } <= components
+    assert not any(
+        item["query_id"].startswith("dns-")
+        or item["component"].startswith("dns_")
+        for item in queries
+    )
 
 
 def test_inventory_refresh_is_pipelined_for_the_next_snapshot():
@@ -769,12 +790,12 @@ def test_single_vm_scope_freezes_v2_collection_runtime():
     )
     assert scope["container_resource_source"] == "direct_cgroup_v2"
     assert scope["beyla_retired_series_ttl"] == "30s"
-    assert scope["dns_exposure_profile"] == "single-vm-dns-v1"
-    assert scope["dns_exposure_source_service"] == "frontend"
-    assert scope["dns_exposure_target_service"] == "kube-dns"
-    assert scope["dns_exposure_interval_pattern_seconds"] == [
-        0.07, 0.08, 0.09, 0.075, 0.085,
-    ]
+    assert scope["experimental_dns"] == {
+        "enabled": False,
+        "formal_scope": "excluded_from_formal_rca",
+        "required_for_readiness": False,
+        "archived_diagnostics_compatible": True,
+    }
 
 
 def test_snapshot_loop_reports_source_failures():

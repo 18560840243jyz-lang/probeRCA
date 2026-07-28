@@ -182,6 +182,8 @@ class FinalControlPlane:
     def _catalog_window(self, window) -> None:
         for record in (*window.node_metrics, *window.edge_metrics):
             metric, spec = self.resolver.resolve(record)
+            if self.resolver.is_excluded_from_formal_rca(spec):
+                continue
             existing = self._metric_catalog.get(metric.node_id)
             if existing is not None and existing != metric:
                 raise ControlPlaneError("metric identity changed during calibration")
@@ -1079,7 +1081,15 @@ class FinalControlPlane:
         if not isinstance(archive, CollectionArchive):
             raise TypeError("control plane requires a loaded CollectionArchive")
         archive.validate()
-        if archive.collection_contract_fingerprint \
+        try:
+            formal_archive_contract = self.config.project_collection_contract(
+                archive.collection_contract
+            )
+        except ValueError as error:
+            raise CollectionContractMismatchError(
+                "sealed collection contract is not formally compatible"
+            ) from error
+        if fingerprint(formal_archive_contract) \
                 != self.config.collection_contract_fingerprint:
             raise CollectionContractMismatchError(
                 "sealed collection contract does not match final control config"

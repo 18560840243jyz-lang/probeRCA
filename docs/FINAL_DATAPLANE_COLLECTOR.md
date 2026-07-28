@@ -11,7 +11,7 @@ It performs only:
 ```text
 raw Prometheus/eBPF-map primitives + dedicated Burst ring events
   -> Kubernetes identity resolution
-  -> exact 1-second 9/4/3/3 normal aggregation
+  -> exact 1-second 9/4/3 normal aggregation
   -> topology-version proof
   -> typed raw Burst count/exposure or continuous samples
   -> paired write-once normal and raw-Burst archives
@@ -52,11 +52,10 @@ The output is exactly:
 - 9 metrics for every monitored service;
 - 4 metrics for every host that runs a monitored service;
 - 3 metrics for every known directed TCP edge;
-- 3 metrics for every known directed DNS edge.
 
-Known edges remain in the topology during an idle second. Their count and
-failure rate are zero and their empty latency has zero coverage. This keeps
-traffic sparsity from masquerading as a deployment-layout change.
+Known formal TCP edges remain in the topology during an idle second. Their
+count and failure rate are zero and their empty latency has zero coverage.
+This keeps traffic sparsity from masquerading as a deployment-layout change.
 
 ## Raw exporter contract
 
@@ -64,21 +63,25 @@ traffic sparsity from masquerading as a deployment-layout change.
 configuration is `configs/final_primitive_exporter.example.yaml`. It:
 
 - discovers exact ready Kubernetes Pod/container identities;
-- reads only required cAdvisor, CoreDNS, node_exporter, and Beyla cumulative
+- reads only required cAdvisor, node_exporter, Beyla, and final BPF cumulative
   primitives;
 - reads cgroup v2 CPU/memory/PSI/task/thread primitives;
-- snapshots the always-on `bpf/final_normal` cgroup, futex, socket, and DNS
-  maps;
+- snapshots the always-on `bpf/final_normal` cgroup, futex, and socket maps;
 - exports cumulative counters, cumulative buckets, and gauges with one
   explicit epoch-second timestamp.
+
+DNS map collection is `experimental / optional` and is disabled by default.
+It may be enabled only by an explicit experimental exporter configuration;
+the formal live collector does not query DNS series.
 
 The independent sources are fetched concurrently so a full snapshot completes
 inside the frozen 1-second period. Normal-path BPF data stays in maps; it does
 not stream fine-grained events to userspace.
 
-`configs/final_live_collector.example.yaml` binds all 34 raw components to
-this exporter. It does not query cAdvisor or node_exporter directly, so the
-source labels and aggregation boundary are fixed in one auditable adapter.
+`configs/final_live_collector.example.yaml` binds the formal non-DNS raw
+components to this exporter. It does not query cAdvisor or node_exporter
+directly, so the source labels and aggregation boundary are fixed in one
+auditable adapter.
 
 Prometheus is a transport for source primitives, not the final aggregator.
 The source adapter rejects `rate`, `irate`, `increase`, `delta`,
@@ -107,15 +110,14 @@ profile. Every sampled event carries its sampling divisor, so event counts
 and exposure denominators are corrected without treating sampled counts as
 complete counts.
 
-The live adapter freezes 29 Burst channel types:
+The live adapter freezes only formal non-DNS Burst channel types:
 
 - event-count channels store an integral count plus exposure. OOM, backlog
-  overflow, accept/connect failure, retransmission, RTO, RST, DNS timeout,
-  rcode failure, and the other frozen count channels never consume a
-  median/MAD Healthy baseline;
+  overflow, accept/connect failure, retransmission, RTO, RST, and the other
+  frozen count channels never consume a median/MAD Healthy baseline;
 - continuous channels store one window value with no exposure. Scheduler,
-  reclaim, block, futex/socket wait, softirq, RTT, and DNS latency channels
-  are the only channels that later consume a Healthy reference distribution.
+  reclaim, block, futex/socket wait, softirq, and RTT channels are the only
+  channels that later consume a Healthy reference distribution.
 
 This distinction is enforced when each raw sample is created and again when
 the control plane converts a sealed raw sample into evidence. An event-count
@@ -155,10 +157,10 @@ This command does not inject a fault. If any required normal or Burst source
 is absent, it exits without producing a sealed pair. Only matching,
 successfully sealed archives may later be passed to the control plane.
 
-The single-VM Healthy paired dry run on 2026-07-26 sealed consecutive
-normal/Burst windows with one shared dataset ID and exact sequence/time
-alignment. Every normal window contained 12 complete service sets, one host
-set, and 16 stable directed edge sets. Every matching raw-Burst window
-contained all 29 channel types across the same 12 services, one host, 15 TCP
-edges, and one DNS edge. Ring-buffer loss was zero and the minimum identity
-mapping quality was one.
+The single-VM Healthy paired dry run on 2026-07-26 predates the formal DNS
+scope exclusion. It sealed consecutive normal/Burst windows with one shared
+dataset ID and exact sequence/time alignment, including 15 TCP edges and one
+legacy DNS edge. This archive remains useful as compatibility evidence, but
+its DNS coordinates are `excluded_from_formal_rca` and do not count toward
+formal Readiness. A new formal collection must satisfy the `9/4/3` contract
+using service, host, and directed TCP-edge data only.

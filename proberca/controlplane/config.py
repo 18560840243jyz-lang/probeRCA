@@ -10,7 +10,13 @@ from proberca.dataplane.contracts import fingerprint
 
 
 ROOT_CATEGORIES = frozenset({
-    "CPU", "Memory", "IO", "Lock", "LocalNet", "NIC", "TCP", "DNS",
+    "CPU", "Memory", "IO", "Lock", "LocalNet", "NIC", "TCP",
+})
+FORMAL_EDGE_PROTOCOLS = frozenset({"tcp"})
+EXPERIMENTAL_DNS_BURST_CHANNEL_IDS = frozenset({
+    "dns.query_latency_p95",
+    "dns.timeout_rate",
+    "dns.rcode_failure_rate",
 })
 ENTITY_TYPES = frozenset({"service", "host", "edge"})
 RECORD_TYPES = frozenset({"node_metric", "edge_metric"})
@@ -58,9 +64,6 @@ def default_burst_channel_roles() -> tuple[dict[str, Any], ...]:
         ("tcp.rtt_p95", "TCP", ("edge",)),
         ("tcp.connect_failure_rate", "TCP", ("edge",)),
         ("tcp.rst_rate", "TCP", ("edge",)),
-        ("dns.query_latency_p95", "DNS", ("edge",)),
-        ("dns.timeout_rate", "DNS", ("edge",)),
-        ("dns.rcode_failure_rate", "DNS", ("edge",)),
     )
     return tuple({
         "channel_id": channel_id,
@@ -252,24 +255,46 @@ def default_metric_roles() -> tuple[MetricRoleSpec, ...]:
                        aggregation="ratio_from_summed_components",
                        aggregation_formula="sum_flow(delta(error_total+timeout_total))/(sum_flow(delta(request_total))+epsilon)",
                        source_scope="flow"),
-        MetricRoleSpec("edge_metric", "dns_query_count", "edge", "edge_count", edge_scopes,
-                       protocols=("dns",), unit="queries", metric_kind="delta_counter",
-                       aggregation="cross_series_sum_delta",
-                       aggregation_formula="sum_flow(delta(dns_query_total))", source_scope="flow"),
-        MetricRoleSpec("edge_metric", "dns_latency_p95", "edge", "edge_latency", edge_scopes,
-                       protocols=("dns",), root_category="DNS", root_eligible=True,
-                       transform="log1p", unit="milliseconds", metric_kind="quantile",
-                       aggregation="histogram_merge_quantile",
-                       aggregation_formula="q0.95(merge_flow(dns_latency_histogram))",
-                       source_scope="flow", quantile=0.95),
-        MetricRoleSpec("edge_metric", "dns_failure_rate", "edge", "edge_failure", edge_scopes,
-                       protocols=("dns",), root_category="DNS", root_eligible=True,
-                       aggregation="ratio_from_summed_components",
-                       aggregation_formula="sum_flow(delta(dns_timeout+dns_error_rcode))/(sum_flow(delta(dns_query_total))+epsilon)",
-                       source_scope="flow"),
     ), key=lambda item: (
         item.record_type, item.metric_name, item.entity_type, item.scopes, item.protocols,
     )))
+
+
+def experimental_dns_metric_roles() -> tuple[MetricRoleSpec, ...]:
+    """Compatibility-only DNS roles; they can be read but never enter formal RCA."""
+    edge_scopes = ("service_pair",)
+    return (
+        MetricRoleSpec(
+            "edge_metric", "dns_failure_rate", "edge", "edge_failure",
+            edge_scopes, protocols=("dns",),
+            root_eligible=False,
+            aggregation="ratio_from_summed_components",
+            aggregation_formula=(
+                "sum_flow(delta(dns_timeout+dns_error_rcode))/"
+                "(sum_flow(delta(dns_query_total))+epsilon)"
+            ),
+            source_scope="flow",
+        ),
+        MetricRoleSpec(
+            "edge_metric", "dns_latency_p95", "edge", "edge_latency",
+            edge_scopes, protocols=("dns",),
+            root_eligible=False, transform="log1p", unit="milliseconds",
+            metric_kind="quantile",
+            aggregation="histogram_merge_quantile",
+            aggregation_formula=(
+                "q0.95(merge_flow(dns_latency_histogram))"
+            ),
+            source_scope="flow", quantile=0.95,
+        ),
+        MetricRoleSpec(
+            "edge_metric", "dns_query_count", "edge", "edge_count",
+            edge_scopes, protocols=("dns",), unit="queries",
+            metric_kind="delta_counter",
+            aggregation="cross_series_sum_delta",
+            aggregation_formula="sum_flow(delta(dns_query_total))",
+            source_scope="flow",
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -321,10 +346,6 @@ class FinalControlConfig:
     fista_tolerance: float = 1.0e-7
     top_k: int = 5
     strict_metric_contract: bool = True
-    dns_aggregation_policy_id: str = "single-vm-online-boutique-dns-v2"
-    dns_aggregation_policy_fingerprint: str = (
-        "b068ed2299af9137870676707ca85c0dee97d878452b8af4b797460ba2cdc90f"
-    )
     metric_roles: tuple[MetricRoleSpec, ...] = field(default_factory=default_metric_roles)
 
     def __post_init__(self) -> None:
@@ -376,20 +397,6 @@ class FinalControlConfig:
             raise ValueError("candidate threshold and burst eta must be finite and non-negative")
         if type(self.strict_metric_contract) is not bool:
             raise TypeError("strict_metric_contract must be boolean")
-        if not isinstance(self.dns_aggregation_policy_id, str) \
-                or not self.dns_aggregation_policy_id:
-            raise ValueError("DNS aggregation policy ID must be non-empty")
-        if (
-            not isinstance(self.dns_aggregation_policy_fingerprint, str)
-            or len(self.dns_aggregation_policy_fingerprint) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in self.dns_aggregation_policy_fingerprint
-            )
-        ):
-            raise ValueError(
-                "DNS aggregation policy fingerprint must be SHA-256"
-            )
         if set(self.baseline_family_min_scales) != SCALE_FAMILIES:
             raise ValueError(
                 "baseline family floors must cover every scale family"
@@ -488,25 +495,15 @@ class FinalControlConfig:
         aggregation_fingerprint = fingerprint({
             "output_source": FINAL_AGGREGATION_OUTPUT_SOURCE,
             "roles": roles,
-            "dns_aggregation_policy_id": (
-                self.dns_aggregation_policy_id
-            ),
-            "dns_aggregation_policy_fingerprint": (
-                self.dns_aggregation_policy_fingerprint
-            ),
         })
         burst_fingerprint = fingerprint({
             "roles": burst_roles,
             "semantics": "normalized_strength_times_quality",
         })
         return {
-            "schema_version": "probeRCA-final-collection-contract-v3",
+            "schema_version": "probeRCA-final-collection-contract-v4",
             "normal_metric_roles": roles,
             "aggregation_output_source": FINAL_AGGREGATION_OUTPUT_SOURCE,
-            "dns_aggregation_policy_id": self.dns_aggregation_policy_id,
-            "dns_aggregation_policy_fingerprint": (
-                self.dns_aggregation_policy_fingerprint
-            ),
             "aggregation_config_fingerprint": aggregation_fingerprint,
             "source_description": FINAL_SOURCE_DESCRIPTION,
             "burst_evidence_source_type": "burst_event",
@@ -519,6 +516,73 @@ class FinalControlConfig:
     @property
     def collection_contract_fingerprint(self) -> str:
         return fingerprint(self.collection_contract)
+
+    def project_collection_contract(
+        self, contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Project only explicit v2/v3 DNS-era contracts into formal v4."""
+        schema = contract.get("schema_version")
+        if schema == "probeRCA-final-collection-contract-v4":
+            return dict(contract)
+        if schema not in {
+            "probeRCA-final-collection-contract-v2",
+            "probeRCA-final-collection-contract-v3",
+        }:
+            raise ValueError("unsupported legacy collection contract")
+        archived_roles = contract["normal_metric_roles"]
+        discarded_roles = [
+            role for role in archived_roles if "dns" in role["protocols"]
+        ]
+        allowed_dns_roles = {
+            (spec.metric_name, spec.role)
+            for spec in experimental_dns_metric_roles()
+        }
+        if any(
+            tuple(role["protocols"]) != ("dns",)
+            or (role["metric_name"], role["role"]) not in allowed_dns_roles
+            for role in discarded_roles
+        ):
+            raise ValueError("legacy DNS metric role is ambiguous")
+        roles = [
+            role for role in archived_roles if role not in discarded_roles
+        ]
+        archived_burst = contract["burst_channel_roles"]
+        discarded_burst = [
+            role for role in archived_burst
+            if role["root_category"] == "DNS"
+        ]
+        if any(
+            role["channel_id"] not in EXPERIMENTAL_DNS_BURST_CHANNEL_IDS
+            for role in discarded_burst
+        ):
+            raise ValueError("legacy DNS Burst role is unknown")
+        burst_roles = [
+            role for role in archived_burst if role not in discarded_burst
+        ]
+        return {
+            "schema_version": "probeRCA-final-collection-contract-v4",
+            "normal_metric_roles": roles,
+            "aggregation_output_source": contract[
+                "aggregation_output_source"
+            ],
+            "aggregation_config_fingerprint": fingerprint({
+                "output_source": contract["aggregation_output_source"],
+                "roles": roles,
+            }),
+            "source_description": contract["source_description"],
+            "burst_evidence_source_type": contract[
+                "burst_evidence_source_type"
+            ],
+            "burst_evidence_semantics": contract[
+                "burst_evidence_semantics"
+            ],
+            "burst_channel_roles": burst_roles,
+            "burst_config_fingerprint": fingerprint({
+                "roles": burst_roles,
+                "semantics": contract["burst_evidence_semantics"],
+            }),
+            "window_sec": contract["window_sec"],
+        }
 
     @property
     def required_scope_fingerprint(self) -> str:

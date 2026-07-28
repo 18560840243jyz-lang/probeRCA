@@ -174,37 +174,48 @@ The final ProbeRCA-BPF path must collect and seal all input windows before the R
 
 Final normal metrics are service-level, node-level, or directed service-pair aggregates exactly as declared in `configs/final_collection_contract.yaml`; incomplete entity metric sets fail closed. Ground-truth, target configuration, injection paths, and expected-root fields are forbidden across the boundary. Burst evidence is collected after Hard in a distinct following window, is required to be independent from residual metrics, and may only reduce the matching `(entity, root category)` group penalty. The final path does not subtract Burst evidence from residuals, add a direct evidence ranking term, introduce a composite relation-strength variable, or perform counterfactual repeat solves.
 
-## Final DNS Attribution and Aggregation Decision
+## Final Formal Root-Cause Scope and Experimental DNS Decision
 
-DNS attribution is resolved before Pod-to-Service aggregation. The frozen
-single-VM policy is `configs/final_dns_aggregation_policy.yaml`; its ID and
-SHA-256 are part of collection-contract v3 and the aggregation fingerprint.
-Existing collection-contract v2 archives remain readable for Replay, but new
-v3 archives reject an unconfigured or all-zero DNS policy.
+The formal ProbeRCA-BPF paper scope contains only:
 
-The formal DNS edge still exposes exactly three metrics:
+- service root-cause entities;
+- host root-cause entities;
+- directed TCP edge entities identified as
+  `(src_service -> dst_service, TCP)`.
 
-- `dns_query_count` counts closed logical transactions admitted by policy;
-- `dns_latency_p95` merges successful-transaction histograms only;
-- `dns_failure_rate` uses the frozen terminal failure counters.
+The final normal metric contract is `9/4/3`: nine metrics per service, four
+metrics per host, and three metrics per directed TCP edge
+(`count`, `latency_p95`, and `failure_rate`). TCP edge alert state is
+independent from its endpoint services. Default edge alert rules remain Soft
+at score `>=3` for three consecutive one-second windows and Hard at score
+`>=5` for two consecutive one-second windows.
 
-Application, DNS-sidecar, and diagnostic containers remain separate. Metadata
-probes and other `record_only` qname classes are retained in policy audit
-output but do not enter the formal business DNS edge. Unknown roles, qname
-classes, outcomes, incomplete transaction identity, and inconsistent terminal
-counter partitions fail closed.
+The directed TCP edge path remains:
 
-The current normal BPF implementation handles UDP pending state across
-one-second windows, qname/qtype identity, retries, terminal outcomes, and
-successful-only latency. Two engineering items remain explicit readiness
-blockers rather than silent approximations:
+```text
+independent edge alert
+  -> candidate scope
+  -> healthy A_v cross-metric propagation subtraction
+  -> TCP edge root residual
+  -> TCP Burst group-penalty adjustment
+  -> one non-negative Sparse-Group FISTA solve
+  -> (src_service -> dst_service, TCP)
+```
 
-1. a locally sealed per-logical-transaction normal ledger is not yet wired
-   into the final collection archive; the formal map path retains cumulative
-   per-qname counters and audit series;
-2. UDP truncation followed by TCP fallback is detected but not yet reassembled,
-   so any observed `TC=1` makes the DNS snapshot Not Ready.
+DNS is no longer a formal root-cause category. It is excluded from
+`required_candidate_scope`, Baseline and `A_v` Readiness denominators,
+Soft/Hard Alert, root residual coordinates, theta/FISTA groups, formal Burst
+evidence, the fault matrix, and paper evaluation.
 
-Healthy Pilot and fault injection must remain disabled until the required DNS
-scope has real application-container coverage and these blockers are either
-implemented or explicitly excluded by a newly reviewed scheme revision.
+DNS transaction attribution and aggregation code is retained only as
+`experimental / optional / not evaluated in the formal paper scope`. It is
+disabled by default and may run only through an explicit experimental
+configuration. Enabling or disabling that experimental producer must not
+change the formal `9/4/3` contract, formal Dataset ID inputs, or Readiness
+denominator.
+
+Legacy collection-contract v2/v3 DNS archives remain readable for Replay.
+Their original archive and contract fingerprints remain provenance. DNS
+coordinates and DNS Burst records from those archives are marked
+`excluded_from_formal_rca` and cannot enter calibration, alerting,
+propagation, residual construction, penalty adjustment, FISTA, or ranking.

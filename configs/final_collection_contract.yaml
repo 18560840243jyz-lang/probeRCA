@@ -1,59 +1,5 @@
-schema_version: probeRCA-final-collection-contract-v3
+schema_version: probeRCA-final-collection-contract-v4
 normal_metric_roles:
-- record_type: edge_metric
-  metric_name: dns_failure_rate
-  entity_type: edge
-  role: edge_failure
-  scopes:
-  - service_pair
-  protocols:
-  - dns
-  root_category: DNS
-  root_eligible: true
-  transform: identity
-  polarity: 1
-  unit: ratio
-  metric_kind: gauge
-  aggregation: ratio_from_summed_components
-  aggregation_formula: sum_flow(delta(dns_servfail+dns_refused+dns_nxdomain_failure+dns_timeout+dns_transport_error))/(sum_flow(delta(dns_query_total))+epsilon)
-  source_scope: flow
-  quantile: null
-- record_type: edge_metric
-  metric_name: dns_latency_p95
-  entity_type: edge
-  role: edge_latency
-  scopes:
-  - service_pair
-  protocols:
-  - dns
-  root_category: DNS
-  root_eligible: true
-  transform: log1p
-  polarity: 1
-  unit: milliseconds
-  metric_kind: quantile
-  aggregation: histogram_merge_quantile
-  aggregation_formula: q0.95(merge_flow(dns_success_latency_histogram))
-  source_scope: flow
-  quantile: 0.95
-- record_type: edge_metric
-  metric_name: dns_query_count
-  entity_type: edge
-  role: edge_count
-  scopes:
-  - service_pair
-  protocols:
-  - dns
-  root_category: null
-  root_eligible: false
-  transform: identity
-  polarity: 1
-  unit: queries
-  metric_kind: delta_counter
-  aggregation: cross_series_sum_delta
-  aggregation_formula: sum_flow(delta(dns_query_total))
-  source_scope: flow
-  quantile: null
 - record_type: edge_metric
   metric_name: edge_failure_rate
   entity_type: edge
@@ -330,9 +276,7 @@ normal_metric_roles:
   source_scope: pod
   quantile: null
 aggregation_output_source: final_window_aggregation
-dns_aggregation_policy_id: single-vm-online-boutique-dns-v2
-dns_aggregation_policy_fingerprint: b068ed2299af9137870676707ca85c0dee97d878452b8af4b797460ba2cdc90f
-aggregation_config_fingerprint: 2563fbb85d7e508ff103d20a890979b318dc719e6de772716bb51dff71517f14
+aggregation_config_fingerprint: 814b0dc72f2fe171d579097d9c20c8508875a179541eefca8e039091169387a9
 source_description: final-window-aggregates-v1
 burst_evidence_source_type: burst_event
 burst_evidence_semantics: normalized_strength_times_quality
@@ -441,17 +385,5 @@ burst_channel_roles:
   root_category: TCP
   entity_types:
   - edge
-- channel_id: dns.query_latency_p95
-  root_category: DNS
-  entity_types:
-  - edge
-- channel_id: dns.timeout_rate
-  root_category: DNS
-  entity_types:
-  - edge
-- channel_id: dns.rcode_failure_rate
-  root_category: DNS
-  entity_types:
-  - edge
-burst_config_fingerprint: 96f5d13ada70e54eae52c476c1712b7f144fe38d9e3eef1c050e74c65c2bef22
+burst_config_fingerprint: 26e46c818617bc36688eaea0f3cc4995c3b1b4c57d80b057f6935233a99181d7
 window_sec: 1

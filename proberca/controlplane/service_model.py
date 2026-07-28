@@ -11,7 +11,7 @@ import numpy as np
 from proberca.data.schema import TopologySnapshot
 from proberca.dataplane.contracts import fingerprint
 
-from .config import FinalControlConfig
+from .config import FORMAL_EDGE_PROTOCOLS, FinalControlConfig
 from .model import CandidateEntityGraph
 
 
@@ -52,6 +52,13 @@ def _edge_endpoints(snapshot: TopologySnapshot, edge) -> tuple[str, str]:
     )
 
 
+def _formal_call_edges(snapshot: TopologySnapshot) -> tuple:
+    return tuple(
+        edge for edge in snapshot.call_edges
+        if (edge.protocol or "tcp") in FORMAL_EDGE_PROTOCOLS
+    )
+
+
 def semantic_topology_fingerprint(snapshot: TopologySnapshot) -> str:
     """Hash only normalized deployment semantics, never snapshot provenance."""
     if not isinstance(snapshot, TopologySnapshot):
@@ -75,7 +82,7 @@ def semantic_topology_fingerprint(snapshot: TopologySnapshot) -> str:
         "cluster_id": snapshot.cluster_id,
         "services": list(_topology_services(snapshot)),
         "call_edges": sorted(
-            normalized_edge(edge) for edge in snapshot.call_edges
+            normalized_edge(edge) for edge in _formal_call_edges(snapshot)
         ),
         "host_edges": sorted(
             normalized_edge(edge) for edge in snapshot.host_edges
@@ -145,7 +152,11 @@ def allowed_service_graph(snapshot: TopologySnapshot) -> AllowedServiceGraph:
     services = _topology_services(snapshot)
     relations = set()
     physical = set()
-    for edge in (*snapshot.call_edges, *snapshot.host_edges, *snapshot.resource_edges):
+    for edge in (
+        *_formal_call_edges(snapshot),
+        *snapshot.host_edges,
+        *snapshot.resource_edges,
+    ):
         source, target = _edge_endpoints(snapshot, edge)
         relation_type = edge.relation_type
         relations.add((source, target, relation_type))

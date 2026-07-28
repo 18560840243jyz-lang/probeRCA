@@ -1,6 +1,6 @@
 ---
 name: proberca
-description: "Enforce the final frozen ProbeRCA-BPF two-plane online RCA scheme: service-only As, healthy masked Av, DNS transaction attribution, Burst penalty guidance, and one non-negative Sparse-Group FISTA solve."
+description: "Enforce the final frozen ProbeRCA-BPF two-plane online RCA scheme for service, host, and directed TCP-edge root causes: service-only As, healthy masked Av, TCP Burst penalty guidance, and one non-negative Sparse-Group FISTA solve. Use when implementing, reviewing, collecting, calibrating, replaying, or evaluating the formal ProbeRCA-BPF path."
 ---
 
 # Final ProbeRCA-BPF Scheme
@@ -425,7 +425,7 @@ G_{(h,\mathrm{IO})}={h::\mathrm{io_psi}}
 G_{(h,\mathrm{NIC})}={h::\mathrm{nic_drop/error}}
 ]
 
-3.4 每条活跃有向边采集3个常态指标
+3.4 每条正式有向TCP边采集3个常态指标
 设有向边为：
 [
 g=(s_a\rightarrow s_b)
@@ -450,8 +450,11 @@ x_{g,\mathrm{latency}}(t)
 x_{g,\mathrm{failure}}(t)
 ]
 表示边失败或超时率。
-其中请求数只是暴露量和上下文，不作为根因指标。
-对普通服务调用边：
+其中请求数只是暴露量和上下文，不作为根因指标。正式有向边只包括：
+[
+g=(s_a\rightarrow s_b,\mathrm{TCP})
+]
+对应根因组为：
 [
 \boxed{
 G_{(g,\mathrm{TCP})}
@@ -461,16 +464,9 @@ g::\mathrm{failure}
 }
 }
 ]
-对DNS调用边：
-[
-\boxed{
-G_{(g,\mathrm{DNS})}
-{
-g::\mathrm{dns_latency},
-g::\mathrm{dns_failure}
-}
-}
-]
+
+因此正式常态指标契约固定为服务9、主机4、每条有向TCP边3，即
+`9/4/3`。DNS不属于正式常态契约或正式根因坐标。
 
 四、步骤2：建立身份映射和多源结构关系图
 4.1 这一步的作用
@@ -526,7 +522,7 @@ PID/TID
 (\mathcal R_{\mathrm{cohost}})：两个服务部署在同一主机上的关系；
 
 
-(\mathcal R_{\mathrm{shared}})：共享数据库、缓存、磁盘、DNS或其他资源的关系。
+(\mathcal R_{\mathrm{shared}})：共享数据库、缓存、磁盘或其他资源的关系。
 
 定义服务允许图：
 [
@@ -864,13 +860,14 @@ P_i(t-1)
 
 
 8.2 Soft Alert
-服务异常状态超过软阈值：
+服务或有向TCP边异常分数达到软阈值：
 [
 \boxed{
-c_s(t)\ge\tau_{\mathrm{soft}}
+\mathrm{score}_e(t)\ge\tau_{\mathrm{soft}}=3
 }
 ]
-并持续一定窗口后进入Soft Alert。
+同一实体连续3个1秒窗口满足条件后进入Soft Alert。不同实体的异常不能拼接
+成连续告警；TCP边拥有独立于端点服务的告警状态。
 其中：
 
 (\tau_{\mathrm{soft}})：软告警阈值。
@@ -893,13 +890,13 @@ Soft阶段执行：
 
 
 8.3 Hard Alert
-当：
+服务或有向TCP边满足：
 [
 \boxed{
-c_s(t)\ge\tau_{\mathrm{hard}}
+\mathrm{score}_e(t)\ge\tau_{\mathrm{hard}}=5
 }
 ]
-并持续规定窗口后进入Hard Alert。
+并且同一实体连续2个1秒窗口达到阈值后进入Hard Alert。
 其中：
 [
 \tau_{\mathrm{hard}}>\tau_{\mathrm{soft}}
@@ -1120,9 +1117,6 @@ LocalNet；
 
 TCP；
 
-
-DNS。
-
 因此需要将候选实体展开到指标粒度。
 
 11.2 指标节点集合
@@ -1170,7 +1164,7 @@ d=|\mathcal V_c|
 [
 \text{无关服务的Memory}
 \rightarrow
-\text{另一条无关边的DNS延迟}
+\text{另一条无关TCP边的延迟}
 ]
 因此指标级传播必须同时满足：
 
@@ -1475,7 +1469,7 @@ z_j(t-\ell)\rightarrow z_i(t),
 主机CPU、Memory、I/O、NIC指标；
 
 
-TCP或DNS边的latency和failure指标。
+有向TCP边的latency和failure指标。
 
 设：
 [
@@ -1525,7 +1519,6 @@ T_B=30\text{秒}
 主机I/O	分设备block latency与queue wait
 主机NIC	NIC队列丢包、错误与softirq延迟
 TCP边	retrans rate、RTO、RTT p95、connect failure、RST
-DNS边	query latency、timeout、rcode
 
 十八、步骤16：判断Burst数据是否异常
 Burst数据分为两类。
@@ -1537,9 +1530,6 @@ OOM kill；
 
 
 RTO；
-
-
-DNS timeout；
 
 
 connect failure。
@@ -2169,7 +2159,7 @@ A_v\text{健康传播扣除}
 - `coverage = 0`表示缺失，不能补零、前向填充、插值或复用上一窗口值。
 - 缺失指标不能进入Healthy基线、告警或(A_v)训练。
 - latency P95必须满足最小样本数。
-- failure rate必须拥有足够的请求或查询暴露量；无请求窗口是缺失，不是健康零值。
+- failure rate必须拥有足够的请求暴露量；无请求窗口是缺失，不是健康零值。
 - 数据面保留raw value、coverage、sample count、request count来源、quality和lineage；控制面判断是否可用。
 
 稳健尺度：
@@ -2209,6 +2199,7 @@ N_i^{min}=
 - 每个目标必须输出allowed feature count、valid training rows、minimum rows、effective rank、condition number、ready和not-ready reason。
 - 一条稀疏边不能拖垮无关目标，也不能以未Ready坐标进入FISTA。
 - 正式计划故障范围内的根因坐标必须通过`calibration_required_root_coordinates`显式冻结并全部Ready。
+- `calibration_required_root_coordinates`只允许服务、主机和有向TCP边坐标；DNS坐标必须排除且不计入Baseline或(A_v) Readiness分母。
 - 上述计划范围只能用于校准门禁，绝对不能进入候选排序、残差或FISTA。
 - 计划范围必须在实验前统一声明并与单次故障注入标签隔离，不能按某次真实注入结果动态改变。
 
@@ -2246,99 +2237,41 @@ reason: <逐坐标真实原因>
 
 此时不得静默跳过(A_v)，不得运行FISTA，也不得输出伪根因。
 
-二十八、DNS逻辑事务和聚合前归属契约
+二十八、DNS实验能力边界
 
-本节补充步骤3.4中DNS三指标在工程实现前必须满足的语义。它不增加新的
-RCA坐标，不改变服务级(A_s)、指标级(A_v)或FISTA。
+DNS事务匹配、容器归属、qname分类、重试、超时和TCP fallback等代码仅作为
+`experimental / optional` 工程历史保留，默认关闭，也不在当前论文中评价。
+只有显式实验配置才允许运行相关采集或诊断模式。
 
-聚合前必须先形成逻辑DNS事务。每条事务至少保留：
+正式ProbeRCA-BPF路径必须满足：
 
-```text
-source_service
-source_pod_uid
-source_container
-source_container_role
-source_cgroup_id
-resolver_identity
-qname_class
-qname_hash
-qtype
-protocol
-first_query_time
-final_response_time
-rcode
-final_outcome
-retry_count
-tcp_fallback
-quality
-lineage
-```
+- DNS不是正式根因类别或正式有向边实体；
+- DNS不进入`required_candidate_scope`、Baseline或(A_v) Readiness分母；
+- DNS不触发正式Soft/Hard Alert；
+- DNS不生成根因残差坐标、θ变量或Sparse-Group FISTA候选组；
+- DNS Burst不调整正式候选组惩罚；
+- DNS不进入正式故障矩阵、主实验、消融或论文评价；
+- experimental DNS开关不改变正式`9/4/3`契约、正式Dataset ID或Readiness分母。
 
-诊断模式可以封存完整qname；正式常态归档默认保存规范化qname的SHA-256和
-冻结的qname_class。不得把故障标签、预期根因或注入配置编码进分类规则。
+旧v2/v3 DNS归档仍允许兼容读取和Replay，但其中DNS常态坐标与Burst证据必须
+统一标记为`excluded_from_formal_rca`，不得进入基线、告警、传播学习、残差
+或排序。控制面结果必须保留旧归档原始契约指纹，不能把旧归档伪装为新v4
+正式归档。
 
-DNS事务关联键必须区分：
+正式有向通信边只保留：
 
 ```text
-cgroup/netns
-source/destination IP and port
-UDP/TCP
-transaction ID
-qname
-qtype
-resolver
+(src_service -> dst_service, TCP)
 ```
 
-pending事务必须跨越1秒窗口保存。窗口结束不能清空pending；达到冻结的
-事务超时TTL后才关闭为TIMEOUT。相同逻辑事务的UDP重发只增加retry_count；
-UDP截断后的TCP fallback必须与原事务合并，不能成为第二个失败。
-
-最终结果只允许：
+其完整路径必须保持为：
 
 ```text
-SUCCESS
-SERVFAIL
-REFUSED
-NXDOMAIN
-TIMEOUT
-TRANSPORT_ERROR
+TCP边独立告警
+  -> 候选范围
+  -> 健康A_v跨指标传播扣除
+  -> TCP边根因残差
+  -> TCP Burst调整组惩罚
+  -> 非负Sparse-Group FISTA
+  -> (src_service -> dst_service, TCP)
 ```
-
-正式三指标仍然是：
-
-```text
-dns_query_count
-dns_latency_p95
-dns_failure_rate
-```
-
-其中：
-
-- dns_query_count只统计纳入冻结策略的已关闭逻辑事务，不统计发送包数；
-- dns_latency_p95只使用final_outcome=SUCCESS的
-  `final_response_time-first_query_time`；
-- timeout上限、SERVFAIL、REFUSED和最终失败重试链不得进入延迟直方图；
-- dns_failure_rate的默认失败集合为SERVFAIL、REFUSED、TIMEOUT和
-  TRANSPORT_ERROR；
-- NXDOMAIN是否计失败由实验前冻结的qname_class策略决定。
-
-容器身份必须在Pod到Service聚合之前解析。主业务容器、DNS sidecar、
-service-mesh sidecar和诊断容器不能自动合并。数据面保留容器级事务，
-控制面只消费预先冻结策略允许进入正式服务DNS边的聚合结果。sidecar成功量
-不能稀释主业务容器失败，也不能替代主业务容器的基线覆盖。
-
-冻结策略至少保存：
-
-```text
-included/separate/record-only container roles
-qname classification rules
-NXDOMAIN policy
-timeout TTL
-qname storage policy
-policy fingerprint
-```
-
-常态阶段对控制面仍只输出窗口级三个指标；规范化逻辑事务在单机实验数据面
-本地封存用于审计和Replay，不作为额外RCA变量。无法确定容器角色、qname
-分类、TCP fallback或事务最终结果时必须失败关闭，并使相应DNS坐标Not
-Ready，不能用补零、全局Service合并或临时过滤绕过。

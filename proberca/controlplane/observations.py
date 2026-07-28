@@ -10,7 +10,11 @@ from typing import Any
 
 from proberca.data.schema import EdgeMetricRecord, NodeMetricRecord
 
-from .config import FinalControlConfig, MetricRoleSpec
+from .config import (
+    FinalControlConfig,
+    MetricRoleSpec,
+    experimental_dns_metric_roles,
+)
 from .model import MetricNode, NormalizedObservation
 
 
@@ -190,12 +194,20 @@ class RobustBaselineStore:
 class MetricResolver:
     def __init__(self, config: FinalControlConfig):
         self.config = config
+        self._excluded_roles = frozenset(experimental_dns_metric_roles())
+        self._resolvable_roles = (
+            *config.metric_roles,
+            *self._excluded_roles,
+        )
         self.last_validity: dict[str, dict[str, Any]] = {}
+
+    def is_excluded_from_formal_rca(self, spec: MetricRoleSpec) -> bool:
+        return spec in self._excluded_roles
 
     def resolve(self, record) -> tuple[MetricNode, MetricRoleSpec]:
         record_type = getattr(record, "record_type", None)
         matches = []
-        for spec in self.config.metric_roles:
+        for spec in self._resolvable_roles:
             if spec.record_type != record_type or spec.metric_name != record.metric_name:
                 continue
             if record.scope not in spec.scopes:
@@ -271,6 +283,18 @@ class MetricResolver:
                 )
             seen.add(metric.node_id)
             quality = float(record.coverage * (1.0 - record.event_loss_rate))
+            if self.is_excluded_from_formal_rca(spec):
+                validity[metric.node_id] = {
+                    "valid": False,
+                    "invalid_reason": "excluded_from_formal_rca",
+                    "exclusion_reason": "excluded_from_formal_rca",
+                    "raw_value": record.value,
+                    "coverage": record.coverage,
+                    "sample_count": record.sample_count,
+                    "request_count": count_by_entity.get(metric.entity_id),
+                    "quality": quality,
+                }
+                continue
             reason = None
             if quality <= 0.0:
                 reason = "zero_coverage"

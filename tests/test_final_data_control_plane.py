@@ -13,6 +13,10 @@ import proberca.dataplane.archive as archive_module
 from proberca.cli.analyze_collection import main as analyze_main
 from proberca.cli.seal_collection import main as seal_main
 from proberca.controlplane import FinalControlConfig, FinalControlPlane
+from proberca.controlplane.config import (
+    EXPERIMENTAL_DNS_BURST_CHANNEL_IDS,
+    experimental_dns_metric_roles,
+)
 from proberca.controlplane import (
     CalibrationNotReadyError,
     load_ready_calibration_report,
@@ -22,12 +26,15 @@ from proberca.controlplane.model import (
     CandidateEntityGraph,
     MetricNode,
     MetricPropagationModel,
+    MetricTargetReadiness,
+    NormalizedObservation,
 )
 from proberca.controlplane.observations import MetricResolver, RobustBaselineStore
 from proberca.controlplane.service_model import (
     AllowedServiceGraph,
     ServiceRLS,
     allowed_service_graph,
+    build_candidate_graph,
 )
 from proberca.data.schema import (
     EdgeMetricRecord,
@@ -482,6 +489,14 @@ def test_collection_must_be_complete_and_sealed_before_control(tmp_path):
     run = FinalControlPlane(config).run(CollectionArchive.load(archive_dir))
 
     assert run.processed_window_count == 12
+    assert run.calibration_readiness["ready"] is True
+    assert run.calibration_readiness["Av_required_count"] > 0
+    assert not any(
+        "::dns::" in coordinate
+        for coordinate in run.calibration_readiness[
+            "required_root_coordinates"
+        ]
+    )
     assert len(run.results) == 1
     result = run.results[0]
     assert result.top_k[0].entity_id == "cluster::ns::payment"
@@ -542,7 +557,11 @@ def test_checked_in_contract_and_plane_imports_are_separate():
     formal = FinalControlConfig.from_dict(control_payload)
     assert formal.calibration_learning_windows == 600
     assert formal.calibration_validation_windows == 300
-    assert len(formal.calibration_required_root_coordinates) == 108
+    assert len(formal.calibration_required_root_coordinates) == 106
+    assert all(
+        "::dns::" not in coordinate
+        for coordinate in formal.calibration_required_root_coordinates
+    )
     assert all(
         value is not None
         for value in formal.baseline_family_min_scales.values()
@@ -1167,18 +1186,12 @@ def test_metric_unit_kind_and_p95_aggregation_semantics_fail_closed(tmp_path):
     assert contract["aggregation_config_fingerprint"] == fingerprint({
         "output_source": contract["aggregation_output_source"],
         "roles": contract["normal_metric_roles"],
-        "dns_aggregation_policy_id": contract["dns_aggregation_policy_id"],
-        "dns_aggregation_policy_fingerprint": contract[
-            "dns_aggregation_policy_fingerprint"
-        ],
     })
 
 
 def test_v2_contract_remains_readable_for_existing_archives(tmp_path):
     contract = dict(_config().collection_contract)
     contract["schema_version"] = "probeRCA-final-collection-contract-v2"
-    contract.pop("dns_aggregation_policy_id")
-    contract.pop("dns_aggregation_policy_fingerprint")
     contract["aggregation_config_fingerprint"] = fingerprint({
         "output_source": contract["aggregation_output_source"],
         "roles": contract["normal_metric_roles"],
@@ -1196,41 +1209,98 @@ def test_v2_contract_remains_readable_for_existing_archives(tmp_path):
     )
 
 
-def test_v3_contract_fails_closed_when_dns_policy_identity_changes(tmp_path):
-    contract = dict(_config().collection_contract)
-    contract["dns_aggregation_policy_id"] = "silently-changed-policy"
-    with pytest.raises(
-        CollectionArchiveError,
-        match="aggregation configuration fingerprint mismatch",
-    ):
-        CollectionArchiveWriter(
-            tmp_path / "changed-dns-policy",
-            dataset_id=fingerprint({"dataset": "changed-dns-policy"}),
-            collection_contract=contract,
-            source_description=contract["source_description"],
-            collection_metadata=_collection_metadata(_config()),
-        )
+def _legacy_v3_dns_contract(config: FinalControlConfig) -> dict:
+    formal = config.collection_contract
+    dns_roles = []
+    for spec in experimental_dns_metric_roles():
+        role = spec.to_dict()
+        if role["metric_name"] != "dns_query_count":
+            role["root_category"] = "DNS"
+            role["root_eligible"] = True
+        dns_roles.append(role)
+    roles = sorted(
+        [*formal["normal_metric_roles"], *dns_roles],
+        key=lambda item: (
+            item["record_type"], item["metric_name"], item["entity_type"],
+            item["scopes"], item["protocols"],
+        ),
+    )
+    burst_roles = [
+        *formal["burst_channel_roles"],
+        *[
+            {
+                "channel_id": channel_id,
+                "root_category": "DNS",
+                "entity_types": ["edge"],
+            }
+            for channel_id in sorted(EXPERIMENTAL_DNS_BURST_CHANNEL_IDS)
+        ],
+    ]
+    policy_id = "legacy-dns-policy"
+    policy_fingerprint = fingerprint({"policy": policy_id})
+    return {
+        **formal,
+        "schema_version": "probeRCA-final-collection-contract-v3",
+        "normal_metric_roles": roles,
+        "dns_aggregation_policy_id": policy_id,
+        "dns_aggregation_policy_fingerprint": policy_fingerprint,
+        "aggregation_config_fingerprint": fingerprint({
+            "output_source": formal["aggregation_output_source"],
+            "roles": roles,
+            "dns_aggregation_policy_id": policy_id,
+            "dns_aggregation_policy_fingerprint": policy_fingerprint,
+        }),
+        "burst_channel_roles": burst_roles,
+        "burst_config_fingerprint": fingerprint({
+            "roles": burst_roles,
+            "semantics": formal["burst_evidence_semantics"],
+        }),
+    }
 
 
-def test_v3_contract_rejects_unconfigured_dns_policy(tmp_path):
+def test_legacy_v3_dns_contract_projects_to_formal_v4():
+    config = _config()
+    legacy = _legacy_v3_dns_contract(config)
+
+    projected = config.project_collection_contract(legacy)
+
+    assert projected == config.collection_contract
+    assert projected["schema_version"] \
+        == "probeRCA-final-collection-contract-v4"
+    assert all(
+        "dns" not in role["protocols"]
+        for role in projected["normal_metric_roles"]
+    )
+    assert all(
+        role["root_category"] != "DNS"
+        for role in projected["burst_channel_roles"]
+    )
+
+
+def test_v4_contract_rejects_dns_burst_channel(tmp_path):
     config = _config()
     contract = dict(config.collection_contract)
-    contract["dns_aggregation_policy_id"] = "unconfigured"
-    contract["dns_aggregation_policy_fingerprint"] = "0" * 64
-    contract["aggregation_config_fingerprint"] = fingerprint({
-        "output_source": contract["aggregation_output_source"],
-        "roles": contract["normal_metric_roles"],
-        "dns_aggregation_policy_id": "unconfigured",
-        "dns_aggregation_policy_fingerprint": "0" * 64,
+    contract["burst_channel_roles"] = [
+        *contract["burst_channel_roles"],
+        {
+            "channel_id": "dns.timeout_rate",
+            "root_category": "DNS",
+            "entity_types": ["edge"],
+        },
+    ]
+    contract["burst_config_fingerprint"] = fingerprint({
+        "roles": contract["burst_channel_roles"],
+        "semantics": contract["burst_evidence_semantics"],
     })
     metadata = _collection_metadata(config)
-    metadata["aggregation_config_fingerprint"] = contract[
-        "aggregation_config_fingerprint"
+    metadata["burst_config_fingerprint"] = contract[
+        "burst_config_fingerprint"
     ]
-    with pytest.raises(CollectionArchiveError, match="must be frozen"):
+
+    with pytest.raises(CollectionArchiveError, match="root category"):
         CollectionArchiveWriter(
-            tmp_path / "unconfigured-dns-policy",
-            dataset_id=fingerprint({"dataset": "unconfigured-dns-policy"}),
+            tmp_path / "formal-dns-burst",
+            dataset_id=fingerprint({"dataset": "formal-dns-burst"}),
             collection_contract=contract,
             source_description=contract["source_description"],
             collection_metadata=metadata,
@@ -1566,3 +1636,425 @@ def test_unknown_wrong_target_and_overlapping_burst_sources_fail_closed(tmp_path
         overlap_writer.append(_window(sequence))
     with pytest.raises(CollectionArchiveError, match="overlap across collected windows"):
         overlap_writer.append(_window(12, evidence=(overlap,)))
+
+
+def _dns_edge_records(sequence: int) -> tuple[EdgeMetricRecord, ...]:
+    timestamp_ns = (sequence - 1) * _NS
+    values = {
+        "dns_query_count": (20.0, 20),
+        "dns_latency_p95": (5000.0, 20),
+        "dns_failure_rate": (1.0, 20),
+    }
+    specs = {
+        spec.metric_name: spec for spec in experimental_dns_metric_roles()
+    }
+    return tuple(
+        EdgeMetricRecord(
+            schema_version="1.0",
+            timestamp_ns=timestamp_ns,
+            window_sec=1,
+            cluster_id="cluster",
+            namespace="ns",
+            src_service="payment",
+            dst_service="kube-dns",
+            src_pod_uid=None,
+            dst_pod_uid=None,
+            src_node="node-a",
+            dst_node="node-a",
+            protocol="dns",
+            metric_name=name,
+            value=value,
+            unit=specs[name].unit,
+            sample_count=sample_count,
+            coverage=1.0,
+            event_loss_rate=0.0,
+            source="final_window_aggregation",
+            metric_kind=specs[name].metric_kind,
+            scope="service_pair",
+            histogram_upper_bound=None,
+            histogram_is_inf_bucket=False,
+            histogram_is_cumulative=None,
+            quantile=specs[name].quantile,
+        )
+        for name, (value, sample_count) in sorted(values.items())
+    )
+
+
+def _legacy_dns_topology() -> TopologySnapshot:
+    call = TopologyEdge(
+        src_service="payment",
+        dst_service="kube-dns",
+        relation_type="call",
+        src_namespace="ns",
+        dst_namespace="ns",
+        protocol="dns",
+        directed=True,
+    )
+    base = _topology()
+    services = ["ns::payment", "ns::kube-dns"]
+    placements = [
+        *base.service_nodes,
+        ServiceNodePlacement(
+            namespace="ns",
+            service_name="kube-dns",
+            node_name="node-a",
+            pod_uid=None,
+        ),
+    ]
+    return replace(
+        base,
+        services=services,
+        call_edges=[call],
+        service_nodes=placements,
+        structure_fingerprint=fingerprint({
+            "cluster": base.cluster_id,
+            "services": services,
+            "calls": [call.to_dict()],
+            "hosts": [item.to_dict() for item in base.host_edges],
+            "bindings": [
+                item.to_dict() for item in base.service_resources
+            ],
+        }),
+    )
+
+
+def _legacy_dns_node_records(
+    sequence: int,
+) -> tuple[NodeMetricRecord, ...]:
+    records = _node_records(sequence)
+    service_records = tuple(
+        replace(record, service_name="kube-dns")
+        for record in records
+        if record.scope == "service"
+    )
+    return (*records, *service_records)
+
+
+def test_formal_scope_and_contract_are_dns_free_9_4_3():
+    payload = yaml.safe_load(
+        Path("configs/final_control.yaml").read_text(encoding="utf-8")
+    )
+    config = FinalControlConfig.from_dict(payload)
+    contract = config.collection_contract
+    roles = contract["normal_metric_roles"]
+
+    assert len(config.calibration_required_root_coordinates) == 106
+    assert not any(
+        "::dns::" in coordinate
+        for coordinate in config.calibration_required_root_coordinates
+    )
+    assert "DNS" not in config.group_penalties
+    assert sum(role["entity_type"] == "service" for role in roles) == 9
+    assert sum(role["entity_type"] == "host" for role in roles) == 4
+    edge_roles = [
+        role for role in roles if role["entity_type"] == "edge"
+    ]
+    assert len(edge_roles) == 3
+    assert {tuple(role["protocols"]) for role in edge_roles} == {("tcp",)}
+    assert {role["metric_name"] for role in edge_roles} == {
+        "edge_request_count", "edge_latency_p95", "edge_failure_rate",
+    }
+    assert all(
+        role["root_category"] != "DNS"
+        for role in contract["burst_channel_roles"]
+    )
+
+
+def test_formal_fault_matrix_keeps_tcp_and_excludes_dns():
+    from scripts.run_final_fault_matrix import experiment_specs
+
+    specs = experiment_specs()
+    assert any(item["fault_type"] == "tcp_edge" for item in specs)
+    assert all(item["fault_type"] != "dns_edge" for item in specs)
+    assert all(item["root_category"] != "DNS" for item in specs)
+
+
+def test_dns_anomaly_is_marked_excluded_and_cannot_alert():
+    config = FinalControlConfig()
+    resolver = MetricResolver(config)
+    baseline = RobustBaselineStore(config)
+    dns_edge = "cluster::ns::payment->kube-dns::dns"
+    window = SimpleNamespace(
+        node_metrics=(), edge_metrics=_dns_edge_records(1),
+    )
+
+    observations, raw = resolver.normalize_window(window, baseline)
+
+    assert observations == {}
+    assert raw == {}
+    assert set(resolver.last_validity) == {
+        f"{dns_edge}::dns_query_count",
+        f"{dns_edge}::dns_latency_p95",
+        f"{dns_edge}::dns_failure_rate",
+    }
+    assert {
+        item["exclusion_reason"]
+        for item in resolver.last_validity.values()
+    } == {"excluded_from_formal_rca"}
+    graph = allowed_service_graph(_legacy_dns_topology())
+    assert graph.physical_edges == ()
+    control = FinalControlPlane(config)
+    service_scores, edge_scores = control._scores(observations, graph)
+    assert service_scores == {}
+    assert edge_scores == {}
+    soft, hard = control._advance_alert_counters(
+        service_scores, edge_scores,
+    )
+    assert soft == set()
+    assert hard == set()
+
+
+def test_formal_candidate_graph_keeps_tcp_and_discards_dns_edges():
+    caller = "cluster::ns::caller"
+    callee = "cluster::ns::callee"
+    tcp_edge = "cluster::ns::caller->callee::tcp"
+    calls = [
+        TopologyEdge(
+            "caller", "callee", "call", "ns", "ns",
+            protocol=protocol, directed=True,
+        )
+        for protocol in ("tcp", "dns")
+    ]
+    snapshot = TopologySnapshot(
+        schema_version="1.0",
+        snapshot_id="snapshot",
+        valid_from_ns=0,
+        valid_to_ns=_NS,
+        cluster_id="cluster",
+        services=["ns::caller", "ns::callee"],
+        call_edges=calls,
+        host_edges=[],
+        resource_edges=[],
+        service_nodes=[
+            ServiceNodePlacement(
+                namespace="ns",
+                service_name=service,
+                node_name="node-a",
+                pod_uid=None,
+            )
+            for service in ("caller", "callee")
+        ],
+        structure_fingerprint=fingerprint({
+            "cluster": "cluster",
+            "services": ["ns::caller", "ns::callee"],
+            "calls": [item.to_dict() for item in calls],
+            "hosts": [],
+            "bindings": [],
+        }),
+    )
+    graph = allowed_service_graph(snapshot)
+
+    candidate = build_candidate_graph(
+        graph=graph,
+        service_strengths={(caller, callee): 1.0},
+        seed_services={caller, callee},
+        seed_edges={tcp_edge},
+        config=FinalControlConfig(),
+    )
+
+    assert {item[3] for item in graph.physical_edges} == {"tcp"}
+    assert candidate.seed_edges == (tcp_edge,)
+    assert candidate.edges == (tcp_edge,)
+
+
+def test_tcp_edge_still_triggers_soft_and_hard_independently():
+    control = FinalControlPlane(FinalControlConfig())
+    tcp_edge = "cluster::ns::caller->callee::tcp"
+
+    for _ in range(2):
+        soft, hard = control._advance_alert_counters(
+            {}, {tcp_edge: 3.5},
+        )
+        assert ("edge", tcp_edge) not in soft
+        assert ("edge", tcp_edge) not in hard
+    soft, hard = control._advance_alert_counters({}, {tcp_edge: 3.5})
+    assert ("edge", tcp_edge) in soft
+    assert ("edge", tcp_edge) not in hard
+
+    control = FinalControlPlane(FinalControlConfig())
+    soft, hard = control._advance_alert_counters({}, {tcp_edge: 6.0})
+    assert ("edge", tcp_edge) not in hard
+    soft, hard = control._advance_alert_counters({}, {tcp_edge: 6.0})
+    assert ("edge", tcp_edge) in hard
+
+
+def test_tcp_edge_runs_av_residual_burst_penalty_and_fista():
+    config = FinalControlConfig(
+        l1_penalty=0.01,
+        fista_tolerance=1.0e-10,
+    )
+    control = FinalControlPlane(config)
+    tcp_edge = "cluster::ns::caller->callee::tcp"
+    count_id = f"{tcp_edge}::edge_request_count"
+    latency_id = f"{tcp_edge}::edge_latency_p95"
+    count_metric = MetricNode(
+        node_id=count_id,
+        entity_id=tcp_edge,
+        entity_type="edge",
+        metric_name="edge_request_count",
+        role="edge_count",
+        root_category=None,
+        root_eligible=False,
+    )
+    latency_metric = MetricNode(
+        node_id=latency_id,
+        entity_id=tcp_edge,
+        entity_type="edge",
+        metric_name="edge_latency_p95",
+        role="edge_latency",
+        root_category="TCP",
+        root_eligible=True,
+    )
+    ready = MetricTargetReadiness(
+        target_metric=latency_id,
+        root_eligible=True,
+        allowed_feature_count=1,
+        valid_training_rows=20,
+        minimum_training_rows=4,
+        effective_rank=1,
+        raw_design_rank_ratio=1.0,
+        condition_number=1.0,
+        regularized_gram_condition_number=1.0,
+        ready=True,
+        not_ready_reason=None,
+    )
+    model = MetricPropagationModel(
+        node_ids=(count_id, latency_id),
+        lags=(1,),
+        coefficients={(latency_id, count_id, 1): 0.5},
+        semantic_mask=((latency_id, count_id),),
+        training_rows=20,
+        healthy_cutoff_ns=4 * _NS,
+        target_readiness={latency_id: ready},
+    )
+    candidate = CandidateEntityGraph(
+        seed_services=(),
+        seed_edges=(tcp_edge,),
+        services=("cluster::ns::caller", "cluster::ns::callee"),
+        hosts=(),
+        edges=(tcp_edge,),
+        strong_service_relations=(),
+        topology_snapshot_id="snapshot",
+    )
+    observation = NormalizedObservation(
+        metric=latency_metric,
+        signed_z=6.0,
+        anomaly=6.0,
+        quality=1.0,
+        source_record_id="source:" + "1" * 64,
+        baseline_center=0.0,
+        baseline_scale=1.0,
+        scale_source="mad",
+    )
+    evidence_sources = ["source:" + "2" * 64]
+    evidence = EvidenceObservationRecord(
+        schema_version="1.0",
+        evidence_id=fingerprint({"evidence": "tcp-rtt"}),
+        timestamp_ns=5 * _NS + _NS // 2,
+        evidence_window_start_ns=5 * _NS,
+        evidence_window_end_ns=6 * _NS,
+        analysis_cutoff_ns=6 * _NS,
+        cluster_id="cluster",
+        namespace="ns",
+        target_type="shock",
+        target_id=tcp_edge,
+        channel_id="tcp.rtt_p95",
+        source_type="burst_event",
+        normalized_strength=0.8,
+        observation_quality=1.0,
+        reliability_weight=1.0,
+        source_record_ids=evidence_sources,
+        source_object_ids=[],
+        independent_from_residual=True,
+        provenance={
+            "calibration_id": fingerprint({"calibration": "tcp"}),
+            "collector_build_fingerprint": _BUILD_FINGERPRINT,
+            "source_set_fingerprint": fingerprint(evidence_sources),
+        },
+        config_fingerprint=config.collection_contract[
+            "burst_config_fingerprint"
+        ],
+    )
+    control._soft = SimpleNamespace(
+        metric_model=model,
+        metrics={count_id: count_metric, latency_id: latency_metric},
+        candidate_graph=candidate,
+        seed_services=set(),
+        seed_edges={tcp_edge},
+    )
+    control._hard = SimpleNamespace(
+        sequence=5,
+        timestamp_ns=5 * _NS,
+        analysis_cutoff_ns=6 * _NS,
+        observations={latency_id: observation},
+    )
+    control._signed_history = {4: {count_id: 2.0}}
+    control._evidence = [evidence]
+    control._dataset_fingerprint = fingerprint({"dataset": "tcp-path"})
+
+    result = control._diagnose()
+
+    assert len(result.candidates) == 1
+    candidate_score = result.candidates[0]
+    assert candidate_score.entity_id == tcp_edge
+    assert candidate_score.root_category == "TCP"
+    assert candidate_score.signed_residuals[latency_id] \
+        == pytest.approx(5.0)
+    assert candidate_score.burst_evidence_strength == pytest.approx(0.8)
+    assert candidate_score.effective_group_penalty == pytest.approx(
+        candidate_score.base_group_penalty
+        / (1.0 + config.burst_eta * 0.8)
+    )
+    assert candidate_score.score > 0.0
+    assert all(item.root_category != "DNS" for item in result.candidates)
+
+
+def test_legacy_dns_archive_is_readable_but_dns_is_excluded(tmp_path):
+    config = _config()
+    legacy_contract = _legacy_v3_dns_contract(config)
+    metadata = {
+        "collector_build_fingerprint": _BUILD_FINGERPRINT,
+        "aggregation_config_fingerprint": legacy_contract[
+            "aggregation_config_fingerprint"
+        ],
+        "burst_config_fingerprint": legacy_contract[
+            "burst_config_fingerprint"
+        ],
+    }
+    writer = CollectionArchiveWriter(
+        tmp_path / "legacy-dns-archive",
+        dataset_id=fingerprint({"dataset": "legacy-dns-archive"}),
+        collection_contract=legacy_contract,
+        source_description=legacy_contract["source_description"],
+        collection_metadata=metadata,
+    )
+    topology = _legacy_dns_topology()
+    for sequence in range(1, 13):
+        writer.append(CollectedWindow.create(
+            sequence=sequence,
+            window_start_ns=(sequence - 1) * _NS,
+            window_end_ns=sequence * _NS,
+            node_metrics=_legacy_dns_node_records(sequence),
+            edge_metrics=_dns_edge_records(sequence),
+            topology_events=(topology,) if sequence == 1 else (),
+            burst_evidence=(),
+            residual_source_record_ids=_residual_source_ids(sequence),
+            collection_metadata=metadata,
+        ))
+    archive = CollectionArchive.load(writer.seal().root)
+    control = FinalControlPlane(config)
+
+    run = control.run(archive)
+
+    assert archive.collection_contract_fingerprint \
+        != config.collection_contract_fingerprint
+    assert run.collection_contract_fingerprint \
+        == archive.collection_contract_fingerprint
+    assert run.calibration_readiness["ready"] is True
+    assert run.calibration_readiness["Av_required_count"] \
+        == len(_required_root_coordinates())
+    assert {
+        item["exclusion_reason"]
+        for node_id, item in control.resolver.last_validity.items()
+        if "::dns::" in node_id
+    } == {"excluded_from_formal_rca"}

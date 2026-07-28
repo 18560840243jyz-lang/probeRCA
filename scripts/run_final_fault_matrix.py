@@ -895,13 +895,6 @@ def experiment_specs() -> list[dict[str, Any]]:
             "activate": tcp_edge,
             "probe": True,
         },
-        {
-            "fault_type": "dns_edge",
-            "root_scope": "edge",
-            "root_category": "DNS",
-            "activate": dns_edge,
-            "probe": True,
-        },
     ]
 
 

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from types import SimpleNamespace
 
 import pytest
 import yaml
 
-from proberca.dataplane.archive import CollectionArchiveWriter
+from proberca.dataplane.archive import CollectionArchive, CollectionArchiveWriter
 from proberca.dataplane.burst_collection import (
     BURST_CHANNEL_MODES,
     BurstChannelCalibration,
@@ -41,6 +42,39 @@ START = 1_000_000_000
 END = 2_000_000_000
 CLUSTER = "cluster-a"
 NAMESPACE = "shop"
+
+FORMAL_SERVICE_METRICS = frozenset({
+    "request_rate",
+    "request_failure_rate",
+    "request_latency_p95",
+    "cpu_usage_rate",
+    "cpu_throttle_ratio",
+    "memory_working_set_ratio",
+    "io_psi",
+    "futex_wait_time_rate",
+    "local_socket_failure_rate",
+})
+FORMAL_HOST_METRICS = frozenset({
+    "cpu_psi",
+    "memory_psi",
+    "io_psi",
+    "nic_drop_error_rate",
+})
+FORMAL_TCP_METRICS = frozenset({
+    "edge_request_count",
+    "edge_latency_p95",
+    "edge_failure_rate",
+})
+EXPERIMENTAL_DNS_COMPONENTS = frozenset({
+    "dns_query_total",
+    "dns_success_total",
+    "dns_timeout_total",
+    "dns_servfail_total",
+    "dns_refused_total",
+    "dns_nxdomain_failure_total",
+    "dns_transport_error_total",
+    "dns_success_latency_histogram",
+})
 
 
 def _counter(
@@ -238,7 +272,7 @@ def _edge_samples(
     )
 
 
-def _raw_window():
+def _raw_window(*, include_dns=True):
     samples = []
     _service_samples(
         samples, "frontend", "node-a", series="frontend-series"
@@ -249,7 +283,8 @@ def _raw_window():
     _host_samples(samples, "node-a")
     _host_samples(samples, "node-b")
     _edge_samples(samples, "tcp")
-    _edge_samples(samples, "dns")
+    if include_dns:
+        _edge_samples(samples, "dns")
     return RawCollectionWindow.create(
         sequence=1,
         window_start_ns=START,
@@ -510,7 +545,27 @@ def test_counter_reset_missing_component_and_wrong_unit_fail_closed(contract):
 
 
 def test_collector_builds_versioned_topology_and_seals(contract, tmp_path):
-    raw = _raw_window()
+    assert contract["schema_version"] == "probeRCA-final-collection-contract-v4"
+    roles = contract["normal_metric_roles"]
+    assert {
+        role["metric_name"] for role in roles
+        if role["entity_type"] == "service"
+    } == FORMAL_SERVICE_METRICS
+    assert {
+        role["metric_name"] for role in roles
+        if role["entity_type"] == "host"
+    } == FORMAL_HOST_METRICS
+    assert {
+        role["metric_name"] for role in roles
+        if role["entity_type"] == "edge"
+    } == FORMAL_TCP_METRICS
+    assert all(
+        role["protocols"] == ["tcp"]
+        for role in roles
+        if role["entity_type"] == "edge"
+    )
+
+    raw = _raw_window(include_dns=False)
     collector = FinalDataPlaneCollector(
         collection_contract=contract,
         collector_build_id=fingerprint({"build": "test"}),
@@ -522,12 +577,38 @@ def test_collector_builds_versioned_topology_and_seals(contract, tmp_path):
     )
     snapshot = window.topology_events[0]
     assert len(snapshot.services) == 2
-    assert {item.protocol for item in snapshot.call_edges} == {"tcp", "dns"}
+    assert {item.protocol for item in snapshot.call_edges} == {"tcp"}
     assert len(snapshot.service_nodes) == 2
+    assert snapshot.valid_from_ns == START
+    assert snapshot.valid_to_ns == END
+    expected_topology_fingerprint = fingerprint({
+        "cluster": CLUSTER,
+        "services": list(snapshot.services),
+        "calls": [item.to_dict() for item in snapshot.call_edges],
+        "hosts": [item.to_dict() for item in snapshot.host_edges],
+        "bindings": [item.to_dict() for item in snapshot.service_resources],
+    })
+    assert snapshot.structure_fingerprint == expected_topology_fingerprint
+    assert snapshot.snapshot_id == fingerprint({
+        "structure_fingerprint": expected_topology_fingerprint,
+        "runtime_identity_fingerprints": list(
+            snapshot.runtime_identity_fingerprints
+        ),
+        "window_start_ns": START,
+        "window_end_ns": END,
+    })
+    assert snapshot.snapshot_id != snapshot.structure_fingerprint
+    assert {
+        item.metric_name for item in window.edge_metrics
+    } == FORMAL_TCP_METRICS
+    assert {item.protocol for item in window.edge_metrics} == {"tcp"}
+
     metadata = window.collection_metadata
+    dataset_id = fingerprint({"dataset": "healthy"})
+    archive_root = tmp_path / "archive"
     writer = CollectionArchiveWriter(
-        tmp_path / "archive",
-        dataset_id=fingerprint({"dataset": "healthy"}),
+        archive_root,
+        dataset_id=dataset_id,
         collection_contract=contract,
         source_description=contract["source_description"],
         collection_metadata=metadata,
@@ -535,7 +616,18 @@ def test_collector_builds_versioned_topology_and_seals(contract, tmp_path):
     writer.append(window)
     archive = writer.seal()
     assert archive.window_count == 1
-    assert len(tuple(archive.iter_windows())) == 1
+    assert archive.dataset_id == dataset_id
+    assert archive.windows_sha256 == hashlib.sha256(
+        (archive.root / archive.windows_file).read_bytes()
+    ).hexdigest()
+
+    reloaded = CollectionArchive.load(archive_root)
+    assert reloaded.dataset_id == dataset_id
+    assert reloaded.windows_sha256 == archive.windows_sha256
+    assert reloaded.manifest_fingerprint == archive.manifest_fingerprint
+    assert tuple(
+        item.to_dict() for item in reloaded.iter_windows()
+    ) == (window.to_dict(),)
 
 
 def test_global_resource_watermark_change_does_not_fake_layout_change(
@@ -794,12 +886,39 @@ def test_example_live_source_config_is_complete():
         "configs/final_live_collector.example.yaml", encoding="utf-8"
     ) as handle:
         config = FinalLiveCollectorConfig.from_dict(yaml.safe_load(handle))
-    assert len(config.prometheus.queries) == len({
+    actual_components = {
         query.component for query in config.prometheus.queries
-    })
-    assert {query.component for query in config.prometheus.queries} == set(
-        COMPONENTS
-    )
+    }
+    assert len(config.prometheus.queries) == len(actual_components)
+    assert EXPERIMENTAL_DNS_COMPONENTS <= set(COMPONENTS)
+    formal_expected = set(COMPONENTS) - EXPERIMENTAL_DNS_COMPONENTS
+    assert actual_components == formal_expected
+    assert actual_components.isdisjoint(EXPERIMENTAL_DNS_COMPONENTS)
+    assert {
+        "edge_request_total",
+        "edge_error_total",
+        "edge_timeout_total",
+        "edge_latency_histogram",
+    } <= actual_components
+
+    with open(
+        "configs/final_collection_contract.yaml", encoding="utf-8"
+    ) as handle:
+        contract = yaml.safe_load(handle)
+    roles = contract["normal_metric_roles"]
+    assert {
+        role["metric_name"] for role in roles
+        if role["entity_type"] == "service"
+    } == FORMAL_SERVICE_METRICS
+    assert {
+        role["metric_name"] for role in roles
+        if role["entity_type"] == "host"
+    } == FORMAL_HOST_METRICS
+    assert {
+        role["metric_name"] for role in roles
+        if role["entity_type"] == "edge"
+        and role["protocols"] == ["tcp"]
+    } == FORMAL_TCP_METRICS
 
 
 def test_prometheus_source_preserves_raw_boundary_series_identity():

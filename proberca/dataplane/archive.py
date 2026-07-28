@@ -58,6 +58,7 @@ _CONTRACT_V2_FIELDS = frozenset({
 _CONTRACT_V3_FIELDS = _CONTRACT_V2_FIELDS | frozenset({
     "dns_aggregation_policy_id", "dns_aggregation_policy_fingerprint",
 })
+_CONTRACT_V4_FIELDS = _CONTRACT_V2_FIELDS
 _BURST_ROLE_FIELDS = frozenset({
     "channel_id", "root_category", "entity_types",
 })
@@ -91,6 +92,8 @@ def _validate_collection_contract(contract: dict[str, Any]) -> None:
         expected_fields = _CONTRACT_V2_FIELDS
     elif schema_version == "probeRCA-final-collection-contract-v3":
         expected_fields = _CONTRACT_V3_FIELDS
+    elif schema_version == "probeRCA-final-collection-contract-v4":
+        expected_fields = _CONTRACT_V4_FIELDS
     else:
         raise CollectionArchiveError("unsupported collection contract schema")
     if set(contract) != expected_fields:
@@ -188,9 +191,12 @@ def _validate_collection_contract(contract: dict[str, Any]) -> None:
     for role in burst_roles:
         if not isinstance(role, dict) or set(role) != _BURST_ROLE_FIELDS:
             raise CollectionArchiveError("Burst channel role fields mismatch")
-        if role["root_category"] not in {
-            "CPU", "Memory", "IO", "Lock", "LocalNet", "NIC", "TCP", "DNS",
-        }:
+        allowed_categories = {
+            "CPU", "Memory", "IO", "Lock", "LocalNet", "NIC", "TCP",
+        }
+        if schema_version != "probeRCA-final-collection-contract-v4":
+            allowed_categories.add("DNS")
+        if role["root_category"] not in allowed_categories:
             raise CollectionArchiveError("Burst channel root category is invalid")
         entity_types = role["entity_types"]
         if not isinstance(entity_types, list) or not entity_types \
@@ -440,7 +446,7 @@ def _topology_endpoint(snapshot, explicit_namespace: str | None, service: str) -
 
 
 def _validate_topology_snapshot_coverage(
-    window: CollectedWindow, snapshot,
+    window: CollectedWindow, snapshot, contract: dict[str, Any],
 ) -> None:
     expected_services = {
         f"{snapshot.cluster_id}::{item}" for item in snapshot.services
@@ -456,15 +462,24 @@ def _validate_topology_snapshot_coverage(
         for item in snapshot.service_nodes
     }
     expected_edges = set()
+    formal_edge_protocols = {
+        protocol
+        for role in contract["normal_metric_roles"]
+        if role["entity_type"] == "edge"
+        for protocol in role["protocols"]
+    }
     for edge in snapshot.call_edges:
         if edge.relation_type != "call":
+            continue
+        protocol = edge.protocol or "tcp"
+        if protocol not in formal_edge_protocols:
             continue
         source = _topology_endpoint(snapshot, edge.src_namespace, edge.src_service)
         _topology_endpoint(snapshot, edge.dst_namespace, edge.dst_service)
         namespace = edge.src_namespace or source.split("::", 2)[1]
         expected_edges.add(
             f"{snapshot.cluster_id}::{namespace}::"
-            f"{edge.src_service}->{edge.dst_service}::{edge.protocol or 'tcp'}"
+            f"{edge.src_service}->{edge.dst_service}::{protocol}"
         )
     observed_services = {
         f"{item.cluster_id}::{item.namespace}::{item.service_name}"
@@ -478,6 +493,7 @@ def _validate_topology_snapshot_coverage(
         f"{item.cluster_id}::{item.namespace}::"
         f"{item.src_service}->{item.dst_service}::{item.protocol}"
         for item in window.edge_metrics
+        if item.protocol in formal_edge_protocols
     }
     for name, expected, observed in (
         ("service", expected_services, observed_services),
@@ -605,11 +621,12 @@ def _validate_topology_versions(snapshots: list) -> None:
 
 def _validate_topology_coverage(
     window: CollectedWindow, snapshots: list,
+    contract: dict[str, Any],
 ) -> None:
     tracker = _TopologyVersionTracker()
     additions = tracker.prepare(snapshots)
     snapshot = tracker.active_for(window, additions)
-    _validate_topology_snapshot_coverage(window, snapshot)
+    _validate_topology_snapshot_coverage(window, snapshot, contract)
 
 
 @dataclass(frozen=True)
@@ -733,7 +750,7 @@ class CollectionArchive:
                     window, additions,
                 )
                 _validate_topology_snapshot_coverage(
-                    window, active_topology,
+                    window, active_topology, self.collection_contract,
                 )
                 topology_tracker.commit(additions)
                 current_normal = {
@@ -814,7 +831,9 @@ class CollectionArchiveWriter:
         active_topology = self._topology_tracker.active_for(
             window, topology_additions,
         )
-        _validate_topology_snapshot_coverage(window, active_topology)
+        _validate_topology_snapshot_coverage(
+            window, active_topology, self.collection_contract,
+        )
         current_normal = {
             *window.residual_source_record_ids,
         }

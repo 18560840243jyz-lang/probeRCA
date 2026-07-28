@@ -6,7 +6,10 @@ from collections import defaultdict
 
 from proberca.data.schema import EvidenceObservationRecord
 
-from .config import default_burst_channel_roles
+from .config import (
+    EXPERIMENTAL_DNS_BURST_CHANNEL_IDS,
+    default_burst_channel_roles,
+)
 from .model import MetricNode
 
 
@@ -27,6 +30,8 @@ def aggregate_burst_evidence(
     strengths: dict[tuple[str, str], dict[str, float]] = defaultdict(dict)
     identifiers: dict[tuple[str, str], set[str]] = defaultdict(set)
     for item in evidence:
+        if item.channel_id in EXPERIMENTAL_DNS_BURST_CHANNEL_IDS:
+            continue
         if item.source_type != "burst_event" or not item.independent_from_residual:
             raise ValueError("Burst evidence independence is not established")
         channel_role = channel_roles.get(item.channel_id)
