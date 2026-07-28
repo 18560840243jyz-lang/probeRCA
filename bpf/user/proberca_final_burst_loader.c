@@ -28,6 +28,7 @@ struct options {
     const char *output_path;
     const char *sampling_profile;
     uint64_t timeout_ms;
+    bool dns_only;
 };
 
 struct writer_context {
@@ -72,6 +73,7 @@ static int parse_options(
         OPT_OUTPUT,
         OPT_TIMEOUT_MS,
         OPT_SAMPLING_PROFILE,
+        OPT_DNS_ONLY,
     };
     static const struct option long_options[] = {
         {"object", required_argument, NULL, OPT_OBJECT},
@@ -79,6 +81,7 @@ static int parse_options(
         {"output", required_argument, NULL, OPT_OUTPUT},
         {"timeout-ms", required_argument, NULL, OPT_TIMEOUT_MS},
         {"sampling-profile", required_argument, NULL, OPT_SAMPLING_PROFILE},
+        {"dns-only", no_argument, NULL, OPT_DNS_ONLY},
         {NULL, 0, NULL, 0},
     };
     int option;
@@ -110,6 +113,9 @@ static int parse_options(
                 strcmp(optarg, "full") != 0)
                 return -EINVAL;
             options->sampling_profile = optarg;
+            break;
+        case OPT_DNS_ONLY:
+            options->dns_only = true;
             break;
         default:
             return -EINVAL;
@@ -185,6 +191,8 @@ static int attach_programs(
         const char *section;
         int error;
 
+        if (bpf_program__fd(program) < 0)
+            continue;
         if (*link_count >= MAX_LINKS)
             return -E2BIG;
         section = bpf_program__section_name(program);
@@ -196,6 +204,26 @@ static int attach_programs(
         if (error)
             return error;
         links[(*link_count)++] = link;
+    }
+    return 0;
+}
+
+static int configure_program_scope(
+    struct bpf_object *object, bool dns_only)
+{
+    struct bpf_program *program;
+
+    if (!dns_only)
+        return 0;
+    bpf_object__for_each_program(program, object) {
+        const char *name = bpf_program__name(program);
+
+        if (name &&
+            (strcmp(name, "final_burst_dns_egress") == 0 ||
+             strcmp(name, "final_burst_dns_ingress") == 0))
+            continue;
+        if (bpf_program__set_autoload(program, false) != 0)
+            return -EINVAL;
     }
     return 0;
 }
@@ -369,6 +397,10 @@ static int run(const struct options *options)
         fprintf(stderr, "cannot open final Burst BPF object\n");
         goto cleanup;
     }
+    if (configure_program_scope(object, options->dns_only) != 0) {
+        fprintf(stderr, "cannot configure final Burst program scope\n");
+        goto cleanup;
+    }
     if (bpf_object__load(object) != 0) {
         fprintf(stderr, "cannot load final Burst BPF object\n");
         goto cleanup;
@@ -409,12 +441,13 @@ static int run(const struct options *options)
             "{\"record_type\":\"control\",\"schema_version\":%u,"
             "\"state\":\"ready\",\"timestamp_ns\":%llu,"
             "\"program_count\":%zu,\"timeout_ms\":%llu,"
-            "\"sampling_profile\":\"%s\"}\n",
+            "\"sampling_profile\":\"%s\",\"dns_only\":%s}\n",
             PROBERCA_BURST_SCHEMA_VERSION,
             (unsigned long long)clock_ns(CLOCK_REALTIME),
             link_count,
             (unsigned long long)options->timeout_ms,
-            options->sampling_profile) < 0)
+            options->sampling_profile,
+            options->dns_only ? "true" : "false") < 0)
         goto cleanup;
     fflush(writer.output);
     next_checkpoint_ns = clock_ns(CLOCK_MONOTONIC);
@@ -470,7 +503,7 @@ int main(int argc, char **argv)
         fprintf(
             stderr,
             "usage: %s --object PATH [--cgroup PATH] --output PATH "
-            "[--timeout-ms N] [--sampling-profile low|full]\n",
+            "[--timeout-ms N] [--sampling-profile low|full] [--dns-only]\n",
             argv[0]);
         return 2;
     }
