@@ -6,6 +6,9 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from scripts.install_final_dataplane import (
+    _service_matches_contract,
+)
 from proberca.dataplane.primitive_exporter import (
     FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION,
     FinalPrimitiveExporter,
@@ -991,7 +994,7 @@ def test_healthy_probe_cadence_is_explicit_and_reproducible():
         "probe_profiles", "deployments",
     }
     assert configuration["schema_version"] \
-        == "proberca-healthy-probe-cadence-v1"
+        == "proberca-healthy-probe-cadence-v2"
     assert configuration["namespace"] == "online-boutique"
     assert configuration["readiness_period_seconds"] == 1
     assert configuration["probe_profiles"] == {
@@ -1003,21 +1006,12 @@ def test_healthy_probe_cadence_is_explicit_and_reproducible():
             "readiness_failure_threshold": 3,
             "readiness_timeout_seconds": 1,
         },
-        "python_grace": {
-            "liveness_initial_delay_seconds": 30,
-            "liveness_failure_threshold": 5,
-            "liveness_timeout_seconds": 2,
-            "readiness_initial_delay_seconds": 10,
-            "readiness_failure_threshold": 10,
-            "readiness_timeout_seconds": 2,
-        },
     }
     expected = {
         "adservice": ("server", 15, "default"),
         "cartservice": ("server", 10, "default"),
         "checkoutservice": ("server", 10, "default"),
         "currencyservice": ("server", 10, "default"),
-        "emailservice": ("server", 5, "python_grace"),
         "frontend": ("server", 10, "default"),
         "paymentservice": ("server", 10, "default"),
         "productcatalogservice": ("server", 10, "default"),
@@ -1032,7 +1026,64 @@ def test_healthy_probe_cadence_is_explicit_and_reproducible():
             profile["probe_profile"],
         )
         for name, profile in configuration["deployments"].items()
+        if name != "emailservice"
     } == expected
+    emailservice = configuration["deployments"]["emailservice"]
+    assert emailservice["service_contract"] == {
+        "name": "emailservice",
+        "port": 5000,
+        "targetPort": 8080,
+    }
+    rendered = emailservice["strategic_merge_patch"]
+    container = rendered["spec"]["template"]["spec"]["containers"][0]
+    assert container["name"] == "server"
+    expected_probes = {
+        "startupProbe": {
+            "$patch": "replace",
+            "grpc": {"port": 8080},
+            "periodSeconds": 2,
+            "timeoutSeconds": 3,
+            "failureThreshold": 30,
+        },
+        "readinessProbe": {
+            "$patch": "replace",
+            "grpc": {"port": 8080},
+            "periodSeconds": 5,
+            "timeoutSeconds": 3,
+            "failureThreshold": 3,
+            "successThreshold": 1,
+        },
+        "livenessProbe": {
+            "$patch": "replace",
+            "grpc": {"port": 8080},
+            "periodSeconds": 10,
+            "timeoutSeconds": 3,
+            "failureThreshold": 3,
+        },
+    }
+    assert {
+        name: container[name] for name in expected_probes
+    } == expected_probes
+    for probe_name in (
+        "startupProbe", "readinessProbe", "livenessProbe",
+    ):
+        assert container[probe_name]["grpc"]["port"] == 8080
+        assert container[probe_name]["$patch"] == "replace"
+        assert "initialDelaySeconds" not in container[probe_name]
+    assert _service_matches_contract(
+        {
+            "metadata": {"name": "emailservice"},
+            "spec": {
+                "ports": [{
+                    "name": "grpc",
+                    "port": 5000,
+                    "targetPort": 8080,
+                    "protocol": "TCP",
+                }],
+            },
+        },
+        emailservice["service_contract"],
+    )
     installer = Path(
         "scripts/install_final_dataplane.py"
     ).read_text(encoding="utf-8")

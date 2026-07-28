@@ -115,6 +115,22 @@ def _install_prometheus_job(repository: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _service_matches_contract(
+    service: dict[str, Any],
+    contract: dict[str, Any],
+) -> bool:
+    return (
+        service.get("metadata", {}).get("name") == contract["name"]
+        and any(
+            isinstance(port, dict)
+            and port.get("port") == contract["port"]
+            and port.get("targetPort") == contract["targetPort"]
+            and port.get("protocol", "TCP") == "TCP"
+            for port in service.get("spec", {}).get("ports", [])
+        )
+    )
+
+
 def _configure_healthy_probe_cadence(repository: Path) -> None:
     path = (
         repository
@@ -127,7 +143,7 @@ def _configure_healthy_probe_cadence(repository: Path) -> None:
     }:
         raise SystemExit("healthy probe cadence fields are not frozen")
     if configuration["schema_version"] \
-            != "proberca-healthy-probe-cadence-v1":
+            != "proberca-healthy-probe-cadence-v2":
         raise SystemExit("healthy probe cadence schema is unsupported")
     namespace = configuration["namespace"]
     readiness_period_seconds = configuration[
@@ -168,22 +184,43 @@ def _configure_healthy_probe_cadence(repository: Path) -> None:
         or not isinstance(deployments, dict)
         or not deployments
         or any(
-            not isinstance(name, str)
-            or not name
-            or not isinstance(profile, dict)
-            or set(profile) != {
-                "container", "liveness_period_seconds", "probe_profile",
-            }
-            or not isinstance(profile["container"], str)
-            or not profile["container"]
-            or isinstance(profile["liveness_period_seconds"], bool)
-            or not isinstance(
-                profile["liveness_period_seconds"], int
+            name != "emailservice"
+            and (
+                not isinstance(name, str)
+                or not name
+                or not isinstance(profile, dict)
+                or set(profile) != {
+                    "container", "liveness_period_seconds",
+                    "probe_profile",
+                }
+                or not isinstance(profile["container"], str)
+                or not profile["container"]
+                or isinstance(profile["liveness_period_seconds"], bool)
+                or not isinstance(
+                    profile["liveness_period_seconds"], int
+                )
+                or profile["liveness_period_seconds"] <= 1
+                or not isinstance(profile["probe_profile"], str)
+                or profile["probe_profile"] not in probe_profiles
             )
-            or profile["liveness_period_seconds"] <= 1
-            or not isinstance(profile["probe_profile"], str)
-            or profile["probe_profile"] not in probe_profiles
             for name, profile in deployments.items()
+        )
+        or not isinstance(deployments.get("emailservice"), dict)
+        or set(deployments["emailservice"]) != {
+            "service_contract", "strategic_merge_patch",
+        }
+        or not isinstance(
+            deployments["emailservice"]["service_contract"], dict
+        )
+        or set(
+            deployments["emailservice"]["service_contract"]
+        ) != {"name", "port", "targetPort"}
+        or deployments["emailservice"][
+            "service_contract"
+        ]["name"] != "emailservice"
+        or not isinstance(
+            deployments["emailservice"]["strategic_merge_patch"],
+            dict,
         )
     ):
         raise SystemExit("healthy probe cadence configuration is invalid")
@@ -194,6 +231,34 @@ def _configure_healthy_probe_cadence(repository: Path) -> None:
         "-n", namespace,
     ]
     for deployment, profile in sorted(deployments.items()):
+        if deployment == "emailservice":
+            contract = profile["service_contract"]
+            service_result = _run(
+                [
+                    *base,
+                    "get", f"service/{contract['name']}",
+                    "-o", "json",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            service = json.loads(service_result.stdout)
+            if not _service_matches_contract(service, contract):
+                raise SystemExit(
+                    "emailservice Service does not match "
+                    "the frozen port contract"
+                )
+            _run([
+                *base,
+                "patch", "deployment/emailservice",
+                "--type", "strategic",
+                "--patch", json.dumps(
+                    profile["strategic_merge_patch"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ])
+            continue
         container_name = profile["container"]
         liveness_period_seconds = profile[
             "liveness_period_seconds"

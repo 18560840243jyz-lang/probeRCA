@@ -1,4 +1,4 @@
-schema_version: proberca-healthy-probe-cadence-v1
+schema_version: proberca-healthy-probe-cadence-v2
 namespace: online-boutique
 readiness_period_seconds: 1
 probe_profiles:
@@ -9,13 +9,6 @@ probe_profiles:
     readiness_initial_delay_seconds: 0
     readiness_failure_threshold: 3
     readiness_timeout_seconds: 1
-  python_grace:
-    liveness_initial_delay_seconds: 30
-    liveness_failure_threshold: 5
-    liveness_timeout_seconds: 2
-    readiness_initial_delay_seconds: 10
-    readiness_failure_threshold: 10
-    readiness_timeout_seconds: 2
 deployments:
   adservice:
     container: server
@@ -34,9 +27,41 @@ deployments:
     liveness_period_seconds: 10
     probe_profile: default
   emailservice:
-    container: server
-    liveness_period_seconds: 5
-    probe_profile: python_grace
+    service_contract:
+      name: emailservice
+      port: 5000
+      targetPort: 8080
+    strategic_merge_patch:
+      spec:
+        template:
+          metadata:
+            annotations:
+              proberca.io/healthy-probe-cadence: exact-emailservice-grpc-v1
+          spec:
+            containers:
+              - name: server
+                startupProbe:
+                  $patch: replace
+                  grpc:
+                    port: 8080
+                  periodSeconds: 2
+                  timeoutSeconds: 3
+                  failureThreshold: 30
+                readinessProbe:
+                  $patch: replace
+                  grpc:
+                    port: 8080
+                  periodSeconds: 5
+                  timeoutSeconds: 3
+                  failureThreshold: 3
+                  successThreshold: 1
+                livenessProbe:
+                  $patch: replace
+                  grpc:
+                    port: 8080
+                  periodSeconds: 10
+                  timeoutSeconds: 3
+                  failureThreshold: 3
   frontend:
     container: server
     liveness_period_seconds: 10
