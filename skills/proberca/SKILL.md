@@ -1,6 +1,6 @@
 ---
 name: proberca
-description: Enforce the final frozen ProbeRCA-BPF two-plane online RCA scheme: service-only As, healthy masked Av, Burst penalty guidance, and one non-negative Sparse-Group FISTA solve.
+description: "Enforce the final frozen ProbeRCA-BPF two-plane online RCA scheme: service-only As, healthy masked Av, DNS transaction attribution, Burst penalty guidance, and one non-negative Sparse-Group FISTA solve."
 ---
 
 # Final ProbeRCA-BPF Scheme
@@ -2245,3 +2245,100 @@ reason: <逐坐标真实原因>
 ```
 
 此时不得静默跳过(A_v)，不得运行FISTA，也不得输出伪根因。
+
+二十八、DNS逻辑事务和聚合前归属契约
+
+本节补充步骤3.4中DNS三指标在工程实现前必须满足的语义。它不增加新的
+RCA坐标，不改变服务级(A_s)、指标级(A_v)或FISTA。
+
+聚合前必须先形成逻辑DNS事务。每条事务至少保留：
+
+```text
+source_service
+source_pod_uid
+source_container
+source_container_role
+source_cgroup_id
+resolver_identity
+qname_class
+qname_hash
+qtype
+protocol
+first_query_time
+final_response_time
+rcode
+final_outcome
+retry_count
+tcp_fallback
+quality
+lineage
+```
+
+诊断模式可以封存完整qname；正式常态归档默认保存规范化qname的SHA-256和
+冻结的qname_class。不得把故障标签、预期根因或注入配置编码进分类规则。
+
+DNS事务关联键必须区分：
+
+```text
+cgroup/netns
+source/destination IP and port
+UDP/TCP
+transaction ID
+qname
+qtype
+resolver
+```
+
+pending事务必须跨越1秒窗口保存。窗口结束不能清空pending；达到冻结的
+事务超时TTL后才关闭为TIMEOUT。相同逻辑事务的UDP重发只增加retry_count；
+UDP截断后的TCP fallback必须与原事务合并，不能成为第二个失败。
+
+最终结果只允许：
+
+```text
+SUCCESS
+SERVFAIL
+REFUSED
+NXDOMAIN
+TIMEOUT
+TRANSPORT_ERROR
+```
+
+正式三指标仍然是：
+
+```text
+dns_query_count
+dns_latency_p95
+dns_failure_rate
+```
+
+其中：
+
+- dns_query_count只统计纳入冻结策略的已关闭逻辑事务，不统计发送包数；
+- dns_latency_p95只使用final_outcome=SUCCESS的
+  `final_response_time-first_query_time`；
+- timeout上限、SERVFAIL、REFUSED和最终失败重试链不得进入延迟直方图；
+- dns_failure_rate的默认失败集合为SERVFAIL、REFUSED、TIMEOUT和
+  TRANSPORT_ERROR；
+- NXDOMAIN是否计失败由实验前冻结的qname_class策略决定。
+
+容器身份必须在Pod到Service聚合之前解析。主业务容器、DNS sidecar、
+service-mesh sidecar和诊断容器不能自动合并。数据面保留容器级事务，
+控制面只消费预先冻结策略允许进入正式服务DNS边的聚合结果。sidecar成功量
+不能稀释主业务容器失败，也不能替代主业务容器的基线覆盖。
+
+冻结策略至少保存：
+
+```text
+included/separate/record-only container roles
+qname classification rules
+NXDOMAIN policy
+timeout TTL
+qname storage policy
+policy fingerprint
+```
+
+常态阶段对控制面仍只输出窗口级三个指标；规范化逻辑事务在单机实验数据面
+本地封存用于审计和Replay，不作为额外RCA变量。无法确定容器角色、qname
+分类、TCP fallback或事务最终结果时必须失败关闭，并使相应DNS坐标Not
+Ready，不能用补零、全局Service合并或临时过滤绕过。

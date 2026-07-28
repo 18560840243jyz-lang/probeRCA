@@ -173,3 +173,38 @@ The integrated pipeline now emits `05b_structured_propagation/` with structured 
 The final ProbeRCA-BPF path must collect and seal all input windows before the RCA control algorithm consumes them. `proberca/dataplane` must not import or execute control-plane code, and `proberca/controlplane` must not invoke collectors or mutate a sealed archive. The legacy mixed `ProbeRCAEngine` path remains only for frozen historical regression compatibility and is not the canonical final-scheme entrypoint.
 
 Final normal metrics are service-level, node-level, or directed service-pair aggregates exactly as declared in `configs/final_collection_contract.yaml`; incomplete entity metric sets fail closed. Ground-truth, target configuration, injection paths, and expected-root fields are forbidden across the boundary. Burst evidence is collected after Hard in a distinct following window, is required to be independent from residual metrics, and may only reduce the matching `(entity, root category)` group penalty. The final path does not subtract Burst evidence from residuals, add a direct evidence ranking term, introduce a composite relation-strength variable, or perform counterfactual repeat solves.
+
+## Final DNS Attribution and Aggregation Decision
+
+DNS attribution is resolved before Pod-to-Service aggregation. The frozen
+single-VM policy is `configs/final_dns_aggregation_policy.yaml`; its ID and
+SHA-256 are part of collection-contract v3 and the aggregation fingerprint.
+Existing collection-contract v2 archives remain readable for Replay, but new
+v3 archives reject an unconfigured or all-zero DNS policy.
+
+The formal DNS edge still exposes exactly three metrics:
+
+- `dns_query_count` counts closed logical transactions admitted by policy;
+- `dns_latency_p95` merges successful-transaction histograms only;
+- `dns_failure_rate` uses the frozen terminal failure counters.
+
+Application, DNS-sidecar, and diagnostic containers remain separate. Metadata
+probes and other `record_only` qname classes are retained in policy audit
+output but do not enter the formal business DNS edge. Unknown roles, qname
+classes, outcomes, incomplete transaction identity, and inconsistent terminal
+counter partitions fail closed.
+
+The current normal BPF implementation handles UDP pending state across
+one-second windows, qname/qtype identity, retries, terminal outcomes, and
+successful-only latency. Two engineering items remain explicit readiness
+blockers rather than silent approximations:
+
+1. a locally sealed per-logical-transaction normal ledger is not yet wired
+   into the final collection archive; the formal map path retains cumulative
+   per-qname counters and audit series;
+2. UDP truncation followed by TCP fallback is detected but not yet reassembled,
+   so any observed `TC=1` makes the DNS snapshot Not Ready.
+
+Healthy Pilot and fault injection must remain disabled until the required DNS
+scope has real application-container coverage and these blockers are either
+implemented or explicitly excluded by a newly reviewed scheme revision.

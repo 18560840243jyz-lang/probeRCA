@@ -294,18 +294,17 @@ cleanup:
 
 static int increment_timeout(
     int timeout_fd,
-    const struct proberca_final_dns_pending_key *pending)
+    const struct proberca_final_dns_pending_value *pending)
 {
-    struct proberca_final_dns_edge_key edge = {};
     uint64_t value = 0;
 
-    edge.cgroup_id = pending->cgroup_id;
-    edge.server_ipv4 = pending->server_ipv4;
-    if (bpf_map_lookup_elem(timeout_fd, &edge, &value) != 0 &&
+    if (bpf_map_lookup_elem(
+            timeout_fd, &pending->edge, &value) != 0 &&
         errno != ENOENT)
         return -errno;
     value++;
-    return bpf_map_update_elem(timeout_fd, &edge, &value, BPF_ANY);
+    return bpf_map_update_elem(
+        timeout_fd, &pending->edge, &value, BPF_ANY);
 }
 
 static int sweep_dns_timeouts(
@@ -313,8 +312,8 @@ static int sweep_dns_timeouts(
 {
     struct proberca_final_dns_pending_key key;
     struct proberca_final_dns_pending_key next;
+    struct proberca_final_dns_pending_value pending;
     bool have_key = false;
-    uint64_t started_ns;
     uint64_t now = monotonic_ns();
     int result;
 
@@ -330,10 +329,13 @@ static int sweep_dns_timeouts(
         }
         key = next;
         have_key = true;
-        if (bpf_map_lookup_elem(pending_fd, &key, &started_ns) != 0)
+        if (bpf_map_lookup_elem(pending_fd, &key, &pending) != 0)
             continue;
-        if (now >= started_ns && now - started_ns >= timeout_ns) {
-            result = increment_timeout(timeout_fd, &key);
+        if (
+            now >= pending.started_ns &&
+            now - pending.started_ns >= timeout_ns
+        ) {
+            result = increment_timeout(timeout_fd, &pending);
             if (result != 0)
                 return result;
             bpf_map_delete_elem(pending_fd, &key);
@@ -660,14 +662,28 @@ static int print_dns(
             return -errno;
         printf(
             "{\"record_type\":\"dns\",\"cgroup_id\":%llu,"
-            "\"server_ipv4\":\"%s\",\"query_total\":%llu,"
-            "\"timeout_total\":%llu,\"error_rcode_total\":%llu,"
-            "\"latency_buckets\":[",
+            "\"server_ipv4\":\"%s\",\"qname\":\"%s\","
+            "\"qname_hash\":\"%016llx\",\"qtype\":%u,"
+            "\"query_total\":%llu,\"success_total\":%llu,"
+            "\"servfail_total\":%llu,\"refused_total\":%llu,"
+            "\"nxdomain_total\":%llu,"
+            "\"transport_error_total\":%llu,"
+            "\"retry_total\":%llu,\"truncated_total\":%llu,"
+            "\"timeout_total\":%llu,\"success_latency_buckets\":[",
             (unsigned long long)key.cgroup_id,
             address,
+            key.qname,
+            (unsigned long long)key.qname_hash,
+            ntohs(key.qtype),
             (unsigned long long)value.query_total,
-            (unsigned long long)timeout_total,
-            (unsigned long long)value.error_rcode_total);
+            (unsigned long long)value.success_total,
+            (unsigned long long)value.servfail_total,
+            (unsigned long long)value.refused_total,
+            (unsigned long long)value.nxdomain_total,
+            (unsigned long long)value.transport_error_total,
+            (unsigned long long)value.retry_total,
+            (unsigned long long)value.truncated_total,
+            (unsigned long long)timeout_total);
         for (index = 0; index < PROBERCA_FINAL_DNS_BUCKETS; index++) {
             printf(
                 "%s%llu", index ? "," : "",

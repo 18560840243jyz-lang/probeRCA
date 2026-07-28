@@ -28,6 +28,8 @@ import yaml
 from kubernetes import client, config as kubernetes_config
 from kubernetes.utils.quantity import parse_quantity
 
+from .dns_policy import DnsAggregationPolicy
+from .dns_semantic_audit import classify_qname, qname_hash
 from .prometheus_text import (
     PrometheusSample,
     parse_prometheus_text,
@@ -37,7 +39,7 @@ from .raw import RawCollectionError
 
 
 FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION = (
-    "probeRCA-final-primitive-exporter-v3"
+    "probeRCA-final-primitive-exporter-v4"
 )
 DNS_BUCKETS_MS = (
     0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0,
@@ -112,6 +114,7 @@ class FinalPrimitiveExporterConfig:
     node_exporter_url: str
     bpf_loader_path: str
     bpf_map_directory: str
+    dns_aggregation_policy_path: str
     dns_timeout_ms: int
     listen_host: str
     listen_port: int
@@ -142,7 +145,8 @@ class FinalPrimitiveExporterConfig:
         for name in (
             "cluster_id", "kubeconfig_path", "kubernetes_context",
             "kind_node_container", "node_exporter_url",
-            "bpf_loader_path", "bpf_map_directory", "listen_host",
+            "bpf_loader_path", "bpf_map_directory",
+            "dns_aggregation_policy_path", "listen_host",
         ):
             _nonempty(name, getattr(self, name))
         if not self.node_exporter_url.startswith(("http://", "https://")):
@@ -433,6 +437,14 @@ class FinalPrimitiveExporter:
         self._cgroup_path_cache: tuple[
             tuple[str, ...], dict[str, Path]
         ] | None = None
+        policy_payload = yaml.safe_load(Path(
+            self.config.dns_aggregation_policy_path
+        ).read_text(encoding="utf-8"))
+        self.dns_policy = DnsAggregationPolicy.from_dict(policy_payload)
+        if self.dns_policy.timeout_ms != self.config.dns_timeout_ms:
+            raise RawCollectionError(
+                "DNS timeout and aggregation policy disagree"
+            )
         kubernetes_config.load_kube_config(
             config_file=self.config.kubeconfig_path,
             context=self.config.kubernetes_context,
@@ -1405,8 +1417,8 @@ class FinalPrimitiveExporter:
                 ))
         return tuple(output)
 
-    @staticmethod
     def _dns_samples(
+        self,
         inventory: Inventory,
         bpf: tuple[dict[str, Any], ...],
         cgroup_identity: dict[int, ContainerIdentity],
@@ -1426,53 +1438,151 @@ class FinalPrimitiveExporter:
                 "kube-system", "kube-dns",
             ):
                 continue
+            qname = record.get("qname")
+            qtype = record.get("qtype")
+            if not isinstance(qname, str) or not qname \
+                    or isinstance(qtype, bool) \
+                    or not isinstance(qtype, int) \
+                    or not 1 <= qtype <= 65535:
+                raise RawCollectionError(
+                    "BPF DNS transaction identity is incomplete"
+                )
+            role = self.dns_policy.role_rule(identity.container)
+            qname_class = classify_qname(
+                qname,
+                search_domains=(
+                    f"{identity.namespace}.svc.cluster.local.",
+                    "svc.cluster.local.",
+                    "cluster.local.",
+                    "localdomain.",
+                ),
+            )
+            qname_rule = self.dns_policy.qname_rule(qname_class)
+            formal_action = (
+                "include"
+                if role.formal_action == "include"
+                and qname_rule.formal_action == "include"
+                else (
+                    "separate"
+                    if role.formal_action == "separate"
+                    else "record_only"
+                )
+            )
             common = {
                 "namespace": identity.namespace,
                 "dst_namespace": destination_namespace,
                 "src_service": identity.service,
                 "dst_service": destination_service,
                 "protocol": "dns",
+                "src_container_role": role.role,
+                "qname_class": qname_class,
+                "qname_hash": qname_hash(qname),
+                "qtype": str(qtype),
+                "dns_policy": self.dns_policy.fingerprint,
                 "source_series": _series_hash(
                     "dns",
                     (
                         ("cgroup_id", str(record["cgroup_id"])),
                         ("server_ipv4", record["server_ipv4"]),
+                        ("qname_hash", qname_hash(qname)),
+                        ("qtype", str(qtype)),
+                        ("container_role", role.role),
                     ),
                 ),
             }
-            buckets = record.get("latency_buckets")
+            buckets = record.get("success_latency_buckets")
             if not isinstance(buckets, list) \
                     or len(buckets) != len(DNS_BUCKETS_MS):
                 raise RawCollectionError("BPF DNS histogram is invalid")
             raw_query_total = float(record["query_total"])
             timeout_total = float(record["timeout_total"])
-            response_total = float(buckets[-1])
-            raw_error_total = float(record["error_rcode_total"])
-            error_total = min(raw_error_total, response_total)
-            completed_total = response_total + timeout_total
+            success_total = float(record["success_total"])
+            servfail_total = float(record["servfail_total"])
+            refused_total = float(record["refused_total"])
+            nxdomain_total = float(record["nxdomain_total"])
+            transport_error_total = float(
+                record["transport_error_total"]
+            )
+            retry_total = float(record["retry_total"])
+            truncated_total = float(record["truncated_total"])
+            if truncated_total:
+                raise RawCollectionError(
+                    "DNS TCP fallback is not completely observed"
+                )
+            nxdomain_failure_total = (
+                nxdomain_total
+                if qname_rule.nxdomain_is_failure else 0.0
+            )
+            completed_total = (
+                success_total + servfail_total + refused_total
+                + nxdomain_total + transport_error_total
+                + timeout_total
+            )
             if (
                 min(
                     raw_query_total, timeout_total,
-                    response_total, raw_error_total,
+                    success_total, servfail_total, refused_total,
+                    nxdomain_total, transport_error_total,
+                    retry_total, truncated_total,
                 ) < 0
                 or
                 raw_query_total < completed_total
+                or float(buckets[-1]) != success_total
             ):
                 raise RawCollectionError(
                     "BPF DNS counters violate completion invariants"
                 )
+            audit_common = dict(common)
+            audit_common["formal_action"] = formal_action
+            for outcome, value in (
+                ("SUCCESS", success_total),
+                ("SERVFAIL", servfail_total),
+                ("REFUSED", refused_total),
+                ("NXDOMAIN", nxdomain_total),
+                ("TRANSPORT_ERROR", transport_error_total),
+                ("TIMEOUT", timeout_total),
+            ):
+                labels = dict(audit_common)
+                labels["final_outcome"] = outcome
+                output.append(PrometheusSample.create(
+                    "proberca_dns_policy_transaction_total",
+                    labels, value,
+                ))
+            labels = dict(audit_common)
+            labels["final_outcome"] = "RETRY"
+            output.append(PrometheusSample.create(
+                "proberca_dns_policy_retry_total", labels, retry_total
+            ))
+            if formal_action != "include":
+                continue
             output.extend((
                 PrometheusSample.create(
                     "proberca_dns_edge_query_total",
                     common, completed_total,
                 ),
                 PrometheusSample.create(
+                    "proberca_dns_edge_success_total",
+                    common, success_total,
+                ),
+                PrometheusSample.create(
                     "proberca_dns_edge_timeout_total",
                     common, timeout_total,
                 ),
                 PrometheusSample.create(
-                    "proberca_dns_edge_error_rcode_total",
-                    common, error_total,
+                    "proberca_dns_edge_servfail_total",
+                    common, servfail_total,
+                ),
+                PrometheusSample.create(
+                    "proberca_dns_edge_refused_total",
+                    common, refused_total,
+                ),
+                PrometheusSample.create(
+                    "proberca_dns_edge_nxdomain_failure_total",
+                    common, nxdomain_failure_total,
+                ),
+                PrometheusSample.create(
+                    "proberca_dns_edge_transport_error_total",
+                    common, transport_error_total,
                 ),
             ))
             for bound, value in zip(DNS_BUCKETS_MS, buckets):
@@ -1481,7 +1591,7 @@ class FinalPrimitiveExporter:
                     "+Inf" if bound is None else f"{bound:.17g}"
                 )
                 output.append(PrometheusSample.create(
-                    "proberca_dns_edge_latency_milliseconds_bucket",
+                    "proberca_dns_edge_success_latency_milliseconds_bucket",
                     labels, float(value),
                 ))
         return tuple(output)

@@ -45,7 +45,7 @@ dns_exposure_reason: >-
   Exercise the frozen frontend-to-kube-dns candidate edge with successful
   service-name lookups so its request_count and latency histogram have enough
   real observations; no delay, loss, failure, or fault actor is used.
-primitive_exporter_schema: probeRCA-final-primitive-exporter-v3
+primitive_exporter_schema: probeRCA-final-primitive-exporter-v4
 container_resource_source: direct_cgroup_v2
 beyla_retired_series_ttl: 30s
 scale_floor_provenance:

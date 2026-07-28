@@ -136,13 +136,25 @@ COMPONENTS: dict[str, ComponentSpec] = {
     "dns_query_total": ComponentSpec(
         "edge", "request", "monotonic_counter", "queries", "flow"
     ),
+    "dns_success_total": ComponentSpec(
+        "edge", "request", "monotonic_counter", "queries", "flow"
+    ),
     "dns_timeout_total": ComponentSpec(
         "edge", "request", "monotonic_counter", "queries", "flow"
     ),
-    "dns_error_rcode_total": ComponentSpec(
+    "dns_servfail_total": ComponentSpec(
         "edge", "request", "monotonic_counter", "queries", "flow"
     ),
-    "dns_latency_histogram": ComponentSpec(
+    "dns_refused_total": ComponentSpec(
+        "edge", "request", "monotonic_counter", "queries", "flow"
+    ),
+    "dns_nxdomain_failure_total": ComponentSpec(
+        "edge", "request", "monotonic_counter", "queries", "flow"
+    ),
+    "dns_transport_error_total": ComponentSpec(
+        "edge", "request", "monotonic_counter", "queries", "flow"
+    ),
+    "dns_success_latency_histogram": ComponentSpec(
         "edge", "request", "histogram_bucket", "milliseconds", "flow"
     ),
 }
@@ -821,20 +833,32 @@ class FinalWindowAggregator:
         protocol = entity_key[-1]
         if protocol == "dns":
             values = self._deltas(
-                window, samples, "dns_query_total", "dns_timeout_total",
-                "dns_error_rcode_total",
+                window, samples,
+                "dns_query_total", "dns_success_total",
+                "dns_timeout_total", "dns_servfail_total",
+                "dns_refused_total", "dns_nxdomain_failure_total",
+                "dns_transport_error_total",
             )
             self._series_sets_equal(
                 values,
-                ("dns_query_total", "dns_timeout_total", "dns_error_rcode_total"),
+                (
+                    "dns_query_total", "dns_success_total",
+                    "dns_timeout_total", "dns_servfail_total",
+                    "dns_refused_total", "dns_nxdomain_failure_total",
+                    "dns_transport_error_total",
+                ),
             )
             count = self._sum(values["dns_query_total"])
+            success = self._sum(values["dns_success_total"])
             bad = (
                 self._sum(values["dns_timeout_total"]),
-                self._sum(values["dns_error_rcode_total"]),
+                self._sum(values["dns_servfail_total"]),
+                self._sum(values["dns_refused_total"]),
+                self._sum(values["dns_nxdomain_failure_total"]),
+                self._sum(values["dns_transport_error_total"]),
             )
             latency = self._histogram_p95(
-                window, samples, "dns_latency_histogram",
+                window, samples, "dns_success_latency_histogram",
                 set(values["dns_query_total"]), allow_empty=True,
             )
             if count.value == 0:
@@ -844,12 +868,13 @@ class FinalWindowAggregator:
                         "inactive DNS edge has failure/latency observations"
                     )
             if (
-                latency.sample_count + bad[0].value
+                latency.sample_count != success.value
+                or success.value + sum(item.value for item in bad)
                 != count.value
             ):
                 raise RawCollectionError(
-                    "DNS response histogram plus timeouts does not "
-                    "match completed query_total"
+                    "DNS successful latency plus final failures does not "
+                    "match logical query_total"
                 )
             failure = self._ratio(
                 _combine(bad, sum(item.value for item in bad)),
@@ -913,5 +938,13 @@ class FinalWindowAggregator:
         )
         if {item.metric_name for item in records} != expected:
             raise AssertionError("edge final metric set is not 3")
-        sources, objects = self._sources(item[1] for item in outputs)
+        lineage_values = tuple(item[1] for item in outputs)
+        if protocol == "dns":
+            # dns_success_total is needed to prove that the successful-only
+            # latency histogram and all terminal outcomes partition the
+            # logical transaction count.  It is an invariant component rather
+            # than a fourth final metric, but it must still be consumed and
+            # retained in the output lineage.
+            lineage_values += (success,)
+        sources, objects = self._sources(lineage_values)
         return records, sources, objects

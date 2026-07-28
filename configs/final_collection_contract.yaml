@@ -1,4 +1,4 @@
-schema_version: probeRCA-final-collection-contract-v2
+schema_version: probeRCA-final-collection-contract-v3
 normal_metric_roles:
 - record_type: edge_metric
   metric_name: dns_failure_rate
@@ -15,7 +15,7 @@ normal_metric_roles:
   unit: ratio
   metric_kind: gauge
   aggregation: ratio_from_summed_components
-  aggregation_formula: sum_flow(delta(dns_timeout+dns_error_rcode))/(sum_flow(delta(dns_query_total))+epsilon)
+  aggregation_formula: sum_flow(delta(dns_servfail+dns_refused+dns_nxdomain_failure+dns_timeout+dns_transport_error))/(sum_flow(delta(dns_query_total))+epsilon)
   source_scope: flow
   quantile: null
 - record_type: edge_metric
@@ -33,7 +33,7 @@ normal_metric_roles:
   unit: milliseconds
   metric_kind: quantile
   aggregation: histogram_merge_quantile
-  aggregation_formula: q0.95(merge_flow(dns_latency_histogram))
+  aggregation_formula: q0.95(merge_flow(dns_success_latency_histogram))
   source_scope: flow
   quantile: 0.95
 - record_type: edge_metric
@@ -330,7 +330,9 @@ normal_metric_roles:
   source_scope: pod
   quantile: null
 aggregation_output_source: final_window_aggregation
-aggregation_config_fingerprint: 23b5ad4169df77d68aaeaca0e2eee08286a106527348a8d373fb55204075566c
+dns_aggregation_policy_id: single-vm-online-boutique-dns-v2
+dns_aggregation_policy_fingerprint: b068ed2299af9137870676707ca85c0dee97d878452b8af4b797460ba2cdc90f
+aggregation_config_fingerprint: 2563fbb85d7e508ff103d20a890979b318dc719e6de772716bb51dff71517f14
 source_description: final-window-aggregates-v1
 burst_evidence_source_type: burst_event
 burst_evidence_semantics: normalized_strength_times_quality

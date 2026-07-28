@@ -321,6 +321,10 @@ class FinalControlConfig:
     fista_tolerance: float = 1.0e-7
     top_k: int = 5
     strict_metric_contract: bool = True
+    dns_aggregation_policy_id: str = "single-vm-online-boutique-dns-v2"
+    dns_aggregation_policy_fingerprint: str = (
+        "b068ed2299af9137870676707ca85c0dee97d878452b8af4b797460ba2cdc90f"
+    )
     metric_roles: tuple[MetricRoleSpec, ...] = field(default_factory=default_metric_roles)
 
     def __post_init__(self) -> None:
@@ -372,6 +376,20 @@ class FinalControlConfig:
             raise ValueError("candidate threshold and burst eta must be finite and non-negative")
         if type(self.strict_metric_contract) is not bool:
             raise TypeError("strict_metric_contract must be boolean")
+        if not isinstance(self.dns_aggregation_policy_id, str) \
+                or not self.dns_aggregation_policy_id:
+            raise ValueError("DNS aggregation policy ID must be non-empty")
+        if (
+            not isinstance(self.dns_aggregation_policy_fingerprint, str)
+            or len(self.dns_aggregation_policy_fingerprint) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.dns_aggregation_policy_fingerprint
+            )
+        ):
+            raise ValueError(
+                "DNS aggregation policy fingerprint must be SHA-256"
+            )
         if set(self.baseline_family_min_scales) != SCALE_FAMILIES:
             raise ValueError(
                 "baseline family floors must cover every scale family"
@@ -470,15 +488,25 @@ class FinalControlConfig:
         aggregation_fingerprint = fingerprint({
             "output_source": FINAL_AGGREGATION_OUTPUT_SOURCE,
             "roles": roles,
+            "dns_aggregation_policy_id": (
+                self.dns_aggregation_policy_id
+            ),
+            "dns_aggregation_policy_fingerprint": (
+                self.dns_aggregation_policy_fingerprint
+            ),
         })
         burst_fingerprint = fingerprint({
             "roles": burst_roles,
             "semantics": "normalized_strength_times_quality",
         })
         return {
-            "schema_version": "probeRCA-final-collection-contract-v2",
+            "schema_version": "probeRCA-final-collection-contract-v3",
             "normal_metric_roles": roles,
             "aggregation_output_source": FINAL_AGGREGATION_OUTPUT_SOURCE,
+            "dns_aggregation_policy_id": self.dns_aggregation_policy_id,
+            "dns_aggregation_policy_fingerprint": (
+                self.dns_aggregation_policy_fingerprint
+            ),
             "aggregation_config_fingerprint": aggregation_fingerprint,
             "source_description": FINAL_SOURCE_DESCRIPTION,
             "burst_evidence_source_type": "burst_event",

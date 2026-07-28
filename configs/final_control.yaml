@@ -8,6 +8,8 @@ baseline_family_min_scales:
   ratio: 0.0005
 latency_min_samples: 5
 failure_min_requests: 5
+dns_aggregation_policy_id: single-vm-online-boutique-dns-v2
+dns_aggregation_policy_fingerprint: b068ed2299af9137870676707ca85c0dee97d878452b8af4b797460ba2cdc90f
 service_lags:
 - 1
 - 2
@@ -179,7 +181,7 @@ metric_roles:
   unit: ratio
   metric_kind: gauge
   aggregation: ratio_from_summed_components
-  aggregation_formula: sum_flow(delta(dns_timeout+dns_error_rcode))/(sum_flow(delta(dns_query_total))+epsilon)
+  aggregation_formula: sum_flow(delta(dns_servfail+dns_refused+dns_nxdomain_failure+dns_timeout+dns_transport_error))/(sum_flow(delta(dns_query_total))+epsilon)
   source_scope: flow
   quantile: null
 - record_type: edge_metric
@@ -197,7 +199,7 @@ metric_roles:
   unit: milliseconds
   metric_kind: quantile
   aggregation: histogram_merge_quantile
-  aggregation_formula: q0.95(merge_flow(dns_latency_histogram))
+  aggregation_formula: q0.95(merge_flow(dns_success_latency_histogram))
   source_scope: flow
   quantile: 0.95
 - record_type: edge_metric

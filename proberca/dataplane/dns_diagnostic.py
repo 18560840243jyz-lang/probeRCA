@@ -223,49 +223,57 @@ def build_transactions(packets: Iterable[PcapDnsPacket]) -> list[DnsTransaction]
             packet.timestamp_ns for packet in item[1]
         )
     ):
-        queries = sorted(
-            (packet for packet in values if not packet.qr_flag),
-            key=lambda item: item.timestamp_ns,
-        )
-        responses = sorted(
-            (packet for packet in values if packet.qr_flag),
-            key=lambda item: item.timestamp_ns,
-        )
-        if not queries:
-            continue
-        response = next(
+        current_queries: list[PcapDnsPacket] = []
+        for packet in sorted(values, key=lambda item: item.timestamp_ns):
+            if not packet.qr_flag:
+                current_queries.append(packet)
+                continue
+            if not current_queries:
+                continue
+            output.append(_transaction_from_packets(
+                key, current_queries, packet
+            ))
+            current_queries = []
+        if current_queries:
+            output.append(_transaction_from_packets(
+                key, current_queries, None
+            ))
+    return sorted(output, key=lambda item: item.first_query_ns)
+
+
+def _transaction_from_packets(
+    key: tuple[str, int, str, int, int, str, str, str],
+    queries: list[PcapDnsPacket],
+    response: PcapDnsPacket | None,
+) -> DnsTransaction:
+    latency_ns = (
+        response.timestamp_ns - queries[0].timestamp_ns
+        if response else None
+    )
+    return DnsTransaction(
+        transaction_id=key[4],
+        qname=key[5],
+        qtype=key[6],
+        protocol=key[7],
+        client_ip=key[0],
+        client_port=key[1],
+        server_ip=key[2],
+        first_query_ns=queries[0].timestamp_ns,
+        last_query_ns=queries[-1].timestamp_ns,
+        response_ns=response.timestamp_ns if response else None,
+        retry_count=max(0, len(queries) - 1),
+        rcode=response.rcode if response else None,
+        tc_flag=max(
             (
-                item for item in responses
-                if item.timestamp_ns >= queries[0].timestamp_ns
+                packet.tc_flag
+                for packet in queries + ([response] if response else [])
             ),
-            None,
-        )
-        latency_ns = (
-            response.timestamp_ns - queries[0].timestamp_ns
-            if response else None
-        )
-        output.append(DnsTransaction(
-            transaction_id=key[4],
-            qname=key[5],
-            qtype=key[6],
-            protocol=key[7],
-            client_ip=key[0],
-            client_port=key[1],
-            server_ip=key[2],
-            first_query_ns=queries[0].timestamp_ns,
-            last_query_ns=queries[-1].timestamp_ns,
-            response_ns=response.timestamp_ns if response else None,
-            retry_count=max(0, len(queries) - 1),
-            rcode=response.rcode if response else None,
-            tc_flag=max(
-                (packet.tc_flag for packet in values),
-                default=0,
-            ),
-            latency_ns=latency_ns,
-            matched=response is not None,
-            timeout_reason=None if response else "pcap_response_missing",
-        ))
-    return output
+            default=0,
+        ),
+        latency_ns=latency_ns,
+        matched=response is not None,
+        timeout_reason=None if response else "pcap_response_missing",
+    )
 
 
 def _event_ipv4(value: Any) -> str:

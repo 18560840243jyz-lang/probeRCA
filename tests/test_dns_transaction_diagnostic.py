@@ -75,6 +75,36 @@ def test_tcpdump_parser_preserves_retry_and_servfail(tmp_path: Path) -> None:
     assert transactions[0].latency_ns == 1_010_000_000
 
 
+def test_transaction_key_reuse_after_response_starts_new_transaction(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tcpdump.txt"
+    path.write_text(
+        """\
+10.000000 veth0 In IP (tos 0x0, proto UDP (17), length 70)
+    10.244.0.77.40000 > 10.96.0.10.53: 99+ A? metadata.google.internal. (42)
+10.010000 veth0 Out IP (tos 0x0, proto UDP (17), length 70)
+    10.96.0.10.53 > 10.244.0.77.40000: 99 ServFail- q: A? metadata.google.internal. 0/0/0 (42)
+11.000000 veth0 In IP (tos 0x0, proto UDP (17), length 70)
+    10.244.0.77.40000 > 10.96.0.10.53: 99+ A? metadata.google.internal. (42)
+11.020000 veth0 Out IP (tos 0x0, proto UDP (17), length 70)
+    10.96.0.10.53 > 10.244.0.77.40000: 99 ServFail- q: A? metadata.google.internal. 0/0/0 (42)
+""",
+        encoding="utf-8",
+    )
+    transactions = build_transactions(parse_tcpdump_text(
+        path,
+        pod_ip="10.244.0.77",
+        dns_cluster_ip="10.96.0.10",
+    ))
+    assert len(transactions) == 2
+    assert [item.latency_ns for item in transactions] == [
+        10_000_000,
+        20_000_000,
+    ]
+    assert all(item.retry_count == 0 for item in transactions)
+
+
 def test_ebpf_events_are_filtered_by_pod_and_enriched(tmp_path: Path) -> None:
     path = tmp_path / "ebpf.jsonl"
     records = (

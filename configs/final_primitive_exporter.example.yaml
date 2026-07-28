@@ -1,4 +1,4 @@
-schema_version: probeRCA-final-primitive-exporter-v3
+schema_version: probeRCA-final-primitive-exporter-v4
 cluster_id: kind-proberca-ob
 kubeconfig_path: /home/jyz/.kube/config
 kubernetes_context: kind-proberca-ob
@@ -23,6 +23,7 @@ beyla_port: 9400
 node_exporter_url: http://127.0.0.1:9100/metrics
 bpf_loader_path: /usr/local/lib/proberca-final/proberca-final-ebpf-loader
 bpf_map_directory: /sys/fs/bpf/proberca-final
+dns_aggregation_policy_path: /home/jyz/probeRCA/configs/final_dns_aggregation_policy.yaml
 dns_timeout_ms: 5000
 listen_host: 127.0.0.1
 listen_port: 9477

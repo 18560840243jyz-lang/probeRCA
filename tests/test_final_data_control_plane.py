@@ -530,7 +530,11 @@ def test_checked_in_contract_and_plane_imports_are_separate():
     contract = yaml.safe_load(
         Path("configs/final_collection_contract.yaml").read_text(encoding="utf-8")
     )
-    assert fingerprint(contract) == FinalControlConfig().collection_contract_fingerprint
+    checked_in_control = FinalControlConfig.from_dict(yaml.safe_load(
+        Path("configs/final_control.yaml").read_text(encoding="utf-8")
+    ))
+    assert fingerprint(contract) \
+        == checked_in_control.collection_contract_fingerprint
     control_payload = yaml.safe_load(
         Path("configs/final_control.yaml").read_text(encoding="utf-8")
     )
@@ -574,10 +578,15 @@ def test_separate_cli_phases(tmp_path, capsys):
         yaml.safe_dump(_collection_metadata(_config()), sort_keys=False),
         encoding="utf-8",
     )
+    contract_path = tmp_path / "collection-contract.yaml"
+    contract_path.write_text(
+        yaml.safe_dump(_config().collection_contract, sort_keys=False),
+        encoding="utf-8",
+    )
     archive_dir = tmp_path / "sealed"
     assert seal_main([
         "--windows-jsonl", str(input_path),
-        "--collection-contract", "configs/final_collection_contract.yaml",
+        "--collection-contract", str(contract_path),
         "--dataset-id", fingerprint({"dataset": "cli-two-phase"}),
         "--source-description", _config().collection_contract["source_description"],
         "--collection-metadata", str(metadata_path),
@@ -1158,7 +1167,74 @@ def test_metric_unit_kind_and_p95_aggregation_semantics_fail_closed(tmp_path):
     assert contract["aggregation_config_fingerprint"] == fingerprint({
         "output_source": contract["aggregation_output_source"],
         "roles": contract["normal_metric_roles"],
+        "dns_aggregation_policy_id": contract["dns_aggregation_policy_id"],
+        "dns_aggregation_policy_fingerprint": contract[
+            "dns_aggregation_policy_fingerprint"
+        ],
     })
+
+
+def test_v2_contract_remains_readable_for_existing_archives(tmp_path):
+    contract = dict(_config().collection_contract)
+    contract["schema_version"] = "probeRCA-final-collection-contract-v2"
+    contract.pop("dns_aggregation_policy_id")
+    contract.pop("dns_aggregation_policy_fingerprint")
+    contract["aggregation_config_fingerprint"] = fingerprint({
+        "output_source": contract["aggregation_output_source"],
+        "roles": contract["normal_metric_roles"],
+    })
+    metadata = _collection_metadata(_config())
+    metadata["aggregation_config_fingerprint"] = contract[
+        "aggregation_config_fingerprint"
+    ]
+    CollectionArchiveWriter(
+        tmp_path / "legacy-v2",
+        dataset_id=fingerprint({"dataset": "legacy-v2"}),
+        collection_contract=contract,
+        source_description=contract["source_description"],
+        collection_metadata=metadata,
+    )
+
+
+def test_v3_contract_fails_closed_when_dns_policy_identity_changes(tmp_path):
+    contract = dict(_config().collection_contract)
+    contract["dns_aggregation_policy_id"] = "silently-changed-policy"
+    with pytest.raises(
+        CollectionArchiveError,
+        match="aggregation configuration fingerprint mismatch",
+    ):
+        CollectionArchiveWriter(
+            tmp_path / "changed-dns-policy",
+            dataset_id=fingerprint({"dataset": "changed-dns-policy"}),
+            collection_contract=contract,
+            source_description=contract["source_description"],
+            collection_metadata=_collection_metadata(_config()),
+        )
+
+
+def test_v3_contract_rejects_unconfigured_dns_policy(tmp_path):
+    config = _config()
+    contract = dict(config.collection_contract)
+    contract["dns_aggregation_policy_id"] = "unconfigured"
+    contract["dns_aggregation_policy_fingerprint"] = "0" * 64
+    contract["aggregation_config_fingerprint"] = fingerprint({
+        "output_source": contract["aggregation_output_source"],
+        "roles": contract["normal_metric_roles"],
+        "dns_aggregation_policy_id": "unconfigured",
+        "dns_aggregation_policy_fingerprint": "0" * 64,
+    })
+    metadata = _collection_metadata(config)
+    metadata["aggregation_config_fingerprint"] = contract[
+        "aggregation_config_fingerprint"
+    ]
+    with pytest.raises(CollectionArchiveError, match="must be frozen"):
+        CollectionArchiveWriter(
+            tmp_path / "unconfigured-dns-policy",
+            dataset_id=fingerprint({"dataset": "unconfigured-dns-policy"}),
+            collection_contract=contract,
+            source_description=contract["source_description"],
+            collection_metadata=metadata,
+        )
 
 
 def test_topology_must_cover_the_entire_half_open_window(tmp_path):

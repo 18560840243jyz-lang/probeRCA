@@ -12,6 +12,7 @@ from proberca.dataplane.primitive_exporter import (
     FinalPrimitiveExporterConfig,
     _select_metric_lines,
 )
+from proberca.dataplane.dns_policy import DnsAggregationPolicy
 from proberca.dataplane.prometheus_text import (
     PrometheusSample,
     parse_prometheus_text,
@@ -100,6 +101,9 @@ def test_final_bpf_normal_path_is_map_aggregated_and_window_safe():
     bpf = Path(
         "bpf/final_normal/final_normal.bpf.c"
     ).read_text(encoding="utf-8")
+    header = Path(
+        "bpf/final_normal/final_normal.h"
+    ).read_text(encoding="utf-8")
     loader = Path(
         "bpf/user/proberca_final_loader.c"
     ).read_text(encoding="utf-8")
@@ -107,6 +111,13 @@ def test_final_bpf_normal_path_is_map_aggregated_and_window_safe():
     assert "BPF_MAP_TYPE_PERF_EVENT_ARRAY" not in bpf
     assert "futex_wait_ns_total" in bpf
     assert "dns_edge_counters" in bpf
+    assert "success_latency_buckets" in loader
+    assert "servfail_total" in bpf
+    assert "PROBERCA_FINAL_DNS_QNAME_MAX" in bpf
+    assert "record_dns_parse_failure" in bpf
+    assert "__be32 client_ipv4;" in header
+    assert "__be16 qtype;" in header
+    assert "__u64 qname_hash;" in header
     assert '"futex_starts"' in loader
     assert "collect_active_futex_waits" in loader
     assert "resolve_stable_futex_entries" in loader
@@ -181,26 +192,168 @@ def test_dns_query_counter_is_completed_responses_plus_timeouts():
         service_cluster_ips={"10.96.0.10": ("kube-system", "kube-dns")}
     )
     identity = SimpleNamespace(
-        namespace="online-boutique", service="frontend"
+        namespace="online-boutique", service="frontend",
+        container="server",
     )
     records = ({
         "record_type": "dns",
         "cgroup_id": 7,
         "server_ipv4": "10.96.0.10",
+        "qname": "paymentservice.online-boutique.svc.cluster.local.",
+        "qtype": 1,
         "query_total": 10,
+        "success_total": 5,
         "timeout_total": 2,
-        "error_rcode_total": 1,
-        "latency_buckets": [0] * 15 + [6],
+        "servfail_total": 1,
+        "refused_total": 0,
+        "nxdomain_total": 0,
+        "transport_error_total": 0,
+        "retry_total": 3,
+        "truncated_total": 0,
+        "success_latency_buckets": [0] * 15 + [5],
     },)
-    samples = FinalPrimitiveExporter._dns_samples(
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.dns_policy = DnsAggregationPolicy.from_dict(
+        yaml.safe_load(Path(
+            "configs/final_dns_aggregation_policy.yaml"
+        ).read_text(encoding="utf-8"))
+    )
+    samples = exporter._dns_samples(
         inventory, records, {7: identity}
     )
-    values = {item.name: item.value for item in samples}
+    values = {
+        item.name: item.value for item in samples
+        if item.name.startswith("proberca_dns_edge_")
+    }
     assert values["proberca_dns_edge_query_total"] == 8
+    assert values["proberca_dns_edge_success_total"] == 5
     assert values["proberca_dns_edge_timeout_total"] == 2
     assert values[
-        "proberca_dns_edge_latency_milliseconds_bucket"
-    ] == 6
+        "proberca_dns_edge_success_latency_milliseconds_bucket"
+    ] == 5
+
+
+def test_dns_tcp_fallback_fails_closed_until_stream_merge_exists():
+    inventory = SimpleNamespace(
+        service_cluster_ips={"10.96.0.10": ("kube-system", "kube-dns")}
+    )
+    identity = SimpleNamespace(
+        namespace="online-boutique", service="frontend",
+        container="server",
+    )
+    record = {
+        "record_type": "dns",
+        "cgroup_id": 7,
+        "server_ipv4": "10.96.0.10",
+        "qname": "paymentservice.online-boutique.svc.cluster.local.",
+        "qtype": 1,
+        "query_total": 1,
+        "success_total": 0,
+        "timeout_total": 0,
+        "servfail_total": 0,
+        "refused_total": 0,
+        "nxdomain_total": 0,
+        "transport_error_total": 0,
+        "retry_total": 0,
+        "truncated_total": 1,
+        "success_latency_buckets": [0] * 16,
+    }
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.dns_policy = DnsAggregationPolicy.from_dict(
+        yaml.safe_load(Path(
+            "configs/final_dns_aggregation_policy.yaml"
+        ).read_text(encoding="utf-8"))
+    )
+    with pytest.raises(
+        RawCollectionError,
+        match="TCP fallback is not completely observed",
+    ):
+        exporter._dns_samples(
+            inventory, (record,), {7: identity}
+        )
+
+
+def test_dns_sidecar_and_metadata_probe_are_audit_only():
+    inventory = SimpleNamespace(
+        service_cluster_ips={"10.96.0.10": ("kube-system", "kube-dns")}
+    )
+    records = (
+        {
+            "record_type": "dns",
+            "cgroup_id": 7,
+            "server_ipv4": "10.96.0.10",
+            "qname": "metadata.google.internal.",
+            "qtype": 1,
+            "query_total": 1,
+            "success_total": 0,
+            "timeout_total": 0,
+            "servfail_total": 1,
+            "refused_total": 0,
+            "nxdomain_total": 0,
+            "transport_error_total": 0,
+            "retry_total": 0,
+            "truncated_total": 0,
+            "success_latency_buckets": [0] * 16,
+        },
+        {
+            "record_type": "dns",
+            "cgroup_id": 8,
+            "server_ipv4": "10.96.0.10",
+            "qname": (
+                "paymentservice.online-boutique.svc.cluster.local."
+            ),
+            "qtype": 1,
+            "query_total": 1,
+            "success_total": 1,
+            "timeout_total": 0,
+            "servfail_total": 0,
+            "refused_total": 0,
+            "nxdomain_total": 0,
+            "transport_error_total": 0,
+            "retry_total": 0,
+            "truncated_total": 0,
+            "success_latency_buckets": [0] * 15 + [1],
+        },
+    )
+    identities = {
+        7: SimpleNamespace(
+            namespace="online-boutique", service="frontend",
+            container="server",
+        ),
+        8: SimpleNamespace(
+            namespace="online-boutique", service="frontend",
+            container="proberca-healthy-dns-exposure",
+        ),
+    }
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.dns_policy = DnsAggregationPolicy.from_dict(
+        yaml.safe_load(Path(
+            "configs/final_dns_aggregation_policy.yaml"
+        ).read_text(encoding="utf-8"))
+    )
+    samples = exporter._dns_samples(
+        inventory, records, identities
+    )
+    assert not any(
+        item.name.startswith("proberca_dns_edge_")
+        for item in samples
+    )
+    nonzero = {
+        (
+            item.label_dict["src_container_role"],
+            item.label_dict["qname_class"],
+            item.label_dict["formal_action"],
+            item.label_dict["final_outcome"],
+            item.value,
+        )
+        for item in samples
+        if item.name == "proberca_dns_policy_transaction_total"
+        and item.value
+    }
+    assert nonzero == {
+        ("application", "metadata_probe", "record_only", "SERVFAIL", 1),
+        ("dns-sidecar", "cluster_service", "separate", "SUCCESS", 1),
+    }
 
 
 def test_directed_edge_series_rebase_after_counter_reset():

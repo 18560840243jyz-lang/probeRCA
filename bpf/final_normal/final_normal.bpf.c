@@ -13,6 +13,14 @@
 #define EINTR 4
 #define IPPROTO_UDP_VALUE 17
 #define DNS_PORT 53
+#define DNS_RCODE_NOERROR 0
+#define DNS_RCODE_SERVFAIL 2
+#define DNS_RCODE_NXDOMAIN 3
+#define DNS_RCODE_REFUSED 5
+#define DNS_FLAG_QR 0x8000
+#define DNS_FLAG_TC 0x0200
+#define FNV1A_OFFSET 1469598103934665603ULL
+#define FNV1A_PRIME 1099511628211ULL
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -25,7 +33,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, PROBERCA_FINAL_MAX_DNS_PENDING);
     __type(key, struct proberca_final_dns_pending_key);
-    __type(value, __u64);
+    __type(value, struct proberca_final_dns_pending_value);
 } dns_pending SEC(".maps");
 
 struct {
@@ -41,6 +49,13 @@ struct {
     __type(key, struct proberca_final_dns_edge_key);
     __type(value, __u64);
 } dns_timeout_counters SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct proberca_final_dns_scratch);
+} dns_scratch SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -231,6 +246,67 @@ struct dns_header {
     __be16 additional_count;
 };
 
+static __always_inline int parse_dns_question(
+    struct __sk_buff *skb,
+    __u32 question_offset,
+    char qname[PROBERCA_FINAL_DNS_QNAME_MAX],
+    __u64 *qname_hash,
+    __be16 *qtype)
+{
+    __u64 hash = FNV1A_OFFSET;
+    __u32 output_index = 0;
+    __u32 consumed = 0;
+    __u8 label_remaining = 0;
+    bool ended = false;
+    int index;
+
+#pragma unroll
+    for (index = 0; index < PROBERCA_FINAL_DNS_QNAME_MAX; index++) {
+        __u8 byte = 0;
+
+        if (bpf_skb_load_bytes(
+                skb, question_offset + index, &byte, sizeof(byte)) < 0)
+            return -1;
+        consumed = index + 1;
+        if (!label_remaining) {
+            if (!byte) {
+                if (!output_index ||
+                    output_index >= PROBERCA_FINAL_DNS_QNAME_MAX - 1)
+                    return -1;
+                qname[output_index++] = '.';
+                hash = (hash ^ (__u8)'.') * FNV1A_PRIME;
+                qname[output_index] = '\0';
+                ended = true;
+                break;
+            }
+            if ((byte & 0xc0) || byte > 63)
+                return -1;
+            if (output_index) {
+                if (output_index >= PROBERCA_FINAL_DNS_QNAME_MAX - 1)
+                    return -1;
+                qname[output_index++] = '.';
+                hash = (hash ^ (__u8)'.') * FNV1A_PRIME;
+            }
+            label_remaining = byte;
+            continue;
+        }
+        if (output_index >= PROBERCA_FINAL_DNS_QNAME_MAX - 1)
+            return -1;
+        if (byte >= 'A' && byte <= 'Z')
+            byte += 'a' - 'A';
+        qname[output_index++] = byte;
+        hash = (hash ^ byte) * FNV1A_PRIME;
+        label_remaining--;
+    }
+    if (!ended || label_remaining)
+        return -1;
+    if (bpf_skb_load_bytes(
+            skb, question_offset + consumed, qtype, sizeof(*qtype)) < 0)
+        return -1;
+    *qname_hash = hash;
+    return 0;
+}
+
 static __always_inline void add_dns_latency(
     struct proberca_final_dns_edge_counters *counters, __u64 latency_ns)
 {
@@ -251,20 +327,45 @@ static __always_inline void add_dns_latency(
         &counters->latency_buckets[PROBERCA_FINAL_DNS_BUCKETS - 1], 1);
 }
 
+static __always_inline void record_dns_parse_failure(
+    struct proberca_final_dns_scratch *scratch)
+{
+    struct proberca_final_dns_edge_counters *counters;
+
+    /*
+     * Emit an intentionally invalid qname/qtype coordinate instead of
+     * silently dropping an unparseable transaction.  The userspace exporter
+     * rejects this record and keeps the DNS coordinate Not Ready.
+     */
+    scratch->pending.edge.cgroup_id =
+        scratch->pending_key.cgroup_id;
+    scratch->pending.edge.server_ipv4 =
+        scratch->pending_key.server_ipv4;
+    counters = get_dns_counters(&scratch->pending.edge);
+    if (counters) {
+        __sync_fetch_and_add(&counters->query_total, 1);
+        __sync_fetch_and_add(
+            &counters->transport_error_total, 1);
+    }
+}
+
 static __always_inline int inspect_dns(struct __sk_buff *skb, bool egress)
 {
     struct ipv4_header ip = {};
     struct udp_header udp = {};
     struct dns_header dns = {};
-    struct proberca_final_dns_pending_key pending_key = {};
-    struct proberca_final_dns_edge_key edge_key = {};
+    struct proberca_final_dns_scratch *scratch;
+    struct proberca_final_dns_pending_value *started;
     struct proberca_final_dns_edge_counters *counters;
-    __u64 *started_ns;
     __u64 now;
+    __u32 scratch_key = 0;
     __u32 ip_header_length;
+    __u32 question_offset;
     __u16 source_port;
     __u16 destination_port;
     __u16 flags;
+    __u16 rcode;
+    int update_result;
 
     if (bpf_skb_load_bytes(skb, 0, &ip, sizeof(ip)) < 0 ||
         (ip.version_ihl >> 4) != 4 ||
@@ -283,39 +384,95 @@ static __always_inline int inspect_dns(struct __sk_buff *skb, bool egress)
         return 1;
     flags = bpf_ntohs(dns.flags);
     now = bpf_ktime_get_ns();
-    pending_key.cgroup_id = bpf_skb_cgroup_id(skb);
-    if (!pending_key.cgroup_id)
+    scratch = bpf_map_lookup_elem(&dns_scratch, &scratch_key);
+    if (!scratch)
         return 1;
+    __builtin_memset(scratch, 0, sizeof(*scratch));
+    scratch->pending_key.cgroup_id = bpf_skb_cgroup_id(skb);
+    if (!scratch->pending_key.cgroup_id)
+        return 1;
+    question_offset = ip_header_length + sizeof(udp) + sizeof(dns);
 
-    if (egress && destination_port == DNS_PORT && !(flags & 0x8000)) {
-        pending_key.server_ipv4 = ip.destination;
-        pending_key.client_port = udp.source;
-        pending_key.transaction_id = dns.transaction_id;
-        edge_key.cgroup_id = pending_key.cgroup_id;
-        edge_key.server_ipv4 = pending_key.server_ipv4;
-        counters = get_dns_counters(&edge_key);
+    if (egress && destination_port == DNS_PORT && !(flags & DNS_FLAG_QR)) {
+        scratch->pending_key.client_ipv4 = ip.source;
+        scratch->pending_key.server_ipv4 = ip.destination;
+        scratch->pending_key.client_port = udp.source;
+        scratch->pending_key.transaction_id = dns.transaction_id;
+        if (parse_dns_question(
+                skb, question_offset, scratch->pending.edge.qname,
+                &scratch->pending_key.qname_hash,
+                &scratch->pending_key.qtype) != 0) {
+            record_dns_parse_failure(scratch);
+            return 1;
+        }
+        scratch->pending.edge.cgroup_id =
+            scratch->pending_key.cgroup_id;
+        scratch->pending.edge.server_ipv4 =
+            scratch->pending_key.server_ipv4;
+        scratch->pending.edge.qname_hash =
+            scratch->pending_key.qname_hash;
+        scratch->pending.edge.qtype = scratch->pending_key.qtype;
+        scratch->pending.started_ns = now;
+        update_result = bpf_map_update_elem(
+            &dns_pending, &scratch->pending_key,
+            &scratch->pending, BPF_NOEXIST);
+        if (update_result != 0) {
+            started = bpf_map_lookup_elem(
+                &dns_pending, &scratch->pending_key);
+            if (!started)
+                return 1;
+            __sync_fetch_and_add(&started->retry_count, 1);
+            counters = get_dns_counters(&started->edge);
+            if (counters)
+                __sync_fetch_and_add(&counters->retry_total, 1);
+            return 1;
+        }
+        counters = get_dns_counters(&scratch->pending.edge);
         if (counters)
             __sync_fetch_and_add(&counters->query_total, 1);
-        bpf_map_update_elem(&dns_pending, &pending_key, &now, BPF_ANY);
         return 1;
     }
-    if (!egress && source_port == DNS_PORT && (flags & 0x8000)) {
-        pending_key.server_ipv4 = ip.source;
-        pending_key.client_port = udp.destination;
-        pending_key.transaction_id = dns.transaction_id;
-        started_ns = bpf_map_lookup_elem(&dns_pending, &pending_key);
-        if (!started_ns)
+    if (!egress && source_port == DNS_PORT && (flags & DNS_FLAG_QR)) {
+        scratch->pending_key.client_ipv4 = ip.destination;
+        scratch->pending_key.server_ipv4 = ip.source;
+        scratch->pending_key.client_port = udp.destination;
+        scratch->pending_key.transaction_id = dns.transaction_id;
+        if (parse_dns_question(
+                skb, question_offset, scratch->pending.edge.qname,
+                &scratch->pending_key.qname_hash,
+                &scratch->pending_key.qtype) != 0) {
+            record_dns_parse_failure(scratch);
             return 1;
-        edge_key.cgroup_id = pending_key.cgroup_id;
-        edge_key.server_ipv4 = pending_key.server_ipv4;
-        counters = get_dns_counters(&edge_key);
-        if (counters) {
-            if ((flags & 0x000f) != 0)
-                __sync_fetch_and_add(&counters->error_rcode_total, 1);
-            if (now >= *started_ns)
-                add_dns_latency(counters, now - *started_ns);
         }
-        bpf_map_delete_elem(&dns_pending, &pending_key);
+        started = bpf_map_lookup_elem(
+            &dns_pending, &scratch->pending_key);
+        if (!started)
+            return 1;
+        counters = get_dns_counters(&started->edge);
+        if (counters) {
+            if (flags & DNS_FLAG_TC) {
+                __sync_fetch_and_add(&counters->truncated_total, 1);
+                return 1;
+            }
+            rcode = flags & 0x000f;
+            if (rcode == DNS_RCODE_NOERROR) {
+                __sync_fetch_and_add(&counters->success_total, 1);
+                if (now >= started->started_ns)
+                    add_dns_latency(
+                        counters, now - started->started_ns);
+            } else if (rcode == DNS_RCODE_SERVFAIL) {
+                __sync_fetch_and_add(&counters->servfail_total, 1);
+            } else if (rcode == DNS_RCODE_NXDOMAIN) {
+                __sync_fetch_and_add(&counters->nxdomain_total, 1);
+            } else if (rcode == DNS_RCODE_REFUSED) {
+                __sync_fetch_and_add(&counters->refused_total, 1);
+            } else {
+                __sync_fetch_and_add(
+                    &counters->transport_error_total, 1);
+            }
+        }
+        bpf_map_delete_elem(
+            &dns_pending, &scratch->pending_key);
     }
     return 1;
 }

@@ -1,0 +1,47 @@
+schema_version: probeRCA-dns-aggregation-policy-v1
+policy_id: single-vm-online-boutique-dns-v2
+timeout_ms: 5000
+formal_qname_storage: sha256
+diagnostic_full_qname: true
+
+# Container role is resolved before Pod -> Service aggregation. Unknown
+# containers fail closed and cannot silently enter a formal DNS edge.
+container_roles:
+  - role: application
+    exact_container_names:
+      - server
+      - redis
+    formal_action: include
+  - role: dns-sidecar
+    exact_container_names:
+      - proberca-healthy-dns-exposure
+    formal_action: separate
+  - role: diagnostic
+    exact_container_names:
+      - resolver
+    formal_action: separate
+  - role: dns-resolver
+    exact_container_names:
+      - coredns
+    formal_action: separate
+
+# Only controlled cluster service-discovery names enter the first single-VM
+# formal scope. Metadata probes, search expansions, reverse lookups, and
+# unclassified external names remain in the sealed transaction layer but do
+# not alter the three formal DNS edge metrics.
+qname_classes:
+  - qname_class: cluster_service
+    formal_action: include
+    nxdomain_is_failure: true
+  - qname_class: metadata_probe
+    formal_action: record_only
+    nxdomain_is_failure: false
+  - qname_class: search_expansion
+    formal_action: record_only
+    nxdomain_is_failure: false
+  - qname_class: reverse_lookup
+    formal_action: record_only
+    nxdomain_is_failure: false
+  - qname_class: external_or_special
+    formal_action: record_only
+    nxdomain_is_failure: false

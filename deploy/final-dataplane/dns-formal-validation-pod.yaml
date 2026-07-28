@@ -1,0 +1,84 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: proberca-dns-formal-validation
+  labels:
+    proberca.io/purpose: dns-formal-validation
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: proberca-dns-formal-validation
+  namespace: proberca-dns-formal-validation
+  labels:
+    app: proberca-dns-formal-validation
+    proberca.io/purpose: dns-formal-validation
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: server
+      image: us-central1-docker.pkg.dev/google-samples/microservices-demo/loadgenerator@sha256:3e5cf93c21e6b7d1e8bb8713aa02c7912d4c9f90fd02d477b3d911bd02a292fb
+      imagePullPolicy: IfNotPresent
+      command: [python, -u, -c]
+      args:
+        - |
+          import json
+          import socket
+          import time
+
+          target = "kubernetes.default.svc.cluster.local."
+          startup_delay_seconds = 5.0
+          attempts = 60
+          time.sleep(startup_delay_seconds)
+          deadline = time.monotonic()
+          for logical_index in range(attempts):
+              start_ns = time.monotonic_ns()
+              error = None
+              addresses = []
+              try:
+                  answers = socket.getaddrinfo(
+                      target,
+                      443,
+                      family=socket.AF_INET,
+                      type=socket.SOCK_STREAM,
+                  )
+                  addresses = sorted({
+                      item[4][0] for item in answers
+                  })
+              except OSError as exception:
+                  error = repr(exception)
+              print(json.dumps({
+                  "record_type": "application_dns_lookup",
+                  "logical_index": logical_index,
+                  "target": target,
+                  "qtype": "A",
+                  "success": error is None,
+                  "addresses": addresses,
+                  "error": error,
+                  "monotonic_start_ns": start_ns,
+                  "duration_ns": time.monotonic_ns() - start_ns,
+              }, sort_keys=True), flush=True)
+              deadline += 1.0
+              remaining = deadline - time.monotonic()
+              if remaining > 0:
+                  time.sleep(remaining)
+          time.sleep(7)
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
+        readOnlyRootFilesystem: true
+        runAsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault

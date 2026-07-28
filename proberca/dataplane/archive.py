@@ -49,11 +49,14 @@ _ROLE_FIELDS = frozenset({
     "unit", "metric_kind", "aggregation", "source_scope", "quantile",
     "aggregation_formula",
 })
-_CONTRACT_FIELDS = frozenset({
+_CONTRACT_V2_FIELDS = frozenset({
     "schema_version", "normal_metric_roles", "aggregation_output_source",
     "aggregation_config_fingerprint", "source_description",
     "burst_evidence_source_type", "burst_evidence_semantics",
     "burst_channel_roles", "burst_config_fingerprint", "window_sec",
+})
+_CONTRACT_V3_FIELDS = _CONTRACT_V2_FIELDS | frozenset({
+    "dns_aggregation_policy_id", "dns_aggregation_policy_fingerprint",
 })
 _BURST_ROLE_FIELDS = frozenset({
     "channel_id", "root_category", "entity_types",
@@ -81,10 +84,17 @@ def _require_sha256(name: str, value: Any) -> None:
 
 
 def _validate_collection_contract(contract: dict[str, Any]) -> None:
-    if not isinstance(contract, dict) or set(contract) != _CONTRACT_FIELDS:
+    if not isinstance(contract, dict):
         raise CollectionArchiveError("collection contract fields mismatch")
-    if contract["schema_version"] != "probeRCA-final-collection-contract-v2":
+    schema_version = contract.get("schema_version")
+    if schema_version == "probeRCA-final-collection-contract-v2":
+        expected_fields = _CONTRACT_V2_FIELDS
+    elif schema_version == "probeRCA-final-collection-contract-v3":
+        expected_fields = _CONTRACT_V3_FIELDS
+    else:
         raise CollectionArchiveError("unsupported collection contract schema")
+    if set(contract) != expected_fields:
+        raise CollectionArchiveError("collection contract fields mismatch")
     window_sec = contract["window_sec"]
     if isinstance(window_sec, bool) or not isinstance(window_sec, int) or window_sec <= 0:
         raise CollectionArchiveError("collection contract window_sec must be positive")
@@ -140,10 +150,32 @@ def _validate_collection_contract(contract: dict[str, Any]) -> None:
         raise CollectionArchiveError("collection metric roles contain duplicates")
     if contract["aggregation_output_source"] != "final_window_aggregation":
         raise CollectionArchiveError("collection aggregation output source mismatch")
-    expected_aggregation_fingerprint = fingerprint({
+    aggregation_payload = {
         "output_source": contract["aggregation_output_source"],
         "roles": roles,
-    })
+    }
+    if schema_version == "probeRCA-final-collection-contract-v3":
+        policy_id = contract["dns_aggregation_policy_id"]
+        if not isinstance(policy_id, str) or not policy_id \
+                or policy_id == "unconfigured":
+            raise CollectionArchiveError(
+                "DNS aggregation policy ID must be frozen"
+            )
+        _require_sha256(
+            "dns_aggregation_policy_fingerprint",
+            contract["dns_aggregation_policy_fingerprint"],
+        )
+        if contract["dns_aggregation_policy_fingerprint"] == "0" * 64:
+            raise CollectionArchiveError(
+                "DNS aggregation policy fingerprint must be frozen"
+            )
+        aggregation_payload.update({
+            "dns_aggregation_policy_id": policy_id,
+            "dns_aggregation_policy_fingerprint": (
+                contract["dns_aggregation_policy_fingerprint"]
+            ),
+        })
+    expected_aggregation_fingerprint = fingerprint(aggregation_payload)
     if contract["aggregation_config_fingerprint"] \
             != expected_aggregation_fingerprint:
         raise CollectionArchiveError("aggregation configuration fingerprint mismatch")

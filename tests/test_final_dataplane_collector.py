@@ -207,12 +207,20 @@ def _edge_samples(
         )
         histogram = "edge_latency_histogram"
     else:
+        dns_count = 21 if count_delta is None else count_delta
+        dns_error = 1 if error_delta is None else error_delta
+        dns_timeout = 1 if timeout_delta is None else timeout_delta
+        dns_success = dns_count - dns_error - dns_timeout
         components = (
-            ("dns_query_total", 21 if count_delta is None else count_delta),
-            ("dns_timeout_total", 1 if timeout_delta is None else timeout_delta),
-            ("dns_error_rcode_total", 1 if error_delta is None else error_delta),
+            ("dns_query_total", dns_count),
+            ("dns_success_total", dns_success),
+            ("dns_timeout_total", dns_timeout),
+            ("dns_servfail_total", dns_error),
+            ("dns_refused_total", 0),
+            ("dns_nxdomain_failure_total", 0),
+            ("dns_transport_error_total", 0),
         )
-        histogram = "dns_latency_histogram"
+        histogram = "dns_success_latency_histogram"
     for component, delta in components:
         _counter(
             output, component, 100, delta,
@@ -222,7 +230,7 @@ def _edge_samples(
         output, histogram, (
             (
                 (25, 48, 50)
-                if protocol == "tcp" else (10, 19, 20)
+                if protocol == "tcp" else (10, dns_success, dns_success)
             )
             if histogram_deltas is None else histogram_deltas
         ),
