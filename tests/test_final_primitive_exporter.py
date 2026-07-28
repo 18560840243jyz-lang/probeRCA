@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+import scripts.install_final_dataplane as install_module
 from scripts.install_final_dataplane import (
     _service_matches_contract,
 )
@@ -958,7 +959,73 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
     )
 
 
-def test_healthy_dns_exposure_is_success_only_and_reproducible():
+def test_formal_installer_executes_only_formal_workloads(monkeypatch):
+    commands = []
+    probe_configurations = []
+    prometheus_configurations = []
+
+    def capture(arguments, **kwargs):
+        commands.append(tuple(str(item) for item in arguments))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(install_module, "_require_root", lambda: None)
+    monkeypatch.setattr(
+        install_module, "_find_bpftool", lambda: "/usr/bin/bpftool",
+    )
+    monkeypatch.setattr(install_module, "_run", capture)
+    monkeypatch.setattr(
+        install_module, "_atomic_copy", lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        install_module,
+        "_install_prometheus_job",
+        lambda repository: prometheus_configurations.append(repository),
+    )
+    monkeypatch.setattr(
+        install_module,
+        "_configure_healthy_probe_cadence",
+        lambda repository: probe_configurations.append(repository),
+    )
+    monkeypatch.setattr(
+        install_module.Path, "mkdir", lambda *_args, **_kwargs: None,
+    )
+
+    repository = Path("/home/jyz/probeRCA")
+    install_module.install(repository)
+
+    rendered = tuple(" ".join(command) for command in commands)
+    assert not any(
+        forbidden in command
+        for command in rendered
+        for forbidden in (
+            "healthy-dns-exposure-patch.yaml",
+            "proberca-healthy-dns-exposure",
+            "patch deployment/frontend",
+        )
+    )
+    assert any(
+        "deploy/final-dataplane/healthy-calibration-load.yaml" in command
+        for command in rendered
+    )
+    assert any(
+        "deploy/final-dataplane/beyla.yaml" in command
+        for command in rendered
+    )
+    assert any(
+        "patch deployment/coredns" in command
+        for command in rendered
+    )
+    assert any(
+        "proberca-final-ebpf.service" in command
+        and "proberca-final-burst.service" in command
+        and "proberca-final-primitive-exporter.service" in command
+        for command in rendered
+    )
+    assert probe_configurations == [repository]
+    assert prometheus_configurations == [repository]
+
+
+def test_experimental_dns_exposure_is_retained_but_not_formally_installed():
     patch_path = Path(
         "deploy/final-dataplane/healthy-dns-exposure-patch.yaml"
     )
@@ -1002,8 +1069,8 @@ def test_healthy_dns_exposure_is_success_only_and_reproducible():
     installer = Path(
         "scripts/install_final_dataplane.py"
     ).read_text(encoding="utf-8")
-    assert str(patch_path) in installer
-    assert '"patch", "deployment/frontend"' in installer
+    assert str(patch_path) not in installer
+    assert "proberca-healthy-dns-exposure" not in installer
 
 
 def test_healthy_probe_cadence_is_explicit_and_reproducible():

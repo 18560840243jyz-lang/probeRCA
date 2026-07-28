@@ -426,27 +426,6 @@ def install(repository: Path) -> None:
         "kubectl",
         "--kubeconfig", "/home/jyz/.kube/config",
         "--context", "kind-proberca-ob",
-        "-n", "online-boutique",
-        "patch", "deployment/frontend",
-        "--type", "strategic",
-        "--patch-file",
-        str(
-            repository
-            / "deploy/final-dataplane/healthy-dns-exposure-patch.yaml"
-        ),
-    ])
-    _run([
-        "kubectl",
-        "--kubeconfig", "/home/jyz/.kube/config",
-        "--context", "kind-proberca-ob",
-        "-n", "online-boutique",
-        "rollout", "status", "deployment/frontend",
-        "--timeout=120s",
-    ])
-    _run([
-        "kubectl",
-        "--kubeconfig", "/home/jyz/.kube/config",
-        "--context", "kind-proberca-ob",
         "apply", "-f",
         str(
             repository
