@@ -8,6 +8,21 @@ from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 from typing import Any, ClassVar
 
 PROBERCA_SCHEMA_VERSION = "1.0"
+METRIC_RECORD_SCHEMA_VERSION = "2.0"
+LEGACY_METRIC_RECORD_SCHEMA_VERSION = "1.0"
+METRIC_INVALID_REASONS = frozenset({
+    "no_exposure",
+    "zero_coverage",
+    "insufficient_sample_count",
+    "excessive_event_loss",
+    "missing_component",
+})
+
+_LEGACY_COUNT_METRICS = frozenset({
+    "request_rate",
+    "edge_request_count",
+    "dns_query_count",
+})
 
 
 @dataclass
@@ -311,6 +326,86 @@ def _schema_version(value: Any) -> None:
         )
 
 
+def _metric_record_schema_version(value: Any) -> None:
+    _required_string("schema_version", value)
+    if value != METRIC_RECORD_SCHEMA_VERSION:
+        raise ValueError(
+            f"incompatible metric record schema_version {value!r}; "
+            f"expected {METRIC_RECORD_SCHEMA_VERSION!r}"
+        )
+
+
+def _metric_validity(
+    value: Any,
+    valid: Any,
+    invalid_reason: Any,
+) -> float | None:
+    if not isinstance(valid, bool):
+        raise TypeError("valid must be a boolean")
+    if valid:
+        if invalid_reason is not None:
+            raise ValueError("valid metric records must not have invalid_reason")
+        return _finite_number("value", value)
+    if value is not None:
+        raise ValueError("invalid metric records must have value=None")
+    if not isinstance(invalid_reason, str) or not invalid_reason:
+        raise ValueError(
+            "invalid metric records require a non-empty invalid_reason"
+        )
+    if invalid_reason not in METRIC_INVALID_REASONS:
+        raise ValueError(
+            f"unsupported metric invalid_reason {invalid_reason!r}"
+        )
+    return None
+
+
+def _legacy_metric_projection(
+    payload: dict[str, Any],
+) -> tuple[float | None, bool, str | None]:
+    value = _finite_number("value", payload.get("value"))
+    coverage = _probability("coverage", payload.get("coverage"))
+    sample_count = payload.get("sample_count")
+    _integer("sample_count", sample_count)
+    metric_name = payload.get("metric_name")
+    _identity_component("metric_name", metric_name)
+    if metric_name in _LEGACY_COUNT_METRICS:
+        return value, True, None
+    if coverage > 0.0:
+        return value, True, None
+    is_no_exposure_role = (
+        "latency" in metric_name
+        or "failure" in metric_name
+        or metric_name.endswith("_ratio")
+    )
+    if value == 0.0 and sample_count == 0 and is_no_exposure_role:
+        return None, False, "no_exposure"
+    return None, False, "zero_coverage"
+
+
+def _metric_record_from_dict(record_type, payload: dict[str, Any]):
+    values = dict(payload)
+    dataclass_fields = fields(record_type)
+    expected = {item.name for item in dataclass_fields}
+    legacy_expected = expected - {
+        "valid",
+        "invalid_reason",
+        "mapping_quality",
+    }
+    if (
+        values.get("schema_version") == LEGACY_METRIC_RECORD_SCHEMA_VERSION
+        and set(values) == legacy_expected
+    ):
+        value, valid, invalid_reason = _legacy_metric_projection(values)
+        values.update(
+            schema_version=METRIC_RECORD_SCHEMA_VERSION,
+            value=value,
+            valid=valid,
+            invalid_reason=invalid_reason,
+            mapping_quality=1.0,
+        )
+    return StrictRecord.from_dict.__func__(record_type, values)
+
+
 @dataclass(frozen=True)
 class NodeMetricRecord(StrictRecord):
     schema_version: str
@@ -324,11 +419,14 @@ class NodeMetricRecord(StrictRecord):
     container_id: str | None
     metric_family: str
     metric_name: str
-    value: float
+    value: float | None
+    valid: bool
+    invalid_reason: str | None
     unit: str
     sample_count: int
     coverage: float
     event_loss_rate: float
+    mapping_quality: float
     source: str
     metric_kind: str
     scope: str
@@ -338,9 +436,13 @@ class NodeMetricRecord(StrictRecord):
     quantile: float | None
     record_type: str = field(default="node_metric", init=False)
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]):
+        return _metric_record_from_dict(cls, payload)
+
     def __post_init__(self) -> None:
         _fixed_record_type(self.record_type, "node_metric")
-        _schema_version(self.schema_version)
+        _metric_record_schema_version(self.schema_version)
         _integer("timestamp_ns", self.timestamp_ns)
         _integer("window_sec", self.window_sec, 1)
         _identity_component("cluster_id", self.cluster_id)
@@ -352,12 +454,21 @@ class NodeMetricRecord(StrictRecord):
         if self.metric_family not in NODE_METRIC_FAMILIES:
             raise ValueError(f"invalid metric_family {self.metric_family!r}")
         _identity_component("metric_name", self.metric_name)
-        object.__setattr__(self, "value", _finite_number("value", self.value))
+        object.__setattr__(
+            self,
+            "value",
+            _metric_validity(self.value, self.valid, self.invalid_reason),
+        )
         _required_string("unit", self.unit)
         _integer("sample_count", self.sample_count)
         object.__setattr__(self, "coverage", _probability("coverage", self.coverage))
         object.__setattr__(
             self, "event_loss_rate", _probability("event_loss_rate", self.event_loss_rate)
+        )
+        object.__setattr__(
+            self, "mapping_quality", _probability(
+                "mapping_quality", self.mapping_quality,
+            )
         )
         _required_string("source", self.source)
         if self.scope not in NODE_METRIC_SCOPES:
@@ -373,7 +484,11 @@ class NodeMetricRecord(StrictRecord):
             self.histogram_is_cumulative,
             self.quantile,
         )
-        if self.metric_kind == "histogram_bucket" and self.value < 0:
+        if (
+            self.valid
+            and self.metric_kind == "histogram_bucket"
+            and self.value < 0
+        ):
             raise ValueError("histogram bucket value is a count and must be non-negative")
         object.__setattr__(self, "histogram_upper_bound", bound)
         object.__setattr__(self, "quantile", quantile_value)
@@ -408,11 +523,14 @@ class EdgeMetricRecord(StrictRecord):
     dst_node: str | None
     protocol: str
     metric_name: str
-    value: float
+    value: float | None
+    valid: bool
+    invalid_reason: str | None
     unit: str
     sample_count: int
     coverage: float
     event_loss_rate: float
+    mapping_quality: float
     source: str
     metric_kind: str
     scope: str
@@ -422,21 +540,34 @@ class EdgeMetricRecord(StrictRecord):
     quantile: float | None
     record_type: str = field(default="edge_metric", init=False)
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]):
+        return _metric_record_from_dict(cls, payload)
+
     def __post_init__(self) -> None:
         _fixed_record_type(self.record_type, "edge_metric")
-        _schema_version(self.schema_version)
+        _metric_record_schema_version(self.schema_version)
         _integer("timestamp_ns", self.timestamp_ns)
         _integer("window_sec", self.window_sec, 1)
         for name in ("cluster_id", "namespace", "src_service", "dst_service", "protocol", "metric_name"):
             _identity_component(name, getattr(self, name))
         for name in ("src_pod_uid", "dst_pod_uid", "src_node", "dst_node"):
             _optional_string(name, getattr(self, name))
-        object.__setattr__(self, "value", _finite_number("value", self.value))
+        object.__setattr__(
+            self,
+            "value",
+            _metric_validity(self.value, self.valid, self.invalid_reason),
+        )
         _required_string("unit", self.unit)
         _integer("sample_count", self.sample_count)
         object.__setattr__(self, "coverage", _probability("coverage", self.coverage))
         object.__setattr__(
             self, "event_loss_rate", _probability("event_loss_rate", self.event_loss_rate)
+        )
+        object.__setattr__(
+            self, "mapping_quality", _probability(
+                "mapping_quality", self.mapping_quality,
+            )
         )
         _required_string("source", self.source)
         if self.scope not in EDGE_METRIC_SCOPES:
@@ -448,7 +579,11 @@ class EdgeMetricRecord(StrictRecord):
             self.histogram_is_cumulative,
             self.quantile,
         )
-        if self.metric_kind == "histogram_bucket" and self.value < 0:
+        if (
+            self.valid
+            and self.metric_kind == "histogram_bucket"
+            and self.value < 0
+        ):
             raise ValueError("histogram bucket value is a count and must be non-negative")
         object.__setattr__(self, "histogram_upper_bound", bound)
         object.__setattr__(self, "quantile", quantile_value)
@@ -1465,10 +1600,15 @@ def node_metric_from_legacy(
 
     if not isinstance(record, MetricRecord):
         raise TypeError("record must be a MetricRecord")
+    if schema_version not in {
+        LEGACY_METRIC_RECORD_SCHEMA_VERSION,
+        METRIC_RECORD_SCHEMA_VERSION,
+    }:
+        raise ValueError("unsupported legacy metric schema_version")
     timestamp = _finite_number("record.timestamp", record.timestamp)
     value = _finite_number("record.value", record.value)
     return NodeMetricRecord(
-        schema_version=schema_version,
+        schema_version=METRIC_RECORD_SCHEMA_VERSION,
         timestamp_ns=int(timestamp * 1_000_000_000),
         window_sec=window_sec,
         cluster_id=cluster_id,
@@ -1480,10 +1620,13 @@ def node_metric_from_legacy(
         metric_family=metric_family,
         metric_name=record.metric,
         value=value,
+        valid=True,
+        invalid_reason=None,
         unit=unit,
         sample_count=sample_count,
         coverage=coverage,
         event_loss_rate=event_loss_rate,
+        mapping_quality=1.0,
         source=record.source,
         metric_kind=metric_kind,
         scope=scope,

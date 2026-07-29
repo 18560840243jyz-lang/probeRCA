@@ -283,11 +283,19 @@ class MetricResolver:
             resolved.append((record, metric, spec))
         count_by_entity = {}
         for record, metric, spec in resolved:
-            if spec.role == "request_rate" and record.coverage > 0.0:
+            if (
+                spec.role == "request_rate"
+                and record.valid
+                and record.value is not None
+            ):
                 count_by_entity[metric.entity_id] = (
                     float(record.value) * record.window_sec
                 )
-            elif spec.role == "edge_count" and record.coverage > 0.0:
+            elif (
+                spec.role == "edge_count"
+                and record.valid
+                and record.value is not None
+            ):
                 count_by_entity[metric.entity_id] = float(record.value)
         validity = {}
         seen = set()
@@ -297,8 +305,15 @@ class MetricResolver:
                     f"collected window has duplicate metric node {metric.node_id}"
                 )
             seen.add(metric.node_id)
-            quality = float(record.coverage * (1.0 - record.event_loss_rate))
+            quality = float(
+                record.coverage
+                * (1.0 - record.event_loss_rate)
+                * record.mapping_quality
+            )
             scope = self.formal_scope_metadata(metric)
+            data_plane_reason = (
+                None if record.valid else record.invalid_reason
+            )
             if self.is_excluded_from_formal_rca(spec) \
                     or scope["formal_scope"] == "excluded":
                 reason = (
@@ -309,32 +324,42 @@ class MetricResolver:
                 validity[metric.node_id] = {
                     "valid": False,
                     "invalid_reason": reason,
+                    "data_plane_invalid_reason": data_plane_reason,
+                    "control_plane_invalid_reason": None,
                     "exclusion_reason": reason,
                     "raw_value": record.value,
                     "coverage": record.coverage,
+                    "mapping_quality": record.mapping_quality,
                     "sample_count": record.sample_count,
                     "request_count": count_by_entity.get(metric.entity_id),
                     "quality": quality,
                     **scope,
                 }
                 continue
-            reason = None
-            if quality <= 0.0:
-                reason = "zero_coverage"
-            elif spec.role in {"request_latency", "edge_latency"} \
-                    and record.sample_count < self.config.latency_min_samples:
-                reason = "insufficient_sample_count"
-            elif spec.role in {"request_failure", "edge_failure"}:
-                exposure = count_by_entity.get(metric.entity_id)
-                if exposure is None:
-                    reason = "missing_request_count"
-                elif exposure < self.config.failure_min_requests:
-                    reason = "insufficient_request_count"
+            control_plane_reason = None
+            if data_plane_reason is None:
+                if record.event_loss_rate >= 1.0:
+                    control_plane_reason = "excessive_event_loss"
+                elif quality <= 0.0:
+                    control_plane_reason = "zero_coverage"
+                elif spec.role in {"request_latency", "edge_latency"} \
+                        and record.sample_count < self.config.latency_min_samples:
+                    control_plane_reason = "insufficient_sample_count"
+                elif spec.role in {"request_failure", "edge_failure"}:
+                    exposure = count_by_entity.get(metric.entity_id)
+                    if exposure is None:
+                        control_plane_reason = "missing_request_count"
+                    elif exposure < self.config.failure_min_requests:
+                        control_plane_reason = "insufficient_request_count"
+            reason = data_plane_reason or control_plane_reason
             validity[metric.node_id] = {
                 "valid": reason is None,
                 "invalid_reason": reason,
+                "data_plane_invalid_reason": data_plane_reason,
+                "control_plane_invalid_reason": control_plane_reason,
                 "raw_value": record.value,
                 "coverage": record.coverage,
+                "mapping_quality": record.mapping_quality,
                 "sample_count": record.sample_count,
                 "request_count": count_by_entity.get(metric.entity_id),
                 "quality": quality,
@@ -342,7 +367,11 @@ class MetricResolver:
             }
             if reason is not None:
                 continue
-            transformed = baseline.transform(record.value, spec)
+            if record.value is None:
+                raise MetricContractError(
+                    "valid metric record unexpectedly has value=None"
+                )
+            transformed = baseline.transform(float(record.value), spec)
             raw[metric.node_id] = (transformed, spec)
             scored = baseline.score(
                 metric.node_id, transformed, spec.polarity, spec,

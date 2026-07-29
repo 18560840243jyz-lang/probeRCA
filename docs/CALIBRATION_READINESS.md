@@ -7,15 +7,21 @@
 
 ## 有效观测
 
-数据面保留原始值、覆盖率、样本数、事件损失率和来源记录。控制面逐指标判断有效性：
+数据面记录显式保存 `value`、`valid`、`invalid_reason`、覆盖率、映射质量、
+样本数、事件损失率和来源记录。`valid=false` 时 `value` 必须为 `null`，
+不得写入有限零值；`coverage`与`mapping_quality`不得相互混用。
+控制面首先尊重数据面有效性，再逐指标追加自己的门禁判断：
 
-- `coverage == 0`：缺失，不进入基线、告警和 `A_v`。
+- 原始采集覆盖为零：`invalid_reason=zero_coverage`，不进入基线、告警和 `A_v`。
+- 完整采集但请求或操作计数为零：计数是有效零；没有分母或样本的P95/失败率
+  使用 `invalid_reason=no_exposure`。
 - 延迟 P95 的样本数低于 `latency_min_samples`：缺失。
 - 失败率找不到请求/查询计数，或计数低于 `failure_min_requests`：缺失。
 - 缺失值不得补零、前向填充、插值或复用上一窗口 P95。
 
 `CalibrationReadinessReport.latest_observation_validity` 保存最新窗口中每个指标的
-`raw_value`、`coverage`、`sample_count`、`request_count`、`quality` 和拒绝原因。
+`raw_value`、`coverage`、`mapping_quality`、`sample_count`、`request_count`、`quality`、
+`data_plane_invalid_reason`、`control_plane_invalid_reason` 和最终拒绝原因。
 
 ## 稳健尺度
 

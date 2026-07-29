@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from proberca.data.schema import (
     PROBERCA_SCHEMA_VERSION, BurstEventRecord, EdgeMetricRecord,
-    EvidenceObservationRecord, NodeMetricRecord,
+    EvidenceObservationRecord, METRIC_RECORD_SCHEMA_VERSION, NodeMetricRecord,
 )
 
 from .contracts import EventClass, EventQuality, EventType, KernelEvent
@@ -255,15 +255,18 @@ def event_to_metric_record(
         raise ValueError("only fully mapped events become metric records")
     unit, value = _unit_value(event)
     common = {
-        "schema_version": PROBERCA_SCHEMA_VERSION,
+        "schema_version": METRIC_RECORD_SCHEMA_VERSION,
         "timestamp_ns": event.timestamp_ns,
         "window_sec": window_sec,
         "cluster_id": mapped.cluster_id,
         "value": value,
+        "valid": True,
+        "invalid_reason": None,
         "unit": unit,
         "sample_count": 1,
         "coverage": 1.0,
         "event_loss_rate": event_loss_rate,
+        "mapping_quality": 1.0,
         "source": f"ebpf:{event.event_type_name}",
         "metric_kind": "delta_counter" if unit == "count" else "gauge",
         "histogram_upper_bound": None,

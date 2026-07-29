@@ -41,9 +41,18 @@ canonical final aggregator.
   bucket layouts. Bucket deltas are merged before the P95 is selected.
 - Duplicate, stale, ambiguous, pre-aggregated, wrong-unit, or wrong-kind
   inputs reject the complete window.
-- A genuinely empty request/edge histogram is represented only as
-  `sample_count=0, coverage=0`. Its finite zero placeholder preserves the
-  frozen tensor shape but is not an observation and is never a forward fill.
+- A genuinely empty request/edge histogram is represented as
+  `value=null, valid=false, invalid_reason=no_exposure`. The record remains
+  present so the frozen tensor role is explicit, but no finite placeholder is
+  written.
+- `coverage` describes source collection quality only. A complete collection
+  with no requests keeps its real count at `value=0, valid=true`; its latency
+  and failure ratio are invalid because they have no statistical exposure.
+- A source with no collection coverage is written as
+  `value=null, valid=false, invalid_reason=zero_coverage`. Missing values are
+  never encoded as zero, NaN, or infinity.
+- `coverage` and `mapping_quality` remain separate record fields; neither is
+  silently folded into the other.
 - The cumulative histogram `+Inf` delta must equal its corresponding request
   or query counter delta whenever observations exist.
 
@@ -54,8 +63,16 @@ The output is exactly:
 - 3 metrics for every known directed TCP edge;
 
 Known formal TCP edges remain in the topology during an idle second. Their
-count and failure rate are zero and their empty latency has zero coverage.
-This keeps traffic sparsity from masquerading as a deployment-layout change.
+count is a valid real zero; their failure rate and latency remain present as
+`no_exposure` records. This keeps traffic sparsity from masquerading as a
+deployment-layout change without treating an undefined ratio or P95 as zero.
+
+New metric records use schema `2.0`, collected windows use
+`probeRCA-dataplane-window-v3`, and collection archives use
+`probeRCA-dataplane-archive-v3`. The reader accepts sealed legacy v2 archives
+without rewriting their bytes, hashes, dataset identity, or contract
+fingerprint. Legacy placeholders are projected conservatively into the new
+validity fields only in memory.
 
 ## Raw exporter contract
 

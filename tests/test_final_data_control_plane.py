@@ -10,6 +10,8 @@ import pytest
 import yaml
 import proberca.dataplane.archive as archive_module
 
+from proberca.aggregation import CounterDeltaTracker
+from proberca.baseline import RobustBaselineStore as LegacyRobustBaselineStore
 from proberca.cli.analyze_collection import main as analyze_main
 from proberca.cli.seal_collection import main as seal_main
 from proberca.controlplane import FinalControlConfig, FinalControlPlane
@@ -37,9 +39,15 @@ from proberca.controlplane.service_model import (
     build_candidate_graph,
     formal_service_graph,
 )
+from proberca.config import (
+    BaselineConfig,
+    MetricSignalSpec,
+    MonotonicCounterPolicy,
+)
 from proberca.data.schema import (
     EdgeMetricRecord,
     EvidenceObservationRecord,
+    METRIC_RECORD_SCHEMA_VERSION,
     NodeMetricRecord,
     ServiceNodePlacement,
     ServiceResourceBinding,
@@ -224,7 +232,7 @@ def _node_records(sequence: int) -> tuple[NodeMetricRecord, ...]:
         entity_type = "host" if scope == "node" else "service"
         spec = roles[(entity_type, name)]
         return NodeMetricRecord(
-            schema_version="1.0",
+            schema_version=METRIC_RECORD_SCHEMA_VERSION,
             timestamp_ns=timestamp,
             window_sec=1,
             cluster_id="cluster",
@@ -236,10 +244,13 @@ def _node_records(sequence: int) -> tuple[NodeMetricRecord, ...]:
             metric_family=family,
             metric_name=name,
             value=value,
+            valid=True,
+            invalid_reason=None,
             unit=spec.unit,
             sample_count=10,
             coverage=1.0,
             event_loss_rate=0.0,
+            mapping_quality=1.0,
             source="final_window_aggregation",
             metric_kind=spec.metric_kind,
             scope=scope,
@@ -652,12 +663,15 @@ def test_burst_normalization_is_bounded_and_quality_aware():
 
 def test_edge_identity_and_cross_metric_only_prediction():
     edge = EdgeMetricRecord(
-        schema_version="1.0", timestamp_ns=0, window_sec=1,
+        schema_version=METRIC_RECORD_SCHEMA_VERSION,
+        timestamp_ns=0, window_sec=1,
         cluster_id="cluster", namespace="ns",
         src_service="checkout", dst_service="payment",
         src_pod_uid=None, dst_pod_uid=None, src_node="node-a", dst_node="node-b",
         protocol="tcp", metric_name="edge_latency_p95", value=10.0,
+        valid=True, invalid_reason=None,
         unit="milliseconds", sample_count=10, coverage=1.0, event_loss_rate=0.0,
+        mapping_quality=1.0,
         source="final_window_aggregation", metric_kind="quantile", scope="service_pair",
         histogram_upper_bound=None, histogram_is_inf_bucket=False,
         histogram_is_cumulative=None, quantile=0.95,
@@ -668,9 +682,16 @@ def test_edge_identity_and_cross_metric_only_prediction():
     assert spec.role == "edge_latency"
 
 
-def test_zero_coverage_placeholder_does_not_enter_healthy_baseline():
+def test_data_plane_invalid_record_does_not_enter_healthy_baseline():
     config = _config()
-    record = replace(_node_records(1)[0], value=0.0, sample_count=0, coverage=0.0)
+    record = replace(
+        _node_records(1)[0],
+        value=None,
+        valid=False,
+        invalid_reason="zero_coverage",
+        sample_count=0,
+        coverage=0.0,
+    )
     window = SimpleNamespace(node_metrics=(record,), edge_metrics=())
     resolver = MetricResolver(config)
     baseline = RobustBaselineStore(config)
@@ -683,8 +704,11 @@ def test_zero_coverage_placeholder_does_not_enter_healthy_baseline():
     assert validity == {
         "valid": False,
         "invalid_reason": "zero_coverage",
-        "raw_value": 0.0,
+        "data_plane_invalid_reason": "zero_coverage",
+        "control_plane_invalid_reason": None,
+        "raw_value": None,
         "coverage": 0.0,
+        "mapping_quality": 1.0,
         "sample_count": 0,
         "request_count": None,
         "quality": 0.0,
@@ -701,6 +725,87 @@ def test_zero_coverage_placeholder_does_not_enter_healthy_baseline():
         training_rows=4, healthy_cutoff_ns=10,
     )
     assert model.cross_prediction("a", {4: {"a": 7.0, "b": 3.0}}, 5) == 6.0
+
+
+def test_data_plane_reason_is_preserved_before_control_plane_thresholds():
+    config = _config()
+    records = _node_records(1)
+    request_count = next(
+        item for item in records if item.metric_name == "request_rate"
+    )
+    missing_latency = replace(
+        next(
+            item for item in records
+            if item.metric_name == "request_latency_p95"
+        ),
+        value=None,
+        valid=False,
+        invalid_reason="no_exposure",
+        sample_count=0,
+    )
+    resolver = MetricResolver(config)
+    normalized, raw = resolver.normalize_window(
+        SimpleNamespace(
+            node_metrics=(request_count, missing_latency),
+            edge_metrics=(),
+        ),
+        RobustBaselineStore(config),
+    )
+    node_id = (
+        "cluster::ns::payment::request_latency_p95"
+    )
+    assert node_id not in normalized
+    assert node_id not in raw
+    validity = resolver.last_validity[node_id]
+    assert validity["valid"] is False
+    assert validity["invalid_reason"] == "no_exposure"
+    assert validity["data_plane_invalid_reason"] == "no_exposure"
+    assert validity["control_plane_invalid_reason"] is None
+    assert validity["raw_value"] is None
+
+
+def test_legacy_control_and_counter_paths_also_fail_closed_on_invalid_record():
+    record = replace(
+        _node_records(1)[0],
+        value=None,
+        valid=False,
+        invalid_reason="no_exposure",
+    )
+    spec = MetricSignalSpec(
+        record_type="node_metric",
+        metric_family=record.metric_family,
+        metric_name=record.metric_name,
+        protocol=None,
+        transform="identity",
+        polarity="increase_bad",
+        rare_event_threshold=None,
+        direct_hard=False,
+        z_cap=6.0,
+        aggregation_output_id=record.stable_id,
+    )
+    baseline = LegacyRobustBaselineStore(
+        BaselineConfig(
+            healthy_history_sec=10,
+            min_healthy_windows=1,
+            min_scale=0.1,
+            z_cap=6.0,
+        ),
+        window_sec=1,
+    )
+    assert baseline.update(record, spec, state="healthy") is False
+    scored = baseline.score(record, spec, 0, _NS)
+    assert scored.score is None
+    assert [item.reason_code for item in scored.issues] == ["no_exposure"]
+
+    counter = replace(record, metric_kind="monotonic_counter")
+    tracker = CounterDeltaTracker(MonotonicCounterPolicy(
+        delta_before_cross_series_sum=True,
+        value_decrease_means_reset=True,
+        reset_policy="mark_missing",
+    ))
+    output, issues = tracker.process(counter)
+    assert output is None
+    assert [item.reason_code for item in issues] == ["no_exposure"]
 
 
 def test_zero_mad_uses_metric_family_floor_instead_of_numeric_epsilon():
@@ -1658,7 +1763,7 @@ def _dns_edge_records(sequence: int) -> tuple[EdgeMetricRecord, ...]:
     }
     return tuple(
         EdgeMetricRecord(
-            schema_version="1.0",
+            schema_version=METRIC_RECORD_SCHEMA_VERSION,
             timestamp_ns=timestamp_ns,
             window_sec=1,
             cluster_id="cluster",
@@ -1672,10 +1777,13 @@ def _dns_edge_records(sequence: int) -> tuple[EdgeMetricRecord, ...]:
             protocol="dns",
             metric_name=name,
             value=value,
+            valid=True,
+            invalid_reason=None,
             unit=specs[name].unit,
             sample_count=sample_count,
             coverage=1.0,
             event_loss_rate=0.0,
+            mapping_quality=1.0,
             source="final_window_aggregation",
             metric_kind=specs[name].metric_kind,
             scope="service_pair",

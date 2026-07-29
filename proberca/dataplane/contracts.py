@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -11,10 +12,13 @@ from typing import Any, Iterable
 from proberca.data.schema import (
     EdgeMetricRecord,
     EvidenceObservationRecord,
+    METRIC_RECORD_SCHEMA_VERSION,
     NodeMetricRecord,
     TopologySnapshot,
 )
 
+COLLECTED_WINDOW_SCHEMA_VERSION = "probeRCA-dataplane-window-v3"
+LEGACY_COLLECTED_WINDOW_SCHEMA_VERSION = "probeRCA-dataplane-window-v2"
 
 FORBIDDEN_INFERENCE_FIELDS = frozenset({
     "root_service",
@@ -174,7 +178,7 @@ class CollectedWindow:
             )
         all_records = (*nodes, *edges, *topology, *evidence)
         payload = {
-            "schema_version": "probeRCA-dataplane-window-v2",
+            "schema_version": COLLECTED_WINDOW_SCHEMA_VERSION,
             "sequence": sequence,
             "window_start_ns": window_start_ns,
             "window_end_ns": window_end_ns,
@@ -215,6 +219,40 @@ class CollectedWindow:
         if not isinstance(payload, dict) or set(payload) != expected:
             raise ValueError("invalid CollectedWindow fields")
         assert_label_safe(payload)
+        serialized_payload = copy.deepcopy(payload)
+        schema_version = payload["schema_version"]
+        metric_payloads = (
+            *payload["node_metrics"],
+            *payload["edge_metrics"],
+        )
+        if schema_version == LEGACY_COLLECTED_WINDOW_SCHEMA_VERSION:
+            if any(
+                item.get("schema_version") != "1.0"
+                or "valid" in item
+                or "invalid_reason" in item
+                or "mapping_quality" in item
+                for item in metric_payloads
+            ):
+                raise ValueError(
+                    "legacy windows require legacy physical metric records"
+                )
+            unsigned = copy.deepcopy(payload)
+            supplied = unsigned.pop("window_fingerprint")
+            if supplied != fingerprint(unsigned):
+                raise ValueError("CollectedWindow fingerprint mismatch")
+        elif schema_version == COLLECTED_WINDOW_SCHEMA_VERSION:
+            if any(
+                item.get("schema_version") != METRIC_RECORD_SCHEMA_VERSION
+                or "valid" not in item
+                or "invalid_reason" not in item
+                or "mapping_quality" not in item
+                for item in metric_payloads
+            ):
+                raise ValueError(
+                    "current windows require current physical metric records"
+                )
+        else:
+            raise ValueError("unsupported CollectedWindow schema_version")
         result = cls(
             schema_version=payload["schema_version"],
             sequence=payload["sequence"],
@@ -239,6 +277,12 @@ class CollectedWindow:
             collection_metadata=dict(payload["collection_metadata"]),
             window_fingerprint=payload["window_fingerprint"],
         )
+        if schema_version == LEGACY_COLLECTED_WINDOW_SCHEMA_VERSION:
+            object.__setattr__(
+                result,
+                "_legacy_serialized_payload",
+                serialized_payload,
+            )
         result.validate()
         return result
 
@@ -247,7 +291,10 @@ class CollectedWindow:
         return cls._from_payload(dict(payload))
 
     def _validate_structure(self) -> None:
-        if self.schema_version != "probeRCA-dataplane-window-v2":
+        if self.schema_version not in {
+            COLLECTED_WINDOW_SCHEMA_VERSION,
+            LEGACY_COLLECTED_WINDOW_SCHEMA_VERSION,
+        }:
             raise ValueError("unsupported CollectedWindow schema_version")
         if isinstance(self.sequence, bool) or not isinstance(self.sequence, int) \
                 or self.sequence <= 0:
@@ -259,6 +306,11 @@ class CollectedWindow:
         records = (*self.node_metrics, *self.edge_metrics)
         if not records:
             raise ValueError("data-plane window must contain metrics")
+        if any(
+            item.schema_version != METRIC_RECORD_SCHEMA_VERSION
+            for item in records
+        ):
+            raise ValueError("collected metrics are not projected to the current schema")
         if any(not self.window_start_ns <= item.timestamp_ns < self.window_end_ns
                for item in records):
             raise ValueError("metric timestamp is outside collected window")
@@ -312,6 +364,11 @@ class CollectedWindow:
             raise ValueError("CollectedWindow fingerprint mismatch")
 
     def to_dict(self) -> dict[str, Any]:
+        legacy_payload = getattr(self, "_legacy_serialized_payload", None)
+        if legacy_payload is not None:
+            payload = copy.deepcopy(legacy_payload)
+            assert_label_safe(payload)
+            return payload
         payload = {
             "schema_version": self.schema_version,
             "sequence": self.sequence,

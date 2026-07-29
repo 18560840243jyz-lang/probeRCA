@@ -142,6 +142,21 @@ class CounterDeltaTracker:
         if record.metric_kind != "monotonic_counter":
             raise ValueError("CounterDeltaTracker only accepts monotonic_counter records")
         key = record.series_id
+        if not record.valid:
+            start = (
+                record.timestamp_ns
+                // (record.window_sec * 1_000_000_000)
+            ) * record.window_sec * 1_000_000_000
+            end = start + record.window_sec * 1_000_000_000
+            return None, [
+                _issue(
+                    key,
+                    start,
+                    end,
+                    record.invalid_reason,
+                    source="data_plane",
+                ),
+            ]
         previous = self._previous.get(key)
         if previous is not None and record.timestamp_ns <= previous[0]:
             raise ValueError("monotonic counter timestamps must increase within each series")
@@ -237,18 +252,41 @@ class AggregationPlan:
         return order
 
     def execute(self, records: Iterable[Metric], start_ns: int, end_ns: int) -> AggregationBatch:
-        records_list = sorted(list(records), key=lambda record: (record.timestamp_ns, record.record_type,
-                              record.stable_id, record.series_id, record.value))
-        if any(not isinstance(record, (NodeMetricRecord, EdgeMetricRecord)) for record in records_list):
+        supplied_records = list(records)
+        if any(not isinstance(record, (NodeMetricRecord, EdgeMetricRecord)) for record in supplied_records):
             raise TypeError("aggregation accepts only P1 node or edge metric records")
         configured_inputs: set[str] = set()
         for spec in self.specs.values():
             configured_inputs.update(spec.input_metric_ids or [])
             configured_inputs.update(item.metric_id for item in (spec.histogram_inputs or []))
-        unconfigured = sorted({record.stable_id for record in records_list} - configured_inputs)
+        unconfigured = sorted(
+            {record.stable_id for record in supplied_records}
+            - configured_inputs
+        )
         if unconfigured:
             raise ValueError(f"missing aggregation spec for input IDs: {unconfigured}")
         batch = AggregationBatch(start_ns, end_ns)
+        for record in supplied_records:
+            if not record.valid:
+                batch.invalid_outputs.append(
+                    _issue(
+                        record.stable_id,
+                        start_ns,
+                        end_ns,
+                        record.invalid_reason,
+                        source="data_plane",
+                    )
+                )
+        records_list = sorted(
+            (record for record in supplied_records if record.valid),
+            key=lambda record: (
+                record.timestamp_ns,
+                record.record_type,
+                record.stable_id,
+                record.series_id,
+                record.value,
+            ),
+        )
         produced: dict[str, list[Metric]] = {}
         for output_id in self.order:
             spec = self.specs[output_id]

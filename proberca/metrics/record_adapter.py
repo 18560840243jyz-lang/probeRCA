@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from proberca.data.schema import (
-    PROBERCA_SCHEMA_VERSION, EdgeMetricRecord, NodeMetricRecord,
+    EdgeMetricRecord, METRIC_RECORD_SCHEMA_VERSION, NodeMetricRecord,
 )
 from proberca.k8s.contracts import CallEdgeObservation, canonical_hash
 
@@ -81,11 +81,33 @@ def records_from_samples(spec, samples, revision, window_sec):
             else:
                 raise MetricMappingError("unsupported service_resolution")
             output.append(NodeMetricRecord(
-                PROBERCA_SCHEMA_VERSION, sample.timestamp_ns, window_sec,
-                revision.cluster_id, node_name, namespace, service_name, pod_uid,
-                container_id, spec.metric_family, spec.metric_name, sample.value,
-                spec.unit, 1, 1.0, 0.0, f"prometheus:{spec.spec_id}",
-                spec.metric_kind, spec.expected_scope, bound, is_inf, cumulative, quantile))
+                schema_version=METRIC_RECORD_SCHEMA_VERSION,
+                timestamp_ns=sample.timestamp_ns,
+                window_sec=window_sec,
+                cluster_id=revision.cluster_id,
+                node_name=node_name,
+                namespace=namespace,
+                service_name=service_name,
+                pod_uid=pod_uid,
+                container_id=container_id,
+                metric_family=spec.metric_family,
+                metric_name=spec.metric_name,
+                value=sample.value,
+                valid=True,
+                invalid_reason=None,
+                unit=spec.unit,
+                sample_count=1,
+                coverage=1.0,
+                event_loss_rate=0.0,
+                mapping_quality=1.0,
+                source=f"prometheus:{spec.spec_id}",
+                metric_kind=spec.metric_kind,
+                scope=spec.expected_scope,
+                histogram_upper_bound=bound,
+                histogram_is_inf_bucket=is_inf,
+                histogram_is_cumulative=cumulative,
+                quantile=quantile,
+            ))
         elif spec.record_type == "edge_metric":
             source, destination = labels.get("source"), labels.get("destination")
             protocol = labels.get("protocol")
@@ -95,11 +117,35 @@ def records_from_samples(spec, samples, revision, window_sec):
             if not protocol:
                 raise MetricMappingError("edge protocol is required")
             output.append(EdgeMetricRecord(
-                PROBERCA_SCHEMA_VERSION, sample.timestamp_ns, window_sec,
-                revision.cluster_id, namespace, source, destination, None, None,
-                None, None, protocol, spec.metric_name, sample.value, spec.unit,
-                1, 1.0, 0.0, f"prometheus:{spec.spec_id}", spec.metric_kind,
-                spec.expected_scope, bound, is_inf, cumulative, quantile))
+                schema_version=METRIC_RECORD_SCHEMA_VERSION,
+                timestamp_ns=sample.timestamp_ns,
+                window_sec=window_sec,
+                cluster_id=revision.cluster_id,
+                namespace=namespace,
+                src_service=source,
+                dst_service=destination,
+                src_pod_uid=None,
+                dst_pod_uid=None,
+                src_node=None,
+                dst_node=None,
+                protocol=protocol,
+                metric_name=spec.metric_name,
+                value=sample.value,
+                valid=True,
+                invalid_reason=None,
+                unit=spec.unit,
+                sample_count=1,
+                coverage=1.0,
+                event_loss_rate=0.0,
+                mapping_quality=1.0,
+                source=f"prometheus:{spec.spec_id}",
+                metric_kind=spec.metric_kind,
+                scope=spec.expected_scope,
+                histogram_upper_bound=bound,
+                histogram_is_inf_bucket=is_inf,
+                histogram_is_cumulative=cumulative,
+                quantile=quantile,
+            ))
         else:
             raise MetricMappingError("call_edge samples require CallEdgeProvider")
     return sorted(output, key=lambda item: (item.timestamp_ns, item.record_type, item.stable_id))

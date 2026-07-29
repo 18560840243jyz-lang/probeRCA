@@ -14,8 +14,8 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from proberca.data.schema import (
-    PROBERCA_SCHEMA_VERSION,
     EdgeMetricRecord,
+    METRIC_RECORD_SCHEMA_VERSION,
     NodeMetricRecord,
 )
 
@@ -186,7 +186,9 @@ class FinalAggregationResult:
 
 @dataclass(frozen=True)
 class _Value:
-    value: float
+    value: float | None
+    valid: bool
+    invalid_reason: str | None
     sample_count: int
     coverage: float
     event_loss_rate: float
@@ -194,23 +196,75 @@ class _Value:
     source_ids: frozenset[str]
     object_ids: frozenset[str]
 
-    @property
-    def effective_coverage(self) -> float:
-        return self.coverage * self.mapping_quality
-
-
-def _combine(values: Iterable[_Value], result: float) -> _Value:
+def _combine(
+    values: Iterable[_Value],
+    result: float | None,
+    *,
+    invalid_reason: str | None = None,
+    sample_count: int | None = None,
+) -> _Value:
     items = tuple(values)
     if not items:
         raise RawCollectionError("cannot combine an empty component set")
+    inherited_reason = next(
+        (item.invalid_reason for item in items if not item.valid),
+        None,
+    )
+    reason = invalid_reason or inherited_reason
+    valid = reason is None
+    if valid:
+        if result is None or not math.isfinite(float(result)):
+            raise RawCollectionError("valid aggregate value must be finite")
+        output_value = float(result)
+    else:
+        output_value = None
     return _Value(
-        float(result),
-        sum(item.sample_count for item in items),
-        min(item.coverage for item in items),
-        max(item.event_loss_rate for item in items),
-        min(item.mapping_quality for item in items),
-        frozenset().union(*(item.source_ids for item in items)),
-        frozenset().union(*(item.object_ids for item in items)),
+        value=output_value,
+        valid=valid,
+        invalid_reason=reason,
+        sample_count=(
+            sum(item.sample_count for item in items)
+            if sample_count is None
+            else sample_count
+        ),
+        coverage=min(item.coverage for item in items),
+        event_loss_rate=max(item.event_loss_rate for item in items),
+        mapping_quality=min(item.mapping_quality for item in items),
+        source_ids=frozenset().union(*(item.source_ids for item in items)),
+        object_ids=frozenset().union(*(item.object_ids for item in items)),
+    )
+
+
+def _measured_value(
+    value: float,
+    *,
+    sample_count: int,
+    coverage: float,
+    event_loss_rate: float,
+    mapping_quality: float,
+    source_ids: frozenset[str],
+    object_ids: frozenset[str],
+) -> _Value:
+    valid = coverage > 0.0 and mapping_quality > 0.0
+    invalid_reason = (
+        None
+        if valid
+        else (
+            "zero_coverage"
+            if coverage <= 0.0
+            else "missing_component"
+        )
+    )
+    return _Value(
+        value=float(value) if valid else None,
+        valid=valid,
+        invalid_reason=invalid_reason,
+        sample_count=sample_count,
+        coverage=coverage,
+        event_loss_rate=event_loss_rate,
+        mapping_quality=mapping_quality,
+        source_ids=source_ids,
+        object_ids=object_ids,
     )
 
 
@@ -362,12 +416,22 @@ class FinalWindowAggregator:
                     raise RawCollectionError(
                         f"counter reset in {component}/{series_id}"
                     )
-                component_values[series_id] = _Value(
-                    delta, 1, min(start.coverage, end.coverage),
-                    max(start.event_loss_rate, end.event_loss_rate),
-                    min(start.mapping_quality, end.mapping_quality),
-                    frozenset({start.source_record_id, end.source_record_id}),
-                    frozenset({start.source_object_id, end.source_object_id}),
+                component_values[series_id] = _measured_value(
+                    delta,
+                    sample_count=1,
+                    coverage=min(start.coverage, end.coverage),
+                    event_loss_rate=max(
+                        start.event_loss_rate, end.event_loss_rate,
+                    ),
+                    mapping_quality=min(
+                        start.mapping_quality, end.mapping_quality,
+                    ),
+                    source_ids=frozenset({
+                        start.source_record_id, end.source_record_id,
+                    }),
+                    object_ids=frozenset({
+                        start.source_object_id, end.source_object_id,
+                    }),
                 )
             output[component] = component_values
         return output
@@ -394,17 +458,37 @@ class FinalWindowAggregator:
                         f"ambiguous latest gauge {component}/{series_id}"
                     )
                 item = latest[0]
-                component_values[series_id] = _Value(
-                    item.value, 1, item.coverage, item.event_loss_rate,
-                    item.mapping_quality, frozenset({item.source_record_id}),
-                    frozenset({item.source_object_id}),
+                component_values[series_id] = _measured_value(
+                    item.value,
+                    sample_count=1,
+                    coverage=item.coverage,
+                    event_loss_rate=item.event_loss_rate,
+                    mapping_quality=item.mapping_quality,
+                    source_ids=frozenset({item.source_record_id}),
+                    object_ids=frozenset({item.source_object_id}),
                 )
             output[component] = component_values
         return output
 
     @staticmethod
     def _sum(values: dict[str, _Value]) -> _Value:
-        return _combine(values.values(), sum(item.value for item in values.values()))
+        items = tuple(values.values())
+        if any(not item.valid for item in items):
+            return _combine(items, None)
+        return _combine(items, sum(float(item.value) for item in items))
+
+    @staticmethod
+    def _scale(value: _Value, factor: float) -> _Value:
+        if not value.valid:
+            return _combine((value,), None)
+        return _combine((value,), float(value.value) * factor)
+
+    @staticmethod
+    def _add(values: Iterable[_Value]) -> _Value:
+        items = tuple(values)
+        if any(not item.valid for item in items):
+            return _combine(items, None)
+        return _combine(items, sum(float(item.value) for item in items))
 
     @staticmethod
     def _ratio(
@@ -414,19 +498,15 @@ class FinalWindowAggregator:
         *,
         bounded: bool = True,
     ) -> _Value:
+        if not numerator.valid or not denominator.valid:
+            return _combine((numerator, denominator), None)
         if denominator.value <= 0:
             if numerator.value == 0:
-                combined = _combine((numerator, denominator), 0.0)
-                # A zero denominator has no statistical exposure. Preserve
-                # lineage but mark the derived ratio explicitly missing.
-                return _Value(
-                    0.0,
-                    0,
-                    0.0,
-                    combined.event_loss_rate,
-                    combined.mapping_quality,
-                    combined.source_ids,
-                    combined.object_ids,
+                return _combine(
+                    (numerator, denominator),
+                    None,
+                    invalid_reason="no_exposure",
+                    sample_count=0,
                 )
             raise RawCollectionError(f"{name} has a non-positive denominator")
         result = numerator.value / (denominator.value + RATIO_EPSILON)
@@ -526,13 +606,28 @@ class FinalWindowAggregator:
         )
         cumulative = [merged[key] for key in ordered]
         total = cumulative[-1]
+        quality_value = _measured_value(
+            0.0,
+            sample_count=0,
+            coverage=min(item.coverage for item in qualities),
+            event_loss_rate=max(item.event_loss_rate for item in qualities),
+            mapping_quality=min(item.mapping_quality for item in qualities),
+            source_ids=frozenset(source_ids),
+            object_ids=frozenset(object_ids),
+        )
+        if not quality_value.valid:
+            return _combine(
+                (quality_value,),
+                None,
+                sample_count=max(0, int(total)),
+            )
         if total <= 0:
             if allow_empty and total == 0:
-                return _Value(
-                    0.0, 0, 0.0,
-                    max(item.event_loss_rate for item in qualities),
-                    min(item.mapping_quality for item in qualities),
-                    frozenset(source_ids), frozenset(object_ids),
+                return _combine(
+                    (quality_value,),
+                    None,
+                    invalid_reason="no_exposure",
+                    sample_count=0,
                 )
             raise RawCollectionError(f"{component} histogram has no observations")
         threshold = 0.95 * total
@@ -541,11 +636,14 @@ class FinalWindowAggregator:
         )
         finite = [float(key[0]) for key in ordered if not key[1]]
         value = finite[-1] if selected[1] else float(selected[0])
-        return _Value(
-            value, int(total), min(item.coverage for item in qualities),
-            max(item.event_loss_rate for item in qualities),
-            min(item.mapping_quality for item in qualities),
-            frozenset(source_ids), frozenset(object_ids),
+        return _measured_value(
+            value,
+            sample_count=int(total),
+            coverage=quality_value.coverage,
+            event_loss_rate=quality_value.event_loss_rate,
+            mapping_quality=quality_value.mapping_quality,
+            source_ids=quality_value.source_ids,
+            object_ids=quality_value.object_ids,
         )
 
     def _node_record(
@@ -567,29 +665,32 @@ class FinalWindowAggregator:
             _, cluster, node_name = entity_key
             namespace, service, scope = "_host", node_name, "node"
         return NodeMetricRecord(
-            PROBERCA_SCHEMA_VERSION,
-            window.window_end_ns - 1,
-            1,
-            cluster,
-            node_name,
-            namespace,
-            service,
-            None,
-            None,
-            metric_family,
-            metric_name,
-            value.value,
-            unit,
-            value.sample_count,
-            value.effective_coverage,
-            value.event_loss_rate,
-            FINAL_OUTPUT_SOURCE,
-            metric_kind,
-            scope,
-            None,
-            False,
-            None,
-            quantile,
+            schema_version=METRIC_RECORD_SCHEMA_VERSION,
+            timestamp_ns=window.window_end_ns - 1,
+            window_sec=1,
+            cluster_id=cluster,
+            node_name=node_name,
+            namespace=namespace,
+            service_name=service,
+            pod_uid=None,
+            container_id=None,
+            metric_family=metric_family,
+            metric_name=metric_name,
+            value=value.value,
+            valid=value.valid,
+            invalid_reason=value.invalid_reason,
+            unit=unit,
+            sample_count=value.sample_count,
+            coverage=value.coverage,
+            event_loss_rate=value.event_loss_rate,
+            mapping_quality=value.mapping_quality,
+            source=FINAL_OUTPUT_SOURCE,
+            metric_kind=metric_kind,
+            scope=scope,
+            histogram_upper_bound=None,
+            histogram_is_inf_bucket=False,
+            histogram_is_cumulative=None,
+            quantile=quantile,
         )
 
     @staticmethod
@@ -612,9 +713,12 @@ class FinalWindowAggregator:
         request_total = self._sum(request["request_total"])
         errors = self._sum(request["request_error_total"])
         timeouts = self._sum(request["request_timeout_total"])
-        request_rate = _combine((request_total,), request_total.value)
+        request_rate = _combine(
+            (request_total,),
+            request_total.value if request_total.valid else None,
+        )
         request_failure = self._ratio(
-            _combine((errors, timeouts), errors.value + timeouts.value),
+            self._add((errors, timeouts)),
             request_total,
             "request_failure_rate",
         )
@@ -622,7 +726,11 @@ class FinalWindowAggregator:
             window, samples, "request_latency_histogram",
             set(request["request_total"]), allow_empty=True,
         )
-        if request_p95.sample_count != request_total.value:
+        if (
+            request_p95.valid
+            and request_total.valid
+            and request_p95.sample_count != request_total.value
+        ):
             raise RawCollectionError(
                 "service request histogram count does not match request_total"
             )
@@ -643,10 +751,9 @@ class FinalWindowAggregator:
         )
         cpu_time = self._sum(cpu["cpu_time_ns_total"])
         cpu_cores = self._sum(allocation["allocated_cpu_cores"])
-        cpu_denominator = _combine(
-            (cpu_cores,), cpu_cores.value * (
-                window.window_end_ns - window.window_start_ns
-            )
+        cpu_denominator = self._scale(
+            cpu_cores,
+            window.window_end_ns - window.window_start_ns,
         )
         cpu_usage = self._ratio(
             cpu_time, cpu_denominator, "cpu_usage_rate", bounded=False
@@ -710,13 +817,18 @@ class FinalWindowAggregator:
         # symptom (for example, a drop followed by a reset).  The metric is a
         # failed-operation ratio, so conservatively de-duplicate overlapping
         # symptom counters at the number of observed operations.
-        local_failed_operations = _combine(
-            local_bad,
-            min(
-                sum(item.value for item in local_bad),
-                socket_operations.value,
-            ),
-        )
+        if any(not item.valid for item in (*local_bad, socket_operations)):
+            local_failed_operations = _combine(
+                (*local_bad, socket_operations), None,
+            )
+        else:
+            local_failed_operations = _combine(
+                local_bad,
+                min(
+                    sum(float(item.value) for item in local_bad),
+                    float(socket_operations.value),
+                ),
+            )
         local_failure = self._ratio(
             local_failed_operations,
             socket_operations,
@@ -753,17 +865,17 @@ class FinalWindowAggregator:
         )
         self._series_sets_equal(pressure, tuple(pressure))
         window_ns = float(window.window_end_ns - window.window_start_ns)
-        cpu = _combine(
-            (self._sum(pressure["node_cpu_psi_some_ns_total"]),),
-            self._sum(pressure["node_cpu_psi_some_ns_total"]).value / window_ns,
+        cpu = self._scale(
+            self._sum(pressure["node_cpu_psi_some_ns_total"]),
+            1.0 / window_ns,
         )
-        memory = _combine(
-            (self._sum(pressure["node_memory_psi_some_ns_total"]),),
-            self._sum(pressure["node_memory_psi_some_ns_total"]).value / window_ns,
+        memory = self._scale(
+            self._sum(pressure["node_memory_psi_some_ns_total"]),
+            1.0 / window_ns,
         )
-        io = _combine(
-            (self._sum(pressure["node_io_psi_some_ns_total"]),),
-            self._sum(pressure["node_io_psi_some_ns_total"]).value / window_ns,
+        io = self._scale(
+            self._sum(pressure["node_io_psi_some_ns_total"]),
+            1.0 / window_ns,
         )
         nic = self._deltas(
             window, samples,
@@ -772,10 +884,7 @@ class FinalWindowAggregator:
         )
         self._series_sets_equal(nic, tuple(nic))
         nic_parts = tuple(self._sum(nic[name]) for name in nic)
-        nic_rate = _combine(
-            nic_parts,
-            sum(item.value for item in nic_parts),
-        )
+        nic_rate = self._add(nic_parts)
         outputs = (
             ("cpu", "cpu_psi", cpu, "ratio"),
             ("memory", "memory_psi", memory, "ratio"),
@@ -802,31 +911,34 @@ class FinalWindowAggregator:
             protocol,
         ) = entity_key
         return EdgeMetricRecord(
-            PROBERCA_SCHEMA_VERSION,
-            window.window_end_ns - 1,
-            1,
-            cluster,
-            namespace,
-            source,
-            destination,
-            None,
-            None,
-            None,
-            None,
-            protocol,
-            metric_name,
-            value.value,
-            unit,
-            value.sample_count,
-            value.effective_coverage,
-            value.event_loss_rate,
-            FINAL_OUTPUT_SOURCE,
-            metric_kind,
-            "service_pair",
-            None,
-            False,
-            None,
-            quantile,
+            schema_version=METRIC_RECORD_SCHEMA_VERSION,
+            timestamp_ns=window.window_end_ns - 1,
+            window_sec=1,
+            cluster_id=cluster,
+            namespace=namespace,
+            src_service=source,
+            dst_service=destination,
+            src_pod_uid=None,
+            dst_pod_uid=None,
+            src_node=None,
+            dst_node=None,
+            protocol=protocol,
+            metric_name=metric_name,
+            value=value.value,
+            valid=value.valid,
+            invalid_reason=value.invalid_reason,
+            unit=unit,
+            sample_count=value.sample_count,
+            coverage=value.coverage,
+            event_loss_rate=value.event_loss_rate,
+            mapping_quality=value.mapping_quality,
+            source=FINAL_OUTPUT_SOURCE,
+            metric_kind=metric_kind,
+            scope="service_pair",
+            histogram_upper_bound=None,
+            histogram_is_inf_bucket=False,
+            histogram_is_cumulative=None,
+            quantile=quantile,
         )
 
     def _edge(self, window, entity_key, samples):
@@ -861,23 +973,30 @@ class FinalWindowAggregator:
                 window, samples, "dns_success_latency_histogram",
                 set(values["dns_query_total"]), allow_empty=True,
             )
-            if count.value == 0:
-                if any(item.value != 0 for item in bad) \
+            if count.valid and count.value == 0:
+                if any(item.valid and item.value != 0 for item in bad) \
                         or latency.sample_count != 0:
                     raise RawCollectionError(
                         "inactive DNS edge has failure/latency observations"
                     )
             if (
-                latency.sample_count != success.value
-                or success.value + sum(item.value for item in bad)
-                != count.value
+                latency.valid
+                and success.valid
+                and count.valid
+                and all(item.valid for item in bad)
+                and (
+                    latency.sample_count != success.value
+                    or success.value
+                    + sum(float(item.value) for item in bad)
+                    != count.value
+                )
             ):
                 raise RawCollectionError(
                     "DNS successful latency plus final failures does not "
                     "match logical query_total"
                 )
             failure = self._ratio(
-                _combine(bad, sum(item.value for item in bad)),
+                self._add(bad),
                 count,
                 "dns_failure_rate",
             )
@@ -905,18 +1024,22 @@ class FinalWindowAggregator:
                 window, samples, "edge_latency_histogram",
                 set(values["edge_request_total"]), allow_empty=True,
             )
-            if count.value == 0:
-                if any(item.value != 0 for item in bad) \
+            if count.valid and count.value == 0:
+                if any(item.valid and item.value != 0 for item in bad) \
                         or latency.sample_count != 0:
                     raise RawCollectionError(
                         "inactive TCP edge has failure/latency observations"
                     )
-            if latency.sample_count != count.value:
+            if (
+                latency.valid
+                and count.valid
+                and latency.sample_count != count.value
+            ):
                 raise RawCollectionError(
                     "TCP latency histogram count does not match request_total"
                 )
             failure = self._ratio(
-                _combine(bad, sum(item.value for item in bad)),
+                self._add(bad),
                 count,
                 "edge_failure_rate",
             )

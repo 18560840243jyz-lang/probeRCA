@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from .contracts import (
+    COLLECTED_WINDOW_SCHEMA_VERSION,
     CollectedWindow,
+    LEGACY_COLLECTED_WINDOW_SCHEMA_VERSION,
     assert_label_safe,
     canonical_json,
     fingerprint,
@@ -21,6 +23,8 @@ from .contracts import (
 
 MANIFEST_NAME = "collection-manifest.json"
 WINDOWS_NAME = "collected-windows.jsonl"
+COLLECTION_ARCHIVE_SCHEMA_VERSION = "probeRCA-dataplane-archive-v3"
+LEGACY_COLLECTION_ARCHIVE_SCHEMA_VERSION = "probeRCA-dataplane-archive-v2"
 
 
 class CollectionArchiveError(ValueError):
@@ -677,7 +681,10 @@ class CollectionArchive:
         return archive
 
     def validate(self) -> None:
-        if self.schema_version != "probeRCA-dataplane-archive-v2":
+        if self.schema_version not in {
+            COLLECTION_ARCHIVE_SCHEMA_VERSION,
+            LEGACY_COLLECTION_ARCHIVE_SCHEMA_VERSION,
+        }:
             raise CollectionArchiveError("unsupported collection archive schema")
         if self.sealed is not True:
             raise CollectionArchiveNotSealedError("collection manifest is not sealed")
@@ -733,6 +740,15 @@ class CollectionArchive:
                     raise CollectionArchiveIntegrityError(
                         f"invalid collected window line {line_number}: {error}"
                     ) from error
+                expected_window_schema = (
+                    COLLECTED_WINDOW_SCHEMA_VERSION
+                    if self.schema_version == COLLECTION_ARCHIVE_SCHEMA_VERSION
+                    else LEGACY_COLLECTED_WINDOW_SCHEMA_VERSION
+                )
+                if window.schema_version != expected_window_schema:
+                    raise CollectionArchiveIntegrityError(
+                        "window schema conflicts with archive schema"
+                    )
                 if window.cluster_id != self.cluster_id:
                     raise CollectionArchiveIntegrityError("window cluster conflicts with archive")
                 if window.sequence != previous_sequence + 1:
@@ -824,6 +840,10 @@ class CollectionArchiveWriter:
         if not isinstance(window, CollectedWindow):
             raise TypeError("data plane accepts only CollectedWindow")
         window.validate()
+        if window.schema_version != COLLECTED_WINDOW_SCHEMA_VERSION:
+            raise CollectionArchiveError(
+                "new collection writers accept only current-schema windows"
+            )
         _validate_window_contract(window, self.collection_contract)
         topology_additions = self._topology_tracker.prepare(
             window.topology_events
@@ -895,7 +915,7 @@ class CollectionArchiveWriter:
                 for item in (*window.node_metrics, *window.edge_metrics, *window.burst_evidence)
             }))
             payload = {
-                "schema_version": "probeRCA-dataplane-archive-v2",
+                "schema_version": COLLECTION_ARCHIVE_SCHEMA_VERSION,
                 "dataset_id": self.dataset_id,
                 "cluster_id": first.cluster_id,
                 "namespaces": list(namespaces),

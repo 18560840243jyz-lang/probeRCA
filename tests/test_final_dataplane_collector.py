@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -23,7 +25,12 @@ from proberca.dataplane.burst_live import (
 )
 from proberca.dataplane.collector import FinalDataPlaneCollector
 from proberca.dataplane.collector import FinalLiveCollectorConfig
-from proberca.dataplane.contracts import fingerprint
+from proberca.dataplane.contracts import canonical_json, fingerprint
+from proberca.data.schema import (
+    METRIC_INVALID_REASONS,
+    METRIC_RECORD_SCHEMA_VERSION,
+    NodeMetricRecord,
+)
 from proberca.dataplane.final_aggregation import COMPONENTS, FinalWindowAggregator
 from proberca.dataplane.raw import (
     RawCollectionError,
@@ -450,7 +457,7 @@ def test_local_socket_failure_events_are_deduplicated_per_operation(contract):
     assert value == pytest.approx(1.0)
 
 
-def test_idle_pressure_and_lock_zero_over_zero_use_formula_epsilon(contract):
+def test_idle_pressure_and_lock_zero_over_zero_are_no_exposure(contract):
     raw = _raw_window()
     targets = {
         "io_psi_some_ns_total",
@@ -488,12 +495,14 @@ def test_idle_pressure_and_lock_zero_over_zero_use_formula_epsilon(contract):
     )
     result = FinalWindowAggregator(contract).aggregate(idle)
     values = {
-        item.metric_name: item.value
+        item.metric_name: item
         for item in result.node_metrics
         if item.service_name == "frontend"
     }
-    assert values["io_psi"] == 0.0
-    assert values["futex_wait_time_rate"] == 0.0
+    for name in ("io_psi", "futex_wait_time_rate"):
+        assert values[name].value is None
+        assert values[name].valid is False
+        assert values[name].invalid_reason == "no_exposure"
 
 
 def test_counter_reset_missing_component_and_wrong_unit_fail_closed(contract):
@@ -575,6 +584,11 @@ def test_collector_builds_versioned_topology_and_seals(contract, tmp_path):
         inventory_at_start=_revision(),
         inventory_at_end=_revision(),
     )
+    assert window.schema_version == "probeRCA-dataplane-window-v3"
+    assert all(
+        item.schema_version == METRIC_RECORD_SCHEMA_VERSION
+        for item in (*window.node_metrics, *window.edge_metrics)
+    )
     snapshot = window.topology_events[0]
     assert len(snapshot.services) == 2
     assert {item.protocol for item in snapshot.call_edges} == {"tcp"}
@@ -615,6 +629,7 @@ def test_collector_builds_versioned_topology_and_seals(contract, tmp_path):
     )
     writer.append(window)
     archive = writer.seal()
+    assert archive.schema_version == "probeRCA-dataplane-archive-v3"
     assert archive.window_count == 1
     assert archive.dataset_id == dataset_id
     assert archive.windows_sha256 == hashlib.sha256(
@@ -628,6 +643,171 @@ def test_collector_builds_versioned_topology_and_seals(contract, tmp_path):
     assert tuple(
         item.to_dict() for item in reloaded.iter_windows()
     ) == (window.to_dict(),)
+
+
+def test_new_archive_serializes_null_and_legacy_v2_is_projected_in_memory(
+    contract,
+    tmp_path,
+):
+    samples = []
+    _service_samples(
+        samples, "frontend", "node-a", series="frontend-series",
+        request_delta=0, error_delta=0,
+        request_histogram_deltas=(0, 0, 0),
+    )
+    _service_samples(
+        samples, "payment", "node-b", series="payment-series",
+    )
+    _host_samples(samples, "node-a")
+    _host_samples(samples, "node-b")
+    _edge_samples(
+        samples, "tcp", count_delta=0, error_delta=0,
+        timeout_delta=0, histogram_deltas=(0, 0, 0),
+    )
+    raw = RawCollectionWindow.create(
+        sequence=1,
+        window_start_ns=START,
+        window_end_ns=END,
+        cluster_id=CLUSTER,
+        samples=samples,
+    )
+    collector = FinalDataPlaneCollector(
+        collection_contract=contract,
+        collector_build_id=fingerprint({"build": "missing-value-test"}),
+    )
+    window = collector.assemble(
+        raw_window=raw,
+        inventory_at_start=_revision(),
+        inventory_at_end=_revision(),
+    )
+    current_root = tmp_path / "current"
+    current = CollectionArchiveWriter(
+        current_root,
+        dataset_id=fingerprint({"dataset": "missing-value-current"}),
+        collection_contract=contract,
+        source_description=contract["source_description"],
+        collection_metadata=window.collection_metadata,
+    )
+    current.append(window)
+    current_archive = current.seal()
+    raw_json = (
+        current_archive.root / current_archive.windows_file
+    ).read_text(encoding="utf-8")
+    payload = json.loads(raw_json)
+    invalid_records = [
+        item
+        for item in (*payload["node_metrics"], *payload["edge_metrics"])
+        if item["valid"] is False
+    ]
+    assert invalid_records
+    assert all(item["value"] is None for item in invalid_records)
+    assert {
+        item["invalid_reason"] for item in invalid_records
+    } == {"no_exposure"}
+    assert '"value":null' in raw_json
+    assert '"valid":false' in raw_json
+    assert '"invalid_reason":"no_exposure"' in raw_json
+
+    reloaded_window = next(current_archive.iter_windows())
+    assert any(
+        item.value is None
+        and item.valid is False
+        and item.invalid_reason == "no_exposure"
+        for item in (
+            *reloaded_window.node_metrics,
+            *reloaded_window.edge_metrics,
+        )
+    )
+    services = {}
+    hosts = {}
+    for item in reloaded_window.node_metrics:
+        target = services if item.scope == "service" else hosts
+        target.setdefault(item.stable_id.rsplit("::", 1)[0], set()).add(
+            item.metric_name
+        )
+    edges = {}
+    for item in reloaded_window.edge_metrics:
+        edge_id = (
+            item.cluster_id,
+            item.namespace,
+            item.src_service,
+            item.dst_service,
+            item.protocol,
+        )
+        edges.setdefault(edge_id, set()).add(item.metric_name)
+    assert all(len(names) == 9 for names in services.values())
+    assert all(len(names) == 4 for names in hosts.values())
+    assert all(len(names) == 3 for names in edges.values())
+
+    legacy_window = window.to_dict()
+    for item in (
+        *legacy_window["node_metrics"],
+        *legacy_window["edge_metrics"],
+    ):
+        if item["valid"] is False:
+            item["value"] = 0.0
+            item["sample_count"] = 0
+            item["coverage"] = 0.0
+        item["schema_version"] = "1.0"
+        item.pop("valid")
+        item.pop("invalid_reason")
+        item.pop("mapping_quality")
+    legacy_window["schema_version"] = "probeRCA-dataplane-window-v2"
+    legacy_window.pop("window_fingerprint")
+    legacy_window["window_fingerprint"] = fingerprint(legacy_window)
+    legacy_root = tmp_path / "legacy-v2"
+    legacy_root.mkdir()
+    legacy_windows_path = legacy_root / "collected-windows.jsonl"
+    legacy_windows_path.write_text(
+        canonical_json(legacy_window) + "\n",
+        encoding="utf-8",
+    )
+    legacy_sha = hashlib.sha256(legacy_windows_path.read_bytes()).hexdigest()
+    manifest = json.loads(
+        (current_archive.root / "collection-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    manifest.update(
+        schema_version="probeRCA-dataplane-archive-v2",
+        windows_sha256=legacy_sha,
+    )
+    manifest.pop("manifest_fingerprint")
+    manifest["manifest_fingerprint"] = fingerprint(manifest)
+    (legacy_root / "collection-manifest.json").write_text(
+        canonical_json(manifest) + "\n",
+        encoding="utf-8",
+    )
+
+    legacy_archive = CollectionArchive.load(legacy_root)
+    projected = next(legacy_archive.iter_windows())
+    assert hashlib.sha256(legacy_windows_path.read_bytes()).hexdigest() == legacy_sha
+    assert (
+        legacy_archive.collection_contract_fingerprint
+        == manifest["collection_contract_fingerprint"]
+    )
+    assert projected.to_dict() == legacy_window
+    edge_records = {
+        item.metric_name: item for item in projected.edge_metrics
+    }
+    assert edge_records["edge_request_count"].value == 0.0
+    assert edge_records["edge_request_count"].valid is True
+    for name in ("edge_latency_p95", "edge_failure_rate"):
+        assert edge_records[name].value is None
+        assert edge_records[name].valid is False
+        assert edge_records[name].invalid_reason == "no_exposure"
+    new_writer = CollectionArchiveWriter(
+        tmp_path / "must-not-reseal-legacy",
+        dataset_id=fingerprint({"dataset": "must-not-reseal-legacy"}),
+        collection_contract=contract,
+        source_description=contract["source_description"],
+        collection_metadata=projected.collection_metadata,
+    )
+    with pytest.raises(
+        ValueError,
+        match="only current-schema windows",
+    ):
+        new_writer.append(projected)
 
 
 def test_global_resource_watermark_change_does_not_fake_layout_change(
@@ -668,7 +848,7 @@ def test_runtime_identity_change_inside_window_is_rejected(contract):
         )
 
 
-def test_empty_service_histogram_has_zero_coverage_not_imputation(
+def test_empty_service_window_distinguishes_zero_count_from_no_exposure(
     contract,
 ):
     samples = []
@@ -688,14 +868,20 @@ def test_empty_service_histogram_has_zero_coverage_not_imputation(
     )
     metrics = {item.metric_name: item for item in result.node_metrics}
     assert len(metrics) == 9
-    assert metrics["request_rate"].value == 0
-    assert metrics["request_failure_rate"].value == 0
+    assert metrics["request_rate"].value == 0.0
+    assert metrics["request_rate"].valid is True
+    assert metrics["request_rate"].invalid_reason is None
+    assert metrics["request_failure_rate"].value is None
+    assert metrics["request_failure_rate"].valid is False
+    assert metrics["request_failure_rate"].invalid_reason == "no_exposure"
     assert metrics["request_failure_rate"].sample_count == 0
-    assert metrics["request_failure_rate"].coverage == 0
+    assert metrics["request_failure_rate"].coverage > 0
     latency = metrics["request_latency_p95"]
-    assert latency.value == 0
+    assert latency.value is None
+    assert latency.valid is False
+    assert latency.invalid_reason == "no_exposure"
     assert latency.sample_count == 0
-    assert latency.coverage == 0
+    assert latency.coverage > 0
 
 
 def test_inactive_edge_keeps_stable_identity_with_missing_latency(
@@ -727,11 +913,193 @@ def test_inactive_edge_keeps_stable_identity_with_missing_latency(
     assert set(metrics) == {
         "edge_request_count", "edge_latency_p95", "edge_failure_rate",
     }
-    assert metrics["edge_request_count"].value == 0
-    assert metrics["edge_failure_rate"].value == 0
+    assert metrics["edge_request_count"].value == 0.0
+    assert metrics["edge_request_count"].valid is True
+    assert metrics["edge_request_count"].invalid_reason is None
+    assert metrics["edge_failure_rate"].value is None
+    assert metrics["edge_failure_rate"].valid is False
+    assert metrics["edge_failure_rate"].invalid_reason == "no_exposure"
     assert metrics["edge_failure_rate"].sample_count == 0
-    assert metrics["edge_failure_rate"].coverage == 0
-    assert metrics["edge_latency_p95"].coverage == 0
+    assert metrics["edge_failure_rate"].coverage > 0
+    assert metrics["edge_latency_p95"].value is None
+    assert metrics["edge_latency_p95"].valid is False
+    assert metrics["edge_latency_p95"].invalid_reason == "no_exposure"
+    assert metrics["edge_latency_p95"].coverage > 0
+
+
+def test_metric_record_validity_invariants(contract):
+    record = FinalWindowAggregator(contract).aggregate(
+        _raw_window(include_dns=False)
+    ).node_metrics[0]
+    assert isinstance(record, NodeMetricRecord)
+    assert record.schema_version == METRIC_RECORD_SCHEMA_VERSION
+    assert record.valid is True
+    assert record.invalid_reason is None
+
+    with pytest.raises((TypeError, ValueError)):
+        replace(record, value=None)
+    with pytest.raises(ValueError, match="value=None"):
+        replace(
+            record,
+            value=0.0,
+            valid=False,
+            invalid_reason="no_exposure",
+        )
+    with pytest.raises(ValueError, match="must not have invalid_reason"):
+        replace(record, invalid_reason="no_exposure")
+    with pytest.raises(ValueError, match="non-empty invalid_reason"):
+        replace(record, value=None, valid=False, invalid_reason=None)
+    with pytest.raises(ValueError, match="non-empty invalid_reason"):
+        replace(record, value=None, valid=False, invalid_reason="")
+    with pytest.raises(ValueError, match="finite"):
+        replace(record, value=float("nan"))
+    with pytest.raises(ValueError, match="finite"):
+        replace(record, value=float("inf"))
+    with pytest.raises(ValueError, match="unsupported metric invalid_reason"):
+        replace(
+            record,
+            value=None,
+            valid=False,
+            invalid_reason="unknown_reason",
+        )
+    for reason in {
+        "no_exposure",
+        "zero_coverage",
+        "insufficient_sample_count",
+        "excessive_event_loss",
+        "missing_component",
+    }:
+        projected = replace(
+            record,
+            value=None,
+            valid=False,
+            invalid_reason=reason,
+        )
+        assert projected.invalid_reason in METRIC_INVALID_REASONS
+
+
+def test_zero_socket_operations_are_no_exposure(contract):
+    samples = []
+    _service_samples(
+        samples,
+        "frontend",
+        "node-a",
+        series="frontend-series",
+        socket_failure_deltas=(0, 0, 0, 0),
+        socket_ops_delta=0,
+    )
+    result = FinalWindowAggregator(contract).aggregate(
+        RawCollectionWindow.create(
+            sequence=1,
+            window_start_ns=START,
+            window_end_ns=END,
+            cluster_id=CLUSTER,
+            samples=samples,
+        )
+    )
+    record = next(
+        item for item in result.node_metrics
+        if item.metric_name == "local_socket_failure_rate"
+    )
+    assert record.value is None
+    assert record.valid is False
+    assert record.invalid_reason == "no_exposure"
+    assert record.coverage > 0
+
+
+def test_positive_requests_with_zero_failures_are_valid_zero(contract):
+    samples = []
+    _service_samples(
+        samples,
+        "frontend",
+        "node-a",
+        series="frontend-series",
+        request_delta=100,
+        error_delta=0,
+    )
+    result = FinalWindowAggregator(contract).aggregate(
+        RawCollectionWindow.create(
+            sequence=1,
+            window_start_ns=START,
+            window_end_ns=END,
+            cluster_id=CLUSTER,
+            samples=samples,
+        )
+    )
+    record = next(
+        item for item in result.node_metrics
+        if item.metric_name == "request_failure_rate"
+    )
+    assert record.value == 0.0
+    assert record.valid is True
+    assert record.invalid_reason is None
+
+
+def test_zero_input_coverage_is_explicitly_invalid(contract):
+    raw = _raw_window(include_dns=False)
+    samples = []
+    for item in raw.samples:
+        if (
+            item.component == "request_total"
+            and item.service_name == "frontend"
+        ):
+            payload = item.to_dict()
+            payload["coverage"] = 0.0
+            payload.pop("source_record_id")
+            item = RawMetricSample.create(**payload)
+        samples.append(item)
+    result = FinalWindowAggregator(contract).aggregate(
+        RawCollectionWindow.create(
+            sequence=1,
+            window_start_ns=START,
+            window_end_ns=END,
+            cluster_id=CLUSTER,
+            samples=samples,
+        )
+    )
+    record = next(
+        item for item in result.node_metrics
+        if item.service_name == "frontend"
+        and item.metric_name == "request_rate"
+    )
+    assert record.value is None
+    assert record.valid is False
+    assert record.invalid_reason == "zero_coverage"
+    assert record.coverage == 0.0
+
+
+def test_coverage_and_mapping_quality_remain_separate(contract):
+    raw = _raw_window(include_dns=False)
+    samples = []
+    for item in raw.samples:
+        if (
+            item.component == "request_total"
+            and item.service_name == "frontend"
+        ):
+            payload = item.to_dict()
+            payload["coverage"] = 0.8
+            payload["mapping_quality"] = 0.5
+            payload.pop("source_record_id")
+            item = RawMetricSample.create(**payload)
+        samples.append(item)
+    result = FinalWindowAggregator(contract).aggregate(
+        RawCollectionWindow.create(
+            sequence=1,
+            window_start_ns=START,
+            window_end_ns=END,
+            cluster_id=CLUSTER,
+            samples=samples,
+        )
+    )
+    record = next(
+        item for item in result.node_metrics
+        if item.service_name == "frontend"
+        and item.metric_name == "request_rate"
+    )
+    assert record.valid is True
+    assert record.value == 100.0
+    assert record.coverage == pytest.approx(0.8)
+    assert record.mapping_quality == pytest.approx(0.5)
 
 
 def _calibrations(contract):

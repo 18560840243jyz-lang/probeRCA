@@ -144,6 +144,8 @@ class RobustBaselineStore:
     def update(self, record: Metric, spec: MetricSignalSpec, *, state: str,
                frozen_ids: set[str] | None = None) -> bool:
         _validate_record_spec(record, spec)
+        if not record.valid:
+            return False
         if state not in {"healthy", "edge_anomaly"}:
             return False
         if state == "edge_anomaly" and isinstance(record, NodeMetricRecord):
@@ -174,6 +176,16 @@ class RobustBaselineStore:
 
     def score(self, record: Metric, spec: MetricSignalSpec, start_ns: int, end_ns: int) -> BaselineScoreResult:
         _validate_record_spec(record, spec)
+        if not record.valid:
+            return BaselineScoreResult(None, [
+                AggregationIssue(
+                    record.stable_id,
+                    start_ns,
+                    end_ns,
+                    record.invalid_reason,
+                    {"source": "data_plane"},
+                ),
+            ])
         if not self.is_ready(record.stable_id):
             return BaselineScoreResult(None, [AggregationIssue(record.stable_id, start_ns, end_ns,
                                                                  "baseline_not_ready", {"count": len(self._buffers.get(record.stable_id, []))})])
