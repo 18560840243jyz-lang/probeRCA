@@ -9,6 +9,8 @@ aggregation semantics unverifiable.
 from __future__ import annotations
 
 import re
+import math
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -146,6 +148,7 @@ class PrometheusSourceConfig:
     maximum_sample_age_sec: float
     reject_warnings: bool
     queries: tuple[PrometheusPrimitiveQuery, ...]
+    range_query_chunk_windows: int = 120
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PrometheusSourceConfig":
@@ -189,6 +192,12 @@ class PrometheusSourceConfig:
             )
         if type(self.reject_warnings) is not bool:
             raise RawCollectionError("reject_warnings must be boolean")
+        if isinstance(self.range_query_chunk_windows, bool) \
+                or not isinstance(self.range_query_chunk_windows, int) \
+                or self.range_query_chunk_windows <= 0:
+            raise RawCollectionError(
+                "range_query_chunk_windows must be a positive integer"
+            )
         if not self.queries:
             raise RawCollectionError("Prometheus source requires queries")
         query_ids = [item.query_id for item in self.queries]
@@ -208,6 +217,7 @@ class PrometheusSourceConfig:
             "timeout_sec": self.timeout_sec,
             "maximum_sample_age_sec": self.maximum_sample_age_sec,
             "reject_warnings": self.reject_warnings,
+            "range_query_chunk_windows": self.range_query_chunk_windows,
             "queries": [item.to_dict() for item in self.queries],
         })
 
@@ -260,21 +270,38 @@ class PrometheusPrimitiveSource:
         self._source_object_ids: dict[
             tuple[str, tuple[tuple[str, str], ...]], str
         ] = {}
+        self.last_range_query_stats: dict[str, Any] = {}
 
-    def _instant(self, query: PrometheusPrimitiveQuery, timestamp_ns: int):
+    def _range(
+        self,
+        query: PrometheusPrimitiveQuery,
+        *,
+        expected_timestamps_ns: tuple[int, ...],
+    ):
+        if not expected_timestamps_ns:
+            raise RawCollectionError("Prometheus range request is empty")
         maximum_age = float(self.config.maximum_sample_age_sec)
         fresh_promql = (
             f"({query.promql}) and "
             f"((time() - timestamp({query.promql})) <= {maximum_age:.9f})"
         )
+        started = time.perf_counter()
         response = self.session.get(
-            self.config.base_url.rstrip("/") + "/api/v1/query",
+            self.config.base_url.rstrip("/") + "/api/v1/query_range",
             params={
                 "query": fresh_promql,
-                "time": f"{timestamp_ns / 1_000_000_000:.9f}",
+                "start": (
+                    f"{expected_timestamps_ns[0] / 1_000_000_000:.9f}"
+                ),
+                "end": (
+                    f"{expected_timestamps_ns[-1] / 1_000_000_000:.9f}"
+                ),
+                "step": "1",
             },
             timeout=float(self.config.timeout_sec),
         )
+        elapsed = time.perf_counter() - started
+        response_bytes = len(getattr(response, "content", b"") or b"")
         if response.status_code >= 400:
             raise RawCollectionError(
                 f"Prometheus query {query.query_id} failed "
@@ -293,18 +320,23 @@ class PrometheusPrimitiveSource:
                 f"Prometheus query {query.query_id} returned warnings"
             )
         data = payload.get("data") or {}
-        if data.get("resultType") not in {"vector", "matrix"}:
+        if data.get("resultType") != "matrix":
             raise RawCollectionError(
                 f"Prometheus query {query.query_id} returned unsupported result type"
             )
         output = []
+        expected = set(expected_timestamps_ns)
+        seen: set[tuple[tuple[tuple[str, str], ...], int]] = set()
+        returned_timestamps: set[int] = set()
         for series in data.get("result") or []:
             labels = series.get("metric") or {}
             if not isinstance(labels, dict):
                 raise RawCollectionError("Prometheus labels are invalid")
             values = series.get("values")
-            if values is None:
-                values = [series.get("value")]
+            if not isinstance(values, list):
+                raise RawCollectionError(
+                    "Prometheus range series lacks values"
+                )
             for pair in values:
                 if not isinstance(pair, list) or len(pair) != 2:
                     raise RawCollectionError("Prometheus sample is invalid")
@@ -315,8 +347,30 @@ class PrometheusPrimitiveSource:
                     raise RawCollectionError(
                         "Prometheus sample is not numeric"
                     ) from error
+                if observed_ns not in expected:
+                    raise RawCollectionError(
+                        f"query {query.query_id} returned a chunk-external "
+                        f"timestamp {observed_ns}"
+                    )
+                if not math.isfinite(value):
+                    raise RawCollectionError(
+                        f"query {query.query_id} returned a stale/non-finite sample"
+                    )
+                identity = tuple(sorted(labels.items())), observed_ns
+                if identity in seen:
+                    raise RawCollectionError(
+                        f"query {query.query_id} returned a duplicate sample"
+                    )
+                seen.add(identity)
+                returned_timestamps.add(observed_ns)
                 output.append((labels, observed_ns, value))
-        return tuple(output)
+        missing = sorted(expected - returned_timestamps)
+        if missing:
+            raise RawCollectionError(
+                f"query {query.query_id} omitted evaluation timestamps "
+                f"{missing}"
+            )
+        return tuple(output), elapsed, response_bytes
 
     @staticmethod
     def _semantic_labels(
@@ -514,6 +568,13 @@ class PrometheusPrimitiveSource:
             raw_bound = semantic.get("histogram_upper_bound")
             if raw_bound is None:
                 raise RawCollectionError("histogram sample lacks a boundary")
+            histogram_consistent = (
+                semantic.get("histogram_consistent") or "1"
+            )
+            if histogram_consistent not in {"0", "1"}:
+                raise RawCollectionError(
+                    "histogram consistency label must be zero or one"
+                )
             is_inf = raw_bound.casefold() in {"+inf", "inf"}
             common.update(
                 histogram_upper_bound=(
@@ -521,6 +582,7 @@ class PrometheusPrimitiveSource:
                     else float(raw_bound) * float(query.histogram_bound_scale)
                 ),
                 histogram_is_inf_bucket=is_inf,
+                histogram_consistent=histogram_consistent == "1",
             )
         return RawMetricSample.create(**common)
 
@@ -616,12 +678,12 @@ class PrometheusPrimitiveSource:
             item.series_id, item.sortable_bucket_key,
         )))
 
-    def collect_windows(
+    def iter_collect_window_chunks(
         self,
         *,
         bounds: tuple[tuple[int, int], ...],
         inventory_revision: RuntimeIdentityResolver,
-    ) -> tuple[tuple[RawMetricSample, ...], ...]:
+    ):
         if not bounds or any(
             isinstance(start_ns, bool)
             or isinstance(end_ns, bool)
@@ -633,46 +695,107 @@ class PrometheusPrimitiveSource:
             raise RawCollectionError(
                 "Prometheus batch bounds must be non-empty valid windows"
             )
-        unique_jobs = {}
-        for start_ns, end_ns in bounds:
-            for query, spec, requested_ns in self._jobs(
-                start_ns, end_ns,
-            ):
-                unique_jobs.setdefault(
-                    (query.query_id, requested_ns),
-                    (query, spec, requested_ns),
-                )
-        ordered_jobs = tuple(
-            unique_jobs[key] for key in sorted(unique_jobs)
-        )
-        with ThreadPoolExecutor(
-            max_workers=min(64, len(ordered_jobs))
-        ) as executor:
-            responses = tuple(executor.map(
-                lambda item: self._instant(item[0], item[2]),
-                ordered_jobs,
-            ))
-        response_cache = {
-            (query.query_id, requested_ns): response
-            for (query, _spec, requested_ns), response in zip(
-                ordered_jobs, responses
+        if any(
+            end_ns - start_ns != 1_000_000_000
+            or (
+                index
+                and start_ns != bounds[index - 1][1]
             )
+            for index, (start_ns, end_ns) in enumerate(bounds)
+        ):
+            raise RawCollectionError(
+                "Prometheus range bounds must be contiguous 1-second windows"
+            )
+        stats = {
+            "request_count": 0,
+            "response_bytes": 0,
+            "chunk_wall_seconds": [],
+            "request_seconds": [],
+            "max_loaded_windows": 0,
         }
-        sample_cache: dict[
-            tuple[
-                str, int, int, tuple[tuple[str, str], ...], float,
-            ],
-            RawMetricSample,
-        ] = {}
-        return tuple(
-            self._samples_from_responses(
-                window_start_ns=start_ns,
-                window_end_ns=end_ns,
-                inventory_revision=inventory_revision,
-                response_cache=response_cache,
-                sample_cache=sample_cache,
+        self.last_range_query_stats = stats
+        size = self.config.range_query_chunk_windows
+        for offset in range(0, len(bounds), size):
+            chunk = bounds[offset:offset + size]
+            stats["max_loaded_windows"] = max(
+                stats["max_loaded_windows"], len(chunk)
             )
-            for start_ns, end_ns in bounds
+            requests_to_run = []
+            for query in self.config.queries:
+                spec = COMPONENTS[query.component]
+                expected = (
+                    (chunk[0][0],) + tuple(end for _start, end in chunk)
+                    if spec.metric_kind in {
+                        "monotonic_counter", "histogram_bucket",
+                    }
+                    else tuple(end for _start, end in chunk)
+                )
+                requests_to_run.append((query, expected))
+            chunk_started = time.perf_counter()
+            with ThreadPoolExecutor(
+                max_workers=min(30, len(requests_to_run))
+            ) as executor:
+                responses = tuple(executor.map(
+                    lambda item: self._range(
+                        item[0], expected_timestamps_ns=item[1],
+                    ),
+                    requests_to_run,
+                ))
+            stats["chunk_wall_seconds"].append(
+                time.perf_counter() - chunk_started
+            )
+            stats["request_count"] += len(responses)
+            stats["request_seconds"].extend(
+                response[1] for response in responses
+            )
+            stats["response_bytes"] += sum(
+                response[2] for response in responses
+            )
+            response_cache = {}
+            for (query, expected), (response, _elapsed, _bytes) in zip(
+                requests_to_run, responses,
+            ):
+                by_timestamp = {
+                    timestamp_ns: [] for timestamp_ns in expected
+                }
+                for labels, timestamp_ns, value in response:
+                    by_timestamp[timestamp_ns].append(
+                        (labels, timestamp_ns, value)
+                    )
+                for timestamp_ns, items in by_timestamp.items():
+                    response_cache[(query.query_id, timestamp_ns)] = tuple(
+                        items
+                    )
+            sample_cache: dict[
+                tuple[
+                    str, int, int, tuple[tuple[str, str], ...], float,
+                ],
+                RawMetricSample,
+            ] = {}
+            yield tuple(
+                self._samples_from_responses(
+                    window_start_ns=start_ns,
+                    window_end_ns=end_ns,
+                    inventory_revision=inventory_revision,
+                    response_cache=response_cache,
+                    sample_cache=sample_cache,
+                )
+                for start_ns, end_ns in chunk
+            )
+
+    def collect_windows(
+        self,
+        *,
+        bounds: tuple[tuple[int, int], ...],
+        inventory_revision: RuntimeIdentityResolver,
+    ) -> tuple[tuple[RawMetricSample, ...], ...]:
+        return tuple(
+            window
+            for chunk in self.iter_collect_window_chunks(
+                bounds=bounds,
+                inventory_revision=inventory_revision,
+            )
+            for window in chunk
         )
 
     def collect(

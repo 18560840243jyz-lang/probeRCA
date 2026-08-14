@@ -540,6 +540,7 @@ class FinalWindowAggregator:
         source_ids: set[str] = set()
         object_ids: set[str] = set()
         qualities: list[RawMetricSample] = []
+        inconsistent = False
         expected_buckets: set[tuple[float | None, bool]] | None = None
         for series_id, series in sorted(by_series.items()):
             by_time: dict[int, dict[tuple[float | None, bool], RawMetricSample]] = {
@@ -580,19 +581,24 @@ class FinalWindowAggregator:
             end_values = [
                 by_time[window.window_end_ns][key].value for key in ordered_keys
             ]
-            if start_values != sorted(start_values) \
-                    or end_values != sorted(end_values):
-                raise RawCollectionError(
-                    f"{component}/{series_id} cumulative buckets are non-monotonic"
-                )
             deltas = [
                 end_value - start_value
                 for start_value, end_value in zip(start_values, end_values)
             ]
-            if any(value < 0 for value in deltas) or deltas != sorted(deltas):
+            if any(value < 0 for value in deltas):
                 raise RawCollectionError(
-                    f"{component}/{series_id} histogram reset or invalid delta"
+                    f"{component}/{series_id} histogram counter reset"
                 )
+            inconsistent = inconsistent or (
+                start_values != sorted(start_values)
+                or end_values != sorted(end_values)
+                or deltas != sorted(deltas)
+                or any(
+                    not item.histogram_consistent
+                    for values in by_time.values()
+                    for item in values.values()
+                )
+            )
             for key, value in zip(ordered_keys, deltas):
                 merged[key] += value
             for timestamp in (window.window_start_ns, window.window_end_ns):
@@ -621,6 +627,13 @@ class FinalWindowAggregator:
                 None,
                 sample_count=max(0, int(total)),
             )
+        if inconsistent:
+            return _combine(
+                (quality_value,),
+                None,
+                invalid_reason="inconsistent_histogram",
+                sample_count=max(0, int(total)),
+            )
         if total <= 0:
             if allow_empty and total == 0:
                 return _combine(
@@ -644,6 +657,31 @@ class FinalWindowAggregator:
             mapping_quality=quality_value.mapping_quality,
             source_ids=quality_value.source_ids,
             object_ids=quality_value.object_ids,
+        )
+
+    @staticmethod
+    def _require_histogram_count_match(
+        histogram: _Value,
+        count: _Value,
+    ) -> _Value:
+        """Invalidate only latency when its cumulative +Inf delta disagrees."""
+
+        if not count.valid:
+            return histogram
+        if math.isclose(
+            float(histogram.sample_count),
+            float(count.value),
+            rel_tol=0.0,
+            abs_tol=RATIO_EPSILON,
+        ):
+            return histogram
+        if histogram.invalid_reason == "zero_coverage":
+            return histogram
+        return _combine(
+            (histogram,),
+            None,
+            invalid_reason="inconsistent_histogram",
+            sample_count=histogram.sample_count,
         )
 
     def _node_record(
@@ -726,14 +764,9 @@ class FinalWindowAggregator:
             window, samples, "request_latency_histogram",
             set(request["request_total"]), allow_empty=True,
         )
-        if (
-            request_p95.valid
-            and request_total.valid
-            and request_p95.sample_count != request_total.value
-        ):
-            raise RawCollectionError(
-                "service request histogram count does not match request_total"
-            )
+        request_p95 = self._require_histogram_count_match(
+            request_p95, request_total,
+        )
 
         cpu = self._deltas(
             window, samples, "cpu_time_ns_total",
@@ -973,6 +1006,9 @@ class FinalWindowAggregator:
                 window, samples, "dns_success_latency_histogram",
                 set(values["dns_query_total"]), allow_empty=True,
             )
+            latency = self._require_histogram_count_match(
+                latency, success,
+            )
             if count.valid and count.value == 0:
                 if any(item.valid and item.value != 0 for item in bad) \
                         or latency.sample_count != 0:
@@ -1024,20 +1060,13 @@ class FinalWindowAggregator:
                 window, samples, "edge_latency_histogram",
                 set(values["edge_request_total"]), allow_empty=True,
             )
+            latency = self._require_histogram_count_match(latency, count)
             if count.valid and count.value == 0:
                 if any(item.valid and item.value != 0 for item in bad) \
                         or latency.sample_count != 0:
                     raise RawCollectionError(
                         "inactive TCP edge has failure/latency observations"
                     )
-            if (
-                latency.valid
-                and count.valid
-                and latency.sample_count != count.value
-            ):
-                raise RawCollectionError(
-                    "TCP latency histogram count does not match request_total"
-                )
             failure = self._ratio(
                 self._add(bad),
                 count,

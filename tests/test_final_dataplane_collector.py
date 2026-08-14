@@ -10,6 +10,10 @@ import pytest
 import yaml
 
 from proberca.dataplane.archive import CollectionArchive, CollectionArchiveWriter
+from proberca.dataplane.burst_archive import (
+    BurstArchiveWriter,
+    RawBurstWindow,
+)
 from proberca.dataplane.burst_collection import (
     BURST_CHANNEL_MODES,
     BurstChannelCalibration,
@@ -42,6 +46,7 @@ from proberca.dataplane.sources import (
     PrometheusPrimitiveSource,
     PrometheusSourceConfig,
 )
+from proberca.cli.collect_final import _write_aligned_windows
 from proberca.k8s.contracts import ResourceVersionVector
 
 
@@ -457,6 +462,106 @@ def test_local_socket_failure_events_are_deduplicated_per_operation(contract):
     assert value == pytest.approx(1.0)
 
 
+def test_tcp_non_monotonic_histogram_invalidates_only_latency(contract):
+    samples = [
+        item for item in _raw_window(include_dns=False).samples
+        if item.entity_type != "edge"
+    ]
+    _edge_samples(
+        samples,
+        "tcp",
+        count_delta=5,
+        error_delta=0,
+        timeout_delta=0,
+        histogram_deltas=(6, 5, 5),
+    )
+    result = FinalWindowAggregator(contract).aggregate(
+        RawCollectionWindow.create(
+            sequence=1,
+            window_start_ns=START,
+            window_end_ns=END,
+            cluster_id=CLUSTER,
+            samples=samples,
+        )
+    )
+    metrics = {item.metric_name: item for item in result.edge_metrics}
+    assert metrics["edge_request_count"].value == 5
+    assert metrics["edge_request_count"].valid is True
+    assert metrics["edge_failure_rate"].value == 0
+    assert metrics["edge_failure_rate"].valid is True
+    latency = metrics["edge_latency_p95"]
+    assert latency.value is None
+    assert latency.valid is False
+    assert latency.invalid_reason == "inconsistent_histogram"
+    assert latency.sample_count == 5
+    assert latency.coverage == 1
+    assert latency.mapping_quality == 1
+
+
+def test_service_non_monotonic_histogram_invalidates_only_latency(contract):
+    samples = [
+        item for item in _raw_window(include_dns=False).samples
+        if item.service_name != "frontend"
+    ]
+    _service_samples(
+        samples,
+        "frontend",
+        "node-a",
+        series="frontend-series",
+        request_delta=5,
+        error_delta=0,
+        request_histogram_deltas=(6, 5, 5),
+    )
+    result = FinalWindowAggregator(contract).aggregate(
+        RawCollectionWindow.create(
+            sequence=1,
+            window_start_ns=START,
+            window_end_ns=END,
+            cluster_id=CLUSTER,
+            samples=samples,
+        )
+    )
+    metrics = {
+        item.metric_name: item
+        for item in result.node_metrics
+        if item.service_name == "frontend"
+    }
+    assert metrics["request_rate"].value == 5
+    assert metrics["request_failure_rate"].value == 0
+    assert metrics["request_latency_p95"].invalid_reason \
+        == "inconsistent_histogram"
+
+
+def test_histogram_count_mismatch_invalidates_latency_only(contract):
+    samples = [
+        item for item in _raw_window(include_dns=False).samples
+        if item.entity_type != "edge"
+    ]
+    _edge_samples(
+        samples,
+        "tcp",
+        count_delta=5,
+        error_delta=0,
+        timeout_delta=0,
+        histogram_deltas=(2, 4, 4),
+    )
+    result = FinalWindowAggregator(contract).aggregate(
+        RawCollectionWindow.create(
+            sequence=1,
+            window_start_ns=START,
+            window_end_ns=END,
+            cluster_id=CLUSTER,
+            samples=samples,
+        )
+    )
+    metrics = {item.metric_name: item for item in result.edge_metrics}
+    assert metrics["edge_request_count"].value == 5
+    assert metrics["edge_failure_rate"].value == 0
+    assert metrics["edge_latency_p95"].invalid_reason \
+        == "inconsistent_histogram"
+    assert metrics["edge_latency_p95"].sample_count == 4
+
+
 def test_idle_pressure_and_lock_zero_over_zero_are_no_exposure(contract):
     raw = _raw_window()
     targets = {
@@ -808,6 +913,140 @@ def test_new_archive_serializes_null_and_legacy_v2_is_projected_in_memory(
         match="only current-schema windows",
     ):
         new_writer.append(projected)
+
+
+def _aligned_test_pair(contract, sequence):
+    offset = (sequence - 1) * 1_000_000_000
+    raw = _raw_window(include_dns=False)
+    shifted = []
+    for item in raw.samples:
+        payload = item.to_dict()
+        payload["timestamp_ns"] += offset
+        payload.pop("source_record_id")
+        shifted.append(RawMetricSample.create(**payload))
+    raw = RawCollectionWindow.create(
+        sequence=sequence,
+        window_start_ns=START + offset,
+        window_end_ns=END + offset,
+        cluster_id=CLUSTER,
+        samples=shifted,
+    )
+    collector = FinalDataPlaneCollector(
+        collection_contract=contract,
+        collector_build_id=fingerprint({"build": "aligned-writer"}),
+    )
+    normal = collector.assemble(
+        raw_window=raw,
+        inventory_at_start=_revision(),
+        inventory_at_end=_revision(),
+    )
+    burst = RawBurstWindow.create(
+        sequence=sequence,
+        window_start_ns=START + offset,
+        window_end_ns=END + offset,
+        cluster_id=CLUSTER,
+        samples=(),
+        event_source_fingerprint=fingerprint({"source": "burst"}),
+        burst_config_fingerprint=contract["burst_config_fingerprint"],
+        event_loss_rate=0.0,
+    )
+    return normal, burst
+
+
+def _aligned_test_writers(contract, tmp_path, metadata):
+    dataset_id = fingerprint({"dataset": str(tmp_path)})
+    normal = CollectionArchiveWriter(
+        tmp_path / "normal",
+        dataset_id=dataset_id,
+        collection_contract=contract,
+        source_description=contract["source_description"],
+        collection_metadata=metadata,
+    )
+    burst = BurstArchiveWriter(
+        tmp_path / "burst",
+        dataset_id=dataset_id,
+        cluster_id=CLUSTER,
+        event_source_fingerprint=fingerprint({"source": "burst"}),
+        burst_config_fingerprint=contract["burst_config_fingerprint"],
+    )
+    return normal, burst
+
+
+def test_aligned_incremental_failure_keeps_equal_partial_archives(
+    contract, tmp_path, capsys,
+):
+    first = _aligned_test_pair(contract, 1)
+    normal_writer, burst_writer = _aligned_test_writers(
+        contract, tmp_path, first[0].collection_metadata,
+    )
+
+    class Runner:
+        @staticmethod
+        def iter_collect_aligned(_window_count):
+            yield first
+            for sequence in range(2, 165):
+                yield _aligned_test_pair(contract, sequence)
+            raise RawCollectionError("deterministic sequence 165 failure")
+
+    with pytest.raises(
+        RawCollectionError, match="deterministic sequence 165"
+    ):
+        _write_aligned_windows(
+            runner=Runner(),
+            normal_writer=normal_writer,
+            burst_writer=burst_writer,
+            window_count=200,
+        )
+    normal_lines = (
+        tmp_path / "normal" / "collected-windows.jsonl"
+    ).read_text(encoding="utf-8").splitlines()
+    burst_lines = (
+        tmp_path / "burst" / "burst-windows.jsonl"
+    ).read_text(encoding="utf-8").splitlines()
+    assert len(normal_lines) == len(burst_lines) == 164
+    assert [
+        json.loads(line)["sequence"] for line in normal_lines
+    ] == list(range(1, 165))
+    assert [
+        json.loads(line)["sequence"] for line in burst_lines
+    ] == list(range(1, 165))
+    assert not (tmp_path / "normal" / "collection-manifest.json").exists()
+    assert not (tmp_path / "burst" / "burst-manifest.json").exists()
+    failure = json.loads(capsys.readouterr().err)
+    assert failure["last_committed_sequence"] == 164
+    assert failure["partial_archives_aligned"] is True
+
+
+def test_aligned_incremental_success_seals_matching_archives(
+    contract, tmp_path,
+):
+    pairs = tuple(_aligned_test_pair(contract, index) for index in range(1, 4))
+    normal_writer, burst_writer = _aligned_test_writers(
+        contract, tmp_path, pairs[0][0].collection_metadata,
+    )
+
+    class Runner:
+        @staticmethod
+        def iter_collect_aligned(_window_count):
+            yield from pairs
+
+    _write_aligned_windows(
+        runner=Runner(),
+        normal_writer=normal_writer,
+        burst_writer=burst_writer,
+        window_count=3,
+    )
+    normal = normal_writer.seal()
+    burst = burst_writer.seal()
+    assert normal.window_count == burst.window_count == 3
+    assert normal.dataset_id == burst.dataset_id
+    assert [
+        (item.sequence, item.window_start_ns, item.window_end_ns)
+        for item in normal.iter_windows()
+    ] == [
+        (item.sequence, item.window_start_ns, item.window_end_ns)
+        for item in burst.iter_windows()
+    ]
 
 
 def test_global_resource_watermark_change_does_not_fake_layout_change(
@@ -1316,41 +1555,57 @@ def test_prometheus_source_preserves_raw_boundary_series_identity():
     class Response:
         status_code = 200
 
-        def __init__(self, timestamp):
-            self.timestamp = timestamp
+        content = b"response"
 
         def json(self):
             return {
                 "status": "success",
                 "data": {
-                    "resultType": "vector",
-                    "result": [{
-                        "metric": {
+                    "resultType": "matrix",
+                    "result": [
+                        {
+                            "metric": {
+                                "__name__": "proberca_service_request_total",
+                                "namespace": NAMESPACE,
+                                "pod": "frontend-pod",
+                                "container": "frontend",
+                                "source_coverage": "1",
+                                "job": "proberca",
+                                "instance": "127.0.0.1:9999",
+                            },
+                            "values": [[1.0, "100"]],
+                        },
+                        {
+                            "metric": {
                             "__name__": "proberca_service_request_total",
                             "namespace": NAMESPACE,
                             "pod": "frontend-pod",
                             "container": "frontend",
-                            "source_coverage": (
-                                "1" if self.timestamp == 1.0 else "0"
-                            ),
+                            "source_coverage": "0",
                             "job": "proberca",
                             "instance": "127.0.0.1:9999",
+                            },
+                            "values": [[2.0, "100"], [3.0, "100"]],
                         },
-                        "value": [self.timestamp, "100"],
-                    }],
+                    ],
                 },
             }
 
     class Session:
         def __init__(self):
-            self.timestamps = []
+            self.ranges = []
             self.queries = []
 
         def get(self, _url, *, params, timeout):
             assert timeout == 1.0
-            self.timestamps.append(float(params["time"]))
+            assert _url.endswith("/api/v1/query_range")
+            self.ranges.append((
+                float(params["start"]),
+                float(params["end"]),
+                params["step"],
+            ))
             self.queries.append(params["query"])
-            return Response(float(params["time"]))
+            return Response()
 
     class Revision(SimpleNamespace):
         def resolve_service_for_pod(self, pod_uid, explicit_service=None):
@@ -1390,7 +1645,7 @@ def test_prometheus_source_preserves_raw_boundary_series_identity():
     assert len({item.source_object_id for item in samples}) == 1
     assert len({item.source_record_id for item in samples}) == 2
     assert len(windows[1]) == 2
-    assert sorted(session.timestamps) == [1.0, 2.0, 3.0]
+    assert session.ranges == [(1.0, 3.0, "1")]
     assert all(
         "time() - timestamp(proberca_service_request_total)" in item
         and "<= 2.000000000" in item
@@ -1398,6 +1653,120 @@ def test_prometheus_source_preserves_raw_boundary_series_identity():
     )
     assert windows[0][-1].source_record_id \
         == windows[1][0].source_record_id
+    assert PrometheusPrimitiveSource(
+        config, session=Session(),
+    ).config.range_query_chunk_windows == 120
+
+
+def test_query_range_chunks_bound_request_fanout_and_memory(monkeypatch):
+    with open(
+        "configs/final_live_collector.example.yaml", encoding="utf-8"
+    ) as handle:
+        config = FinalLiveCollectorConfig.from_dict(yaml.safe_load(handle))
+    source = PrometheusPrimitiveSource(config.prometheus)
+    requests_seen = []
+
+    def fake_range(query, *, expected_timestamps_ns):
+        requests_seen.append((query.component, expected_timestamps_ns))
+        return (), 0.001, 10
+
+    monkeypatch.setattr(source, "_range", fake_range)
+    monkeypatch.setattr(
+        source,
+        "_samples_from_responses",
+        lambda **_kwargs: (),
+    )
+    bounds = tuple(
+        (
+            START + index * 1_000_000_000,
+            START + (index + 1) * 1_000_000_000,
+        )
+        for index in range(1200)
+    )
+    chunks = list(source.iter_collect_window_chunks(
+        bounds=bounds,
+        inventory_revision=SimpleNamespace(),
+    ))
+    assert len(chunks) == 10
+    assert all(len(chunk) == 120 for chunk in chunks)
+    assert len(requests_seen) == 30 * 10 == 300
+    assert source.last_range_query_stats["request_count"] == 300
+    assert source.last_range_query_stats["max_loaded_windows"] == 120
+    for component, timestamps in requests_seen:
+        expected_count = (
+            121
+            if COMPONENTS[component].metric_kind in {
+                "monotonic_counter", "histogram_bucket",
+            }
+            else 120
+        )
+        assert len(timestamps) == expected_count
+
+
+@pytest.mark.parametrize(
+    "values,match",
+    [
+        ([[1.0, "1"]], "omitted evaluation timestamps"),
+        (
+            [[1.0, "1"], [2.0, "2"], [3.0, "3"]],
+            "chunk-external timestamp",
+        ),
+        (
+            [[1.0, "1"], [1.0, "2"], [2.0, "2"]],
+            "duplicate sample",
+        ),
+        ([[1.0, "NaN"], [2.0, "2"]], "stale/non-finite"),
+    ],
+)
+def test_query_range_rejects_missing_extra_duplicate_and_stale(
+    values, match,
+):
+    query = PrometheusPrimitiveQuery.from_dict({
+        "query_id": "request-total",
+        "component": "request_total",
+        "promql": "proberca_service_request_total",
+        "label_mapping": {"namespace": "namespace"},
+        "required_labels": ["namespace"],
+        "optional_labels": [],
+        "series_labels": ["namespace"],
+        "histogram_le_label": None,
+        "value_scale": 1.0,
+        "histogram_bound_scale": 1.0,
+    })
+
+    class Response:
+        status_code = 200
+        content = b"response"
+
+        @staticmethod
+        def json():
+            return {
+                "status": "success",
+                "data": {
+                    "resultType": "matrix",
+                    "result": [{
+                        "metric": {"namespace": NAMESPACE},
+                        "values": values,
+                    }],
+                },
+            }
+
+    class Session:
+        @staticmethod
+        def get(*_args, **_kwargs):
+            return Response()
+
+    source = PrometheusPrimitiveSource(
+        PrometheusSourceConfig(
+            "http://prometheus.test", 1.0, 2.0, True, (query,),
+        ),
+        session=Session(),
+    )
+    with pytest.raises(RawCollectionError, match=match):
+        source._range(
+            query,
+            expected_timestamps_ns=(START, END),
+        )
 
 
 def test_dataplane_does_not_import_control_or_algorithm_modules():

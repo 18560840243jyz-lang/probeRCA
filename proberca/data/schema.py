@@ -16,6 +16,7 @@ METRIC_INVALID_REASONS = frozenset({
     "insufficient_sample_count",
     "excessive_event_loss",
     "missing_component",
+    "inconsistent_histogram",
 })
 
 _LEGACY_COUNT_METRICS = frozenset({

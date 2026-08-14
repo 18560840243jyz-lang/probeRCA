@@ -16,7 +16,7 @@ from typing import Any, Iterable
 from .contracts import assert_label_safe, fingerprint
 
 
-RAW_SAMPLE_SCHEMA_VERSION = "probeRCA-final-raw-sample-v1"
+RAW_SAMPLE_SCHEMA_VERSION = "probeRCA-final-raw-sample-v2"
 RAW_WINDOW_SCHEMA_VERSION = "probeRCA-final-raw-window-v1"
 RAW_METRIC_KINDS = frozenset({
     "gauge", "monotonic_counter", "histogram_bucket",
@@ -103,6 +103,7 @@ class RawMetricSample:
     protocol: str | None = None
     histogram_upper_bound: float | None = None
     histogram_is_inf_bucket: bool = False
+    histogram_consistent: bool = True
     coverage: float = 1.0
     event_loss_rate: float = 0.0
     mapping_quality: float = 1.0
@@ -194,6 +195,10 @@ class RawMetricSample:
         if self.metric_kind == "histogram_bucket":
             if not isinstance(self.histogram_is_inf_bucket, bool):
                 raise RawCollectionError("histogram infinity flag must be boolean")
+            if not isinstance(self.histogram_consistent, bool):
+                raise RawCollectionError(
+                    "histogram_consistent must be boolean"
+                )
             if self.histogram_is_inf_bucket:
                 if self.histogram_upper_bound is not None:
                     raise RawCollectionError("+Inf bucket must not have an upper bound")
@@ -203,7 +208,8 @@ class RawMetricSample:
                 )
                 object.__setattr__(self, "histogram_upper_bound", bound)
         elif self.histogram_upper_bound is not None \
-                or self.histogram_is_inf_bucket is not False:
+                or self.histogram_is_inf_bucket is not False \
+                or self.histogram_consistent is not True:
             raise RawCollectionError(
                 "non-histogram component contains histogram metadata"
             )

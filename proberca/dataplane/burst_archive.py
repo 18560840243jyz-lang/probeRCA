@@ -366,6 +366,20 @@ class BurstArchiveWriter:
         self._end_ns = None
         self._sealed = False
 
+    @property
+    def window_count(self) -> int:
+        return self._count
+
+    @property
+    def last_committed_sequence(self) -> int:
+        return self._count
+
+    def close_partial(self) -> None:
+        if not self._handle.closed:
+            self._handle.flush()
+            os.fsync(self._handle.fileno())
+            self._handle.close()
+
     def append(self, window: RawBurstWindow) -> None:
         if self._sealed:
             raise RawCollectionError("cannot append to sealed Burst archive")
@@ -395,7 +409,7 @@ class BurstArchiveWriter:
     def seal(self) -> BurstArchive:
         if self._sealed or self._count <= 0:
             raise RawCollectionError("raw Burst archive cannot be sealed")
-        self._handle.close()
+        self.close_partial()
         payload = {
             "schema_version": BURST_ARCHIVE_SCHEMA_VERSION,
             "dataset_id": self.dataset_id,

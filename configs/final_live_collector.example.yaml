@@ -33,6 +33,7 @@ prometheus:
   base_url: http://127.0.0.1:9090
   timeout_sec: 10.0
   maximum_sample_age_sec: 2.0
+  range_query_chunk_windows: 120
   reject_warnings: true
   queries:
     # Service request symptoms. The exporter must expose raw counters and
@@ -81,9 +82,10 @@ prometheus:
         container: container
         source_series: source_series
         source_coverage: source_coverage
+        histogram_consistent: histogram_consistent
         histogram_upper_bound: le
       required_labels: &service_histogram_required [namespace, pod, container, source_series, source_coverage, le]
-      optional_labels: *service_optional
+      optional_labels: [job, instance, histogram_consistent]
       series_labels: *service_request_series
       histogram_le_label: le
       value_scale: 1.0
@@ -368,9 +370,10 @@ prometheus:
         protocol: protocol
         source_series: source_series
         source_coverage: source_coverage
+        histogram_consistent: histogram_consistent
         histogram_upper_bound: le
       required_labels: &edge_histogram_required [namespace, src_service, dst_namespace, dst_service, protocol, source_series, source_coverage, le]
-      optional_labels: *edge_optional
+      optional_labels: [job, instance, histogram_consistent]
       series_labels: *tcp_edge_series
       histogram_le_label: le
       value_scale: 1.0

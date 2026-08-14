@@ -466,6 +466,127 @@ def test_histogram_buckets_remain_cumulative_across_series_reset():
     ] == [1, 2, 3]
 
 
+def test_request_histogram_family_rebases_atomically():
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter._edge_sample_high_water = {}
+    exporter._edge_sample_raw = {}
+    common = {
+        "namespace": "online-boutique",
+        "dst_namespace": "online-boutique",
+        "src_service": "checkoutservice",
+        "dst_service": "paymentservice",
+        "protocol": "tcp",
+        "source_series": "series-a",
+    }
+
+    def family(count, buckets):
+        output = [
+            PrometheusSample.create(
+                "proberca_tcp_edge_request_total", common, count
+            ),
+            PrometheusSample.create(
+                "proberca_tcp_edge_error_total", common, 0
+            ),
+            PrometheusSample.create(
+                "proberca_tcp_edge_timeout_total", common, 0
+            ),
+        ]
+        output.extend(
+            PrometheusSample.create(
+                "proberca_tcp_edge_latency_milliseconds_bucket",
+                {**common, "le": bound},
+                value,
+            )
+            for bound, value in zip(("1", "10", "+Inf"), buckets)
+        )
+        return tuple(output)
+
+    exporter._persistent_edge_samples(family(10, (2, 7, 10)))
+    absent = exporter._persistent_edge_samples(())
+    assert {
+        item.label_dict["source_coverage"] for item in absent
+    } == {"0"}
+    rebased = exporter._persistent_edge_samples(
+        family(3, (1, 2, 3))
+    )
+    by_name = {
+        (item.name, item.label_dict.get("le")): item.value
+        for item in rebased
+    }
+    assert by_name[
+        ("proberca_tcp_edge_request_total", None)
+    ] == 13
+    assert [
+        by_name[
+            (
+                "proberca_tcp_edge_latency_milliseconds_bucket",
+                bound,
+            )
+        ]
+        for bound in ("1", "10", "+Inf")
+    ] == [3, 9, 13]
+
+
+def test_inconsistent_raw_histogram_does_not_poison_family_state():
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter._edge_sample_high_water = {}
+    exporter._edge_sample_raw = {}
+    common = {
+        "namespace": "online-boutique",
+        "dst_namespace": "online-boutique",
+        "src_service": "checkoutservice",
+        "dst_service": "paymentservice",
+        "protocol": "tcp",
+        "source_series": "series-a",
+    }
+
+    def family(count, buckets):
+        output = [
+            PrometheusSample.create(
+                "proberca_tcp_edge_request_total", common, count
+            ),
+            PrometheusSample.create(
+                "proberca_tcp_edge_error_total", common, 0
+            ),
+            PrometheusSample.create(
+                "proberca_tcp_edge_timeout_total", common, 0
+            ),
+        ]
+        output.extend(
+            PrometheusSample.create(
+                "proberca_tcp_edge_latency_milliseconds_bucket",
+                {**common, "le": bound},
+                value,
+            )
+            for bound, value in zip(("1", "10", "+Inf"), buckets)
+        )
+        return tuple(output)
+
+    exporter._persistent_edge_samples(family(10, (2, 7, 10)))
+    inconsistent = exporter._persistent_edge_samples(
+        family(15, (3, 9, 14))
+    )
+    assert {
+        item.label_dict["histogram_consistent"]
+        for item in inconsistent
+        if item.name.endswith("_bucket")
+    } == {"0"}
+    recovered = exporter._persistent_edge_samples(
+        family(16, (4, 10, 16))
+    )
+    assert {
+        item.label_dict["histogram_consistent"]
+        for item in recovered
+        if item.name.endswith("_bucket")
+    } == {"1"}
+    by_bound = {
+        item.label_dict["le"]: item.value
+        for item in recovered
+        if item.name.endswith("_bucket")
+    }
+    assert by_bound == {"1": 4, "10": 10, "+Inf": 16}
+
+
 def test_service_series_persist_only_for_the_active_container():
     exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
     exporter._service_sample_high_water = {}
@@ -617,9 +738,11 @@ def test_dynamic_edge_series_merge_into_one_stable_counter():
         {**common, "source_series": "route-a"},
         20,
     )
+    diagnostic_mapping = {}
     first = exporter._stable_request_samples(
         exporter._persistent_edge_samples((first_raw,)),
         edge=True,
+        diagnostic_mapping=diagnostic_mapping,
     )
 
     second_raw = (
@@ -637,12 +760,15 @@ def test_dynamic_edge_series_merge_into_one_stable_counter():
     second = exporter._stable_request_samples(
         exporter._persistent_edge_samples(second_raw),
         edge=True,
+        diagnostic_mapping=diagnostic_mapping,
     )
 
     assert len(first) == len(second) == 1
     assert first[0].value == 20
     assert second[0].value == 24
     assert first[0].labels == second[0].labels
+    stable_series = second[0].label_dict["source_series"]
+    assert diagnostic_mapping[stable_series] == {"route-a", "route-b"}
 
 
 def test_stable_request_aggregation_keeps_histogram_buckets_separate():

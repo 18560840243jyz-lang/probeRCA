@@ -38,7 +38,13 @@ canonical final aggregator.
 - Failure, throttle, memory, I/O, futex, and local-socket ratios are recomputed
   from summed numerator and denominator components.
 - P95 is accepted only from complete cumulative histograms with identical
-  bucket layouts. Bucket deltas are merged before the P95 is selected.
+  bucket layouts. Bucket deltas are merged before the P95 is selected. A
+  non-negative but non-monotonic cumulative snapshot/delta, or a `+Inf`
+  delta that disagrees with its independent request counter, invalidates only
+  the latency record as
+  `value=null, valid=false, invalid_reason=inconsistent_histogram`; count and
+  failure remain usable. Any negative bucket delta is still a hard cumulative
+  lifecycle violation and rejects the window.
 - Duplicate, stale, ambiguous, pre-aggregated, wrong-unit, or wrong-kind
   inputs reject the complete window.
 - A genuinely empty request/edge histogram is represented as
@@ -53,8 +59,9 @@ canonical final aggregator.
   never encoded as zero, NaN, or infinity.
 - `coverage` and `mapping_quality` remain separate record fields; neither is
   silently folded into the other.
-- The cumulative histogram `+Inf` delta must equal its corresponding request
-  or query counter delta whenever observations exist.
+- The raw exporter rebases one request histogram family atomically: count,
+  all finite buckets, `+Inf`, error, and timeout share one reset epoch. An
+  inconsistent raw snapshot does not update histogram high-water state.
 
 The output is exactly:
 
@@ -67,7 +74,8 @@ count is a valid real zero; their failure rate and latency remain present as
 `no_exposure` records. This keeps traffic sparsity from masquerading as a
 deployment-layout change without treating an undefined ratio or P95 as zero.
 
-New metric records use schema `2.0`, collected windows use
+New raw metric samples use
+`probeRCA-final-raw-sample-v2`, metric records use schema `2.0`, collected windows use
 `probeRCA-dataplane-window-v3`, and collection archives use
 `probeRCA-dataplane-archive-v3`. The reader accepts sealed legacy v2 archives
 without rewriting their bytes, hashes, dataset identity, or contract
@@ -105,6 +113,12 @@ The source adapter rejects `rate`, `irate`, `increase`, `delta`,
 `histogram_quantile`, and cross-series reductions. Counter and histogram
 samples must have exact window-boundary timestamps. This prevents an exporter
 or recording rule from silently changing the mathematical contract.
+
+Historical transport uses `/api/v1/query_range` in frozen chunks of 120
+one-second windows. Each query definition is requested once per chunk, with
+strict evaluation timestamp, warning, staleness, duplicate, and boundary
+validation. Only one chunk is retained in memory at a time; no server-side
+rate, increase, sum, delta, or quantile operation is introduced.
 
 ## Topology and identity
 
@@ -147,6 +161,11 @@ sharing the normal archive's dataset ID and 1-second window sequence. The
 later control plane applies the rare-event threshold or continuous
 median/MAD calibration and quality weight. Raw Burst source IDs are checked
 against normal residual source IDs before either window is committed.
+Normal and Burst are validated as an aligned pair and then appended with
+flush/fsync before the next sequence is processed. A logical failure leaves
+both partial JSONL files at the same last committed sequence and publishes no
+manifest. Manifests are created only after the complete pair has matching
+counts, boundaries, and Dataset ID.
 
 ## Healthy-only collection
 

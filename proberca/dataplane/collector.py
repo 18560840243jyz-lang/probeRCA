@@ -66,11 +66,6 @@ class RawBurstWindowSource(Protocol):
         ...
 
 
-class RawBurstWindowSink(Protocol):
-    def append(self, window) -> None:
-        ...
-
-
 @dataclass(frozen=True)
 class FinalLiveCollectorConfig:
     schema_version: str
@@ -557,7 +552,6 @@ class FinalLiveCollectionRunner:
         collection_contract: dict[str, Any],
         primitive_source: PrimitiveSource,
         raw_burst_source: RawBurstWindowSource | None = None,
-        raw_burst_sink: RawBurstWindowSink | None = None,
         discovery_client: KubernetesDiscoveryClient | None = None,
         wall_clock_ns=time.time_ns,
         sleep=time.sleep,
@@ -569,12 +563,7 @@ class FinalLiveCollectionRunner:
             )
         self.config = config
         self.primitive_source = primitive_source
-        if (raw_burst_source is None) != (raw_burst_sink is None):
-            raise RawCollectionError(
-                "raw Burst source and sink must be configured together"
-            )
         self.raw_burst_source = raw_burst_source
-        self.raw_burst_sink = raw_burst_sink
         self.discovery = discovery_client or KubernetesDiscoveryClient(
             config.kubernetes
         )
@@ -655,10 +644,11 @@ class FinalLiveCollectionRunner:
                 raise RawCollectionError(
                     "raw Burst source overlaps normal residual source"
                 )
-            self.raw_burst_sink.append(raw_burst_window)
         return window
 
-    def collect(self, window_count: int) -> tuple[CollectedWindow, ...]:
+    def iter_collect_aligned(self, window_count: int):
+        """Yield fully validated Normal/Burst pairs one sequence at a time."""
+
         if isinstance(window_count, bool) or not isinstance(window_count, int) \
                 or window_count <= 0:
             raise RawCollectionError("window_count must be positive")
@@ -713,55 +703,78 @@ class FinalLiveCollectionRunner:
         after = self.discovery.discover_once(
             self.wall_clock_ns()
         ).freeze(self.wall_clock_ns())
-        collect_windows = getattr(
-            self.primitive_source, "collect_windows", None,
+        collect_chunks = getattr(
+            self.primitive_source, "iter_collect_window_chunks", None,
         )
-        if callable(collect_windows):
-            sample_windows = collect_windows(
+        if callable(collect_chunks):
+            sample_chunks = collect_chunks(
                 bounds=bounds,
                 inventory_revision=before,
             )
-            if len(sample_windows) != len(bounds):
-                raise RawCollectionError(
-                    "primitive batch returned the wrong window count"
-                )
         else:
-            sample_windows = tuple(
-                self.primitive_source.collect(
-                    window_start_ns=start_ns,
-                    window_end_ns=end_ns,
-                    inventory_revision=before,
+            collect_windows = getattr(
+                self.primitive_source, "collect_windows", None,
+            )
+            if callable(collect_windows):
+                sample_chunks = (
+                    collect_windows(
+                        bounds=bounds,
+                        inventory_revision=before,
+                    ),
                 )
-                for start_ns, end_ns in bounds
-            )
-        output = []
-        for sequence, ((start_ns, end_ns), samples) in enumerate(
-            zip(bounds, sample_windows), 1,
-        ):
-            raw_window = RawCollectionWindow._create_from_validated_samples(
-                sequence=sequence,
-                window_start_ns=start_ns,
-                window_end_ns=end_ns,
-                cluster_id=self.config.cluster_id,
-                samples=samples,
-            )
-            raw_burst_window = (
-                self.raw_burst_source.collect_window(
-                    sequence=sequence,
-                    window_start_ns=start_ns,
-                    window_end_ns=end_ns,
-                    inventory_revision=before,
-                    normal_raw_window=raw_window,
+            else:
+                sample_chunks = (
+                    tuple(
+                        self.primitive_source.collect(
+                            window_start_ns=start_ns,
+                            window_end_ns=end_ns,
+                            inventory_revision=before,
+                        )
+                        for start_ns, end_ns in bounds
+                    ),
                 )
-                if self.raw_burst_source is not None else None
-            )
-            window = self.assembler.assemble(
-                raw_window=raw_window,
-                inventory_at_start=before,
-                inventory_at_end=after,
-                burst_evidence=(),
-            )
-            if raw_burst_window is not None:
+        sequence = 0
+        for sample_chunk in sample_chunks:
+            if not sample_chunk:
+                raise RawCollectionError(
+                    "primitive source returned an empty chunk"
+                )
+            for samples in sample_chunk:
+                sequence += 1
+                if sequence > len(bounds):
+                    raise RawCollectionError(
+                        "primitive source returned excess windows"
+                    )
+                start_ns, end_ns = bounds[sequence - 1]
+                raw_window = (
+                    RawCollectionWindow._create_from_validated_samples(
+                        sequence=sequence,
+                        window_start_ns=start_ns,
+                        window_end_ns=end_ns,
+                        cluster_id=self.config.cluster_id,
+                        samples=samples,
+                    )
+                )
+                window = self.assembler.assemble(
+                    raw_window=raw_window,
+                    inventory_at_start=before,
+                    inventory_at_end=after,
+                    burst_evidence=(),
+                )
+                raw_burst_window = (
+                    self.raw_burst_source.collect_window(
+                        sequence=sequence,
+                        window_start_ns=start_ns,
+                        window_end_ns=end_ns,
+                        inventory_revision=before,
+                        normal_raw_window=raw_window,
+                    )
+                    if self.raw_burst_source is not None else None
+                )
+                if raw_burst_window is None:
+                    raise RawCollectionError(
+                        "aligned formal collection requires raw Burst"
+                    )
                 residual = set(window.residual_source_record_ids)
                 overlap = residual & {
                     sample.source_record_id
@@ -771,6 +784,25 @@ class FinalLiveCollectionRunner:
                     raise RawCollectionError(
                         "raw Burst source overlaps normal residual source"
                     )
-                self.raw_burst_sink.append(raw_burst_window)
-            output.append(window)
-        return tuple(output)
+                if (
+                    window.sequence != raw_burst_window.sequence
+                    or window.window_start_ns
+                    != raw_burst_window.window_start_ns
+                    or window.window_end_ns
+                    != raw_burst_window.window_end_ns
+                    or window.cluster_id != raw_burst_window.cluster_id
+                ):
+                    raise RawCollectionError(
+                        "Normal/Burst window alignment mismatch"
+                    )
+                yield window, raw_burst_window
+        if sequence != len(bounds):
+            raise RawCollectionError(
+                "primitive source returned the wrong window count"
+            )
+
+    def collect(self, window_count: int) -> tuple[CollectedWindow, ...]:
+        return tuple(
+            normal
+            for normal, _burst in self.iter_collect_aligned(window_count)
+        )

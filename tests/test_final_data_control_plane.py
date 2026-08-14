@@ -764,6 +764,31 @@ def test_data_plane_reason_is_preserved_before_control_plane_thresholds():
     assert validity["raw_value"] is None
 
 
+def test_inconsistent_histogram_never_enters_control_plane_math():
+    config = _config()
+    record = replace(
+        next(
+            item for item in _node_records(1)
+            if item.metric_name == "request_latency_p95"
+        ),
+        value=None,
+        valid=False,
+        invalid_reason="inconsistent_histogram",
+        sample_count=5,
+    )
+    resolver = MetricResolver(config)
+    normalized, raw = resolver.normalize_window(
+        SimpleNamespace(node_metrics=(record,), edge_metrics=()),
+        RobustBaselineStore(config),
+    )
+    assert normalized == {}
+    assert raw == {}
+    validity = resolver.last_validity[record.stable_id]
+    assert validity["data_plane_invalid_reason"] \
+        == "inconsistent_histogram"
+    assert validity["control_plane_invalid_reason"] is None
+
+
 def test_legacy_control_and_counter_paths_also_fail_closed_on_invalid_record():
     record = replace(
         _node_records(1)[0],

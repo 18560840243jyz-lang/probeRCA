@@ -443,6 +443,7 @@ class FinalPrimitiveExporter:
         self._service_sample_raw: dict[
             tuple[str, tuple[tuple[str, str], ...]], PrometheusSample
         ] = {}
+        self._stable_edge_source_series: dict[str, set[str]] = {}
         self._qdisc_drop_state: dict[str, tuple[float, float]] = {}
         self._last_capacity_ns: int | None = None
         self._inventory_cache: Inventory | None = None
@@ -1176,6 +1177,202 @@ class FinalPrimitiveExporter:
                 ))
         return tuple(output)
 
+    @staticmethod
+    def _request_family_key(
+        sample: PrometheusSample,
+    ) -> tuple[tuple[str, str], ...]:
+        labels = sample.label_dict
+        if not labels.get("source_series"):
+            raise RawCollectionError(
+                "request sample lacks raw source_series identity"
+            )
+        labels.pop("le", None)
+        return tuple(sorted(labels.items()))
+
+    def _persistent_request_samples(
+        self,
+        samples: tuple[PrometheusSample, ...],
+        *,
+        edge: bool,
+        high_water: dict[
+            tuple[str, tuple[tuple[str, str], ...]], PrometheusSample
+        ],
+        raw_samples: dict[
+            tuple[str, tuple[tuple[str, str], ...]], PrometheusSample
+        ],
+    ) -> tuple[PrometheusSample, ...]:
+        prefix = (
+            "proberca_tcp_edge_"
+            if edge else "proberca_service_request_"
+        )
+        count_name = prefix + "request_total" if edge else prefix + "total"
+        bucket_name = (
+            prefix + "latency_milliseconds_bucket"
+        )
+        families: dict[
+            tuple[tuple[str, str], ...], list[PrometheusSample]
+        ] = {}
+        for sample in samples:
+            if not sample.name.startswith(prefix):
+                raise RawCollectionError(
+                    "request persistence received an incompatible metric"
+                )
+            families.setdefault(
+                self._request_family_key(sample), []
+            ).append(sample)
+
+        present = {sample.identity for sample in samples}
+        transient: dict[
+            tuple[str, tuple[tuple[str, str], ...]], PrometheusSample
+        ] = {}
+        inconsistent_families: set[
+            tuple[tuple[str, str], ...]
+        ] = set()
+
+        for family_key, family_samples in families.items():
+            counters = [
+                sample for sample in family_samples
+                if sample.name != bucket_name
+            ]
+            histogram = [
+                sample for sample in family_samples
+                if sample.name == bucket_name
+            ]
+            counts = [
+                sample for sample in counters
+                if sample.name == count_name
+            ]
+            if len(counts) > 1:
+                raise RawCollectionError(
+                    "request family has duplicate count samples"
+                )
+
+            histogram_consistent = True
+            ordered_histogram: list[PrometheusSample] = []
+            if histogram:
+                bounds = [item.label_dict.get("le") for item in histogram]
+                if (
+                    len(bounds) != len(set(bounds))
+                    or "+Inf" not in bounds
+                ):
+                    histogram_consistent = False
+                else:
+                    ordered_histogram = sorted(
+                        histogram,
+                        key=lambda item: (
+                            math.inf
+                            if item.label_dict["le"] == "+Inf"
+                            else float(item.label_dict["le"])
+                        ),
+                    )
+                    values = [item.value for item in ordered_histogram]
+                    histogram_consistent = values == sorted(values)
+
+                previous_bounds = {
+                    item.label_dict.get("le")
+                    for item in raw_samples.values()
+                    if item.name == bucket_name
+                    and self._request_family_key(item) == family_key
+                }
+                if previous_bounds and set(bounds) != previous_bounds:
+                    histogram_consistent = False
+                if counts and ordered_histogram and not math.isclose(
+                    counts[0].value,
+                    ordered_histogram[-1].value,
+                    rel_tol=0.0,
+                    abs_tol=0.0,
+                ):
+                    histogram_consistent = False
+
+            state_candidates = counters + (
+                ordered_histogram if histogram_consistent else []
+            )
+            family_reset = any(
+                (previous_raw := raw_samples.get(sample.identity))
+                is not None
+                and sample.value < previous_raw.value
+                for sample in state_candidates
+            )
+            for sample in counters:
+                previous = high_water.get(sample.identity)
+                previous_raw = raw_samples.get(sample.identity)
+                if previous is None or previous_raw is None:
+                    value = sample.value
+                elif family_reset:
+                    value = previous.value + sample.value
+                else:
+                    value = (
+                        previous.value
+                        + sample.value
+                        - previous_raw.value
+                    )
+                high_water[sample.identity] = PrometheusSample(
+                    sample.name, sample.labels, value
+                )
+                raw_samples[sample.identity] = sample
+
+            if histogram_consistent:
+                for sample in ordered_histogram:
+                    previous = high_water.get(sample.identity)
+                    previous_raw = raw_samples.get(sample.identity)
+                    if previous is None or previous_raw is None:
+                        value = sample.value
+                    elif family_reset:
+                        value = previous.value + sample.value
+                    else:
+                        value = (
+                            previous.value
+                            + sample.value
+                            - previous_raw.value
+                        )
+                    high_water[sample.identity] = PrometheusSample(
+                        sample.name, sample.labels, value
+                    )
+                    raw_samples[sample.identity] = sample
+            elif histogram:
+                # Preserve the last consistent persistent state.  The current
+                # observation is emitted only as a diagnostic snapshot marked
+                # inconsistent, so downstream latency is explicitly invalid
+                # while count/error/timeout remain independently usable.
+                inconsistent_families.add(family_key)
+                for sample in histogram:
+                    previous = high_water.get(sample.identity)
+                    previous_raw = raw_samples.get(sample.identity)
+                    value = sample.value
+                    if (
+                        previous is not None
+                        and previous_raw is not None
+                        and sample.value >= previous_raw.value
+                    ):
+                        value = (
+                            previous.value
+                            + sample.value
+                            - previous_raw.value
+                        )
+                    transient[sample.identity] = PrometheusSample(
+                        sample.name, sample.labels, value
+                    )
+
+        output = []
+        identities = sorted(set(high_water) | set(transient))
+        for key in identities:
+            sample = transient.get(key, high_water.get(key))
+            labels = sample.label_dict
+            labels["source_coverage"] = (
+                "1" if key in present else "0"
+            )
+            if sample.name == bucket_name:
+                labels["histogram_consistent"] = (
+                    "0"
+                    if self._request_family_key(sample)
+                    in inconsistent_families
+                    else "1"
+                )
+            output.append(PrometheusSample.create(
+                sample.name, labels, sample.value,
+            ))
+        return tuple(output)
+
     def _persistent_edge_samples(
         self, samples: tuple[PrometheusSample, ...],
     ) -> tuple[PrometheusSample, ...]:
@@ -1183,47 +1380,12 @@ class FinalPrimitiveExporter:
         if raw_samples is None:
             raw_samples = {}
             self._edge_sample_raw = raw_samples
-        present = {sample.identity for sample in samples}
-        for sample in samples:
-            if not sample.name.startswith("proberca_tcp_edge_"):
-                raise RawCollectionError(
-                    "edge persistence received a non-edge metric"
-                )
-            previous = self._edge_sample_high_water.get(sample.identity)
-            previous_raw = raw_samples.get(sample.identity)
-            if previous is None or previous_raw is None:
-                value = sample.value
-            elif sample.value >= previous_raw.value:
-                value = (
-                    previous.value
-                    + sample.value
-                    - previous_raw.value
-                )
-            else:
-                # Beyla retires inactive series after its frozen TTL.  When
-                # the same semantic series reappears, its Prometheus counter
-                # starts again from zero.  Preserve every post-reset event by
-                # rebasing the new raw counter onto the logical cumulative
-                # total; max(old, new) would silently discard those events and
-                # can make cumulative histogram bucket deltas non-monotonic.
-                value = previous.value + sample.value
-            self._edge_sample_high_water[sample.identity] = (
-                PrometheusSample(
-                    sample.name, sample.labels, value
-                )
-            )
-            raw_samples[sample.identity] = sample
-        output = []
-        for key in sorted(self._edge_sample_high_water):
-            sample = self._edge_sample_high_water[key]
-            labels = sample.label_dict
-            labels["source_coverage"] = (
-                "1" if key in present else "0"
-            )
-            output.append(PrometheusSample.create(
-                sample.name, labels, sample.value,
-            ))
-        return tuple(output)
+        return self._persistent_request_samples(
+            samples,
+            edge=True,
+            high_water=self._edge_sample_high_water,
+            raw_samples=raw_samples,
+        )
 
     def _persistent_service_samples(
         self,
@@ -1250,7 +1412,7 @@ class FinalPrimitiveExporter:
             if coordinates not in active:
                 del self._service_sample_high_water[key]
                 raw_samples.pop(key, None)
-        present: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+        filtered = []
         for sample in samples:
             if not sample.name.startswith("proberca_service_"):
                 raise RawCollectionError(
@@ -1268,40 +1430,20 @@ class FinalPrimitiveExporter:
                 # the authority for this snapshot, so the retired series must
                 # neither fail the exporter nor enter the high-water cache.
                 continue
-            present.add(sample.identity)
-            previous = self._service_sample_high_water.get(sample.identity)
-            previous_raw = raw_samples.get(sample.identity)
-            if previous is None or previous_raw is None:
-                value = sample.value
-            elif sample.value >= previous_raw.value:
-                value = (
-                    previous.value
-                    + sample.value
-                    - previous_raw.value
-                )
-            else:
-                value = previous.value + sample.value
-            self._service_sample_high_water[sample.identity] = (
-                PrometheusSample(sample.name, sample.labels, value)
-            )
-            raw_samples[sample.identity] = sample
-        output = []
-        for key in sorted(self._service_sample_high_water):
-            sample = self._service_sample_high_water[key]
-            labels = sample.label_dict
-            labels["source_coverage"] = (
-                "1" if key in present else "0"
-            )
-            output.append(PrometheusSample.create(
-                sample.name, labels, sample.value,
-            ))
-        return tuple(output)
+            filtered.append(sample)
+        return self._persistent_request_samples(
+            tuple(filtered),
+            edge=False,
+            high_water=self._service_sample_high_water,
+            raw_samples=raw_samples,
+        )
 
     @staticmethod
     def _stable_request_samples(
         samples: tuple[PrometheusSample, ...],
         *,
         edge: bool,
+        diagnostic_mapping: dict[str, set[str]] | None = None,
     ) -> tuple[PrometheusSample, ...]:
         coordinate_names = (
             (
@@ -1316,8 +1458,12 @@ class FinalPrimitiveExporter:
         coverages: dict[
             tuple[str, tuple[tuple[str, str], ...]], float
         ] = {}
+        consistencies: dict[
+            tuple[str, tuple[tuple[str, str], ...]], float
+        ] = {}
         for sample in samples:
             labels = sample.label_dict
+            raw_source_series = labels.get("source_series")
             try:
                 source_coverage = float(
                     labels.pop("source_coverage")
@@ -1338,10 +1484,22 @@ class FinalPrimitiveExporter:
                 raise RawCollectionError(
                     "persistent request sample lacks stable coordinates"
                 )
-            labels["source_series"] = _series_hash(
+            histogram_consistency = labels.pop(
+                "histogram_consistent", "1"
+            )
+            if histogram_consistency not in {"0", "1"}:
+                raise RawCollectionError(
+                    "histogram consistency marker must be zero or one"
+                )
+            stable_source_series = _series_hash(
                 "edge-aggregate" if edge else "service-aggregate",
                 tuple(sorted(coordinates.items())),
             )
+            labels["source_series"] = stable_source_series
+            if edge and diagnostic_mapping is not None:
+                diagnostic_mapping.setdefault(
+                    stable_source_series, set()
+                ).add(raw_source_series or "")
             identity = (
                 sample.name,
                 tuple(sorted(labels.items())),
@@ -1350,6 +1508,10 @@ class FinalPrimitiveExporter:
             coverages[identity] = max(
                 coverages.get(identity, 0.0), source_coverage,
             )
+            consistencies[identity] = min(
+                consistencies.get(identity, 1.0),
+                float(histogram_consistency),
+            )
         return tuple(
             PrometheusSample.create(
                 name,
@@ -1357,6 +1519,16 @@ class FinalPrimitiveExporter:
                     **dict(labels),
                     "source_coverage": (
                         "1" if coverages[(name, labels)] else "0"
+                    ),
+                    **(
+                        {
+                            "histogram_consistent": (
+                                "1"
+                                if consistencies[(name, labels)]
+                                else "0"
+                            ),
+                        }
+                        if name.endswith("_bucket") else {}
                     ),
                 },
                 value,
@@ -1842,6 +2014,7 @@ class FinalPrimitiveExporter:
                 self._render_request_rows(edge_rows, edge=True)
             ),
             edge=True,
+            diagnostic_mapping=self._stable_edge_source_series,
         )
         covered_services = {
             (item.label_dict["namespace"],

@@ -792,7 +792,7 @@ class CollectionArchive:
 
 
 class CollectionArchiveWriter:
-    """Accumulate collection output and atomically publish one sealed archive."""
+    """Incrementally persist windows and publish a manifest only on seal."""
 
     def __init__(
         self,
@@ -810,7 +810,10 @@ class CollectionArchiveWriter:
         self.source_description = source_description
         self.collection_metadata = dict(collection_metadata or {})
         self.clock_ns = clock_ns
-        self._windows: list[CollectedWindow] = []
+        self._count = 0
+        self._first: CollectedWindow | None = None
+        self._last: CollectedWindow | None = None
+        self._namespaces: set[str] = set()
         self._topology_tracker = _TopologyVersionTracker()
         self._normal_source_ids: set[str] = set()
         self._burst_source_ids: set[str] = set()
@@ -833,6 +836,25 @@ class CollectionArchiveWriter:
                 or self.collection_metadata["burst_config_fingerprint"] \
                 != self.collection_contract["burst_config_fingerprint"]:
             raise CollectionArchiveError("archive collection configuration mismatch")
+        self.root.mkdir(parents=True, exist_ok=False)
+        self.windows_path = self.root / WINDOWS_NAME
+        self._handle = self.windows_path.open(
+            "x", encoding="utf-8", newline="\n",
+        )
+
+    @property
+    def window_count(self) -> int:
+        return self._count
+
+    @property
+    def last_committed_sequence(self) -> int:
+        return 0 if self._last is None else self._last.sequence
+
+    def close_partial(self) -> None:
+        if not self._handle.closed:
+            self._handle.flush()
+            os.fsync(self._handle.fileno())
+            self._handle.close()
 
     def append(self, window: CollectedWindow) -> None:
         if self._sealed:
@@ -867,8 +889,8 @@ class CollectionArchiveWriter:
             raise CollectionArchiveError(
                 "Burst and residual sources overlap across collected windows"
             )
-        if self._windows:
-            previous = self._windows[-1]
+        if self._last is not None:
+            previous = self._last
             if window.sequence != previous.sequence + 1:
                 raise CollectionArchiveError("data-plane sequence must be contiguous")
             if window.window_start_ns < previous.window_end_ns:
@@ -880,7 +902,21 @@ class CollectionArchiveWriter:
                 raise CollectionArchiveError("one archive cannot mix window durations")
         elif window.sequence != 1:
             raise CollectionArchiveError("first data-plane sequence must be 1")
-        self._windows.append(window)
+        self._handle.write(canonical_json(window.to_dict()))
+        self._handle.write("\n")
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+        self._count += 1
+        self._first = window if self._first is None else self._first
+        self._last = window
+        self._namespaces.update(
+            item.namespace
+            for item in (
+                *window.node_metrics,
+                *window.edge_metrics,
+                *window.burst_evidence,
+            )
+        )
         self._topology_tracker.commit(topology_additions)
         self._normal_source_ids.update(current_normal)
         self._burst_source_ids.update(current_burst)
@@ -892,54 +928,48 @@ class CollectionArchiveWriter:
     def seal(self) -> CollectionArchive:
         if self._sealed:
             raise CollectionArchiveError("collection archive is already sealed")
-        if not self._windows:
+        if self._count <= 0:
             raise CollectionArchiveError("cannot seal an empty collection archive")
-        self.root.mkdir(parents=True, exist_ok=True)
         manifest_path = self.root / MANIFEST_NAME
-        windows_path = self.root / WINDOWS_NAME
-        if manifest_path.exists() or windows_path.exists():
-            raise CollectionArchiveError("collection archive target is not empty")
-        temporary = self.root / f".{WINDOWS_NAME}.{os.getpid()}.tmp"
+        if manifest_path.exists():
+            raise CollectionArchiveError("collection archive is already published")
+        self.close_partial()
+        first, last = self._first, self._last
+        if first is None or last is None:
+            raise AssertionError("non-empty archive lacks boundary windows")
+        payload = {
+            "schema_version": COLLECTION_ARCHIVE_SCHEMA_VERSION,
+            "dataset_id": self.dataset_id,
+            "cluster_id": first.cluster_id,
+            "namespaces": sorted(self._namespaces),
+            "window_sec": (
+                first.window_end_ns - first.window_start_ns
+            ) // 1_000_000_000,
+            "start_ns": first.window_start_ns,
+            "end_ns": last.window_end_ns,
+            "window_count": self._count,
+            "windows_file": WINDOWS_NAME,
+            "windows_sha256": _file_sha256(self.windows_path),
+            "collection_contract": self.collection_contract,
+            "collection_contract_fingerprint": fingerprint(
+                self.collection_contract
+            ),
+            "source_description": self.source_description,
+            "collection_metadata": self.collection_metadata,
+            "created_at_ns": int(self.clock_ns()),
+            "sealed": True,
+        }
+        payload["manifest_fingerprint"] = fingerprint(payload)
+        manifest_temporary = (
+            self.root / f".{MANIFEST_NAME}.{os.getpid()}.tmp"
+        )
         try:
-            with temporary.open("x", encoding="utf-8", newline="\n") as handle:
-                for window in self._windows:
-                    handle.write(canonical_json(window.to_dict()))
-                    handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, windows_path)
-            first, last = self._windows[0], self._windows[-1]
-            namespaces = tuple(sorted({
-                item.namespace
-                for window in self._windows
-                for item in (*window.node_metrics, *window.edge_metrics, *window.burst_evidence)
-            }))
-            payload = {
-                "schema_version": COLLECTION_ARCHIVE_SCHEMA_VERSION,
-                "dataset_id": self.dataset_id,
-                "cluster_id": first.cluster_id,
-                "namespaces": list(namespaces),
-                "window_sec": (first.window_end_ns - first.window_start_ns) // 1_000_000_000,
-                "start_ns": first.window_start_ns,
-                "end_ns": last.window_end_ns,
-                "window_count": len(self._windows),
-                "windows_file": WINDOWS_NAME,
-                "windows_sha256": _file_sha256(windows_path),
-                "collection_contract": self.collection_contract,
-                "collection_contract_fingerprint": fingerprint(self.collection_contract),
-                "source_description": self.source_description,
-                "collection_metadata": self.collection_metadata,
-                "created_at_ns": int(self.clock_ns()),
-                "sealed": True,
-            }
-            payload["manifest_fingerprint"] = fingerprint(payload)
-            manifest_temporary = self.root / f".{MANIFEST_NAME}.{os.getpid()}.tmp"
             manifest_temporary.write_text(
                 canonical_json(payload) + "\n", encoding="utf-8",
             )
             os.replace(manifest_temporary, manifest_path)
-            self._sealed = True
-            return CollectionArchive.load(self.root)
         finally:
-            if temporary.exists():
-                temporary.unlink()
+            if manifest_temporary.exists():
+                manifest_temporary.unlink()
+        self._sealed = True
+        return CollectionArchive.load(self.root)

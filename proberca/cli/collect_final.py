@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from pathlib import Path
 
@@ -33,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Collect Kubernetes/Prometheus raw primitives, perform only the "
-            "frozen 9/4/3/3 aggregation, and seal a collection archive. "
+            "frozen 9/4/3 aggregation, and seal aligned archives. "
             "No alerting or RCA algorithm is imported or executed."
         ),
     )
@@ -44,6 +45,49 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--burst-output", type=Path, required=True)
     parser.add_argument("--windows", type=int, required=True)
     return parser
+
+
+def _write_aligned_windows(
+    *,
+    runner,
+    normal_writer: CollectionArchiveWriter,
+    burst_writer: BurstArchiveWriter,
+    window_count: int,
+) -> None:
+    try:
+        if normal_writer.dataset_id != burst_writer.dataset_id:
+            raise ValueError("Normal and Burst Dataset IDs differ")
+        for normal_window, burst_window in runner.iter_collect_aligned(
+            window_count
+        ):
+            normal_writer.append(normal_window)
+            burst_writer.append(burst_window)
+    except Exception:
+        normal_writer.close_partial()
+        burst_writer.close_partial()
+        aligned = (
+            normal_writer.window_count == burst_writer.window_count
+        )
+        print(canonical_json({
+            "burst_partial_window_count": burst_writer.window_count,
+            "last_committed_sequence": (
+                normal_writer.last_committed_sequence
+                if aligned else None
+            ),
+            "normal_partial_window_count": normal_writer.window_count,
+            "partial_archives_aligned": aligned,
+            "phase": "collection_failed",
+        }), file=sys.stderr)
+        raise
+    if (
+        normal_writer.window_count != window_count
+        or burst_writer.window_count != window_count
+        or normal_writer.last_committed_sequence
+        != burst_writer.last_committed_sequence
+    ):
+        normal_writer.close_partial()
+        burst_writer.close_partial()
+        raise ValueError("Normal/Burst completed window counts differ")
 
 
 def main(argv=None) -> int:
@@ -81,7 +125,6 @@ def main(argv=None) -> int:
         collection_contract=contract,
         primitive_source=primitive_source,
         raw_burst_source=burst_source,
-        raw_burst_sink=burst_writer,
     )
     metadata = {
         "collector_build_fingerprint": (
@@ -101,8 +144,12 @@ def main(argv=None) -> int:
         source_description=contract["source_description"],
         collection_metadata=metadata,
     )
-    for window in runner.collect(args.windows):
-        writer.append(window)
+    _write_aligned_windows(
+        runner=runner,
+        normal_writer=writer,
+        burst_writer=burst_writer,
+        window_count=args.windows,
+    )
     archive = writer.seal()
     burst_archive = burst_writer.seal()
     print(canonical_json({
@@ -114,6 +161,9 @@ def main(argv=None) -> int:
         "manifest_fingerprint": archive.manifest_fingerprint,
         "output": str(archive.root),
         "phase": "collection_sealed",
+        "prometheus_range_query_stats": (
+            primitive_source.last_range_query_stats
+        ),
         "window_count": archive.window_count,
     }))
     return 0

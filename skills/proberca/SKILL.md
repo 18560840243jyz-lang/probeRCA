@@ -2159,6 +2159,7 @@ A_v\text{健康传播扣除}
 - 数据面使用`value / valid / invalid_reason`显式表达有效性；`valid=false`时`value`必须为`null`。
 - 原始采集`coverage = 0`时使用`invalid_reason=zero_coverage`，不能补零、前向填充、插值或复用上一窗口值。
 - 采集完整但请求/操作计数为0时，计数是有效零；无定义的P95和失败率使用`invalid_reason=no_exposure`。
+- 累计直方图没有负delta、但开始/结束快照、桶delta或`+Inf`与独立count不一致时，只将对应latency写成`invalid_reason=inconsistent_histogram`；count和failure保持独立有效。任何负bucket delta仍是累计生命周期硬失败。
 - 缺失指标不能进入Healthy基线、告警或(A_v)训练。
 - latency P95必须满足最小样本数。
 - failure rate必须拥有足够的请求暴露量；无请求窗口是缺失，不是健康零值。
