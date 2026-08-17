@@ -57,7 +57,7 @@ class RawBurstWindowSource(Protocol):
     ):
         ...
 
-    def begin_capture(self) -> None:
+    def begin_capture(self, inventory_revision) -> None:
         ...
 
     def capture_boundary(
@@ -681,7 +681,7 @@ class FinalLiveCollectionRunner:
                 raise RawCollectionError(
                     "raw Burst source cannot capture exact boundaries"
                 )
-            begin_capture()
+            begin_capture(before)
             self._wait_until(bounds[0][0])
             capture_boundary(bounds[0][0], before)
             for _start_ns, end_ns in bounds:

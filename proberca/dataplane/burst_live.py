@@ -174,7 +174,7 @@ def _ipv4(raw: Any) -> str | None:
         return None
 
 
-def _read_counter(path: Path, key: str) -> int:
+def _read_counter_values(path: Path) -> dict[str, int]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError as error:
@@ -190,9 +190,17 @@ def _read_counter(path: Path, key: str) -> int:
             raise RawCollectionError(
                 f"non-integer Burst counter in {path}"
             ) from error
+    return values
+
+
+def _counter_value(values: dict[str, int], path: Path, key: str) -> int:
     if key not in values or values[key] < 0:
         raise RawCollectionError(f"Burst counter {key} missing from {path}")
     return values[key]
+
+
+def _read_counter(path: Path, key: str) -> int:
+    return _counter_value(_read_counter_values(path), path, key)
 
 
 class FinalLiveBurstSource:
@@ -225,30 +233,52 @@ class FinalLiveBurstSource:
             int, dict[int, tuple[int, int, int]]
         ] = {}
         self._boundary_nic: dict[int, tuple[int, int, int]] = {}
+        self._boundary_revision_token: tuple[str, Any] | None = None
+        self._boundary_runtime_paths: dict[int, Path] = {}
+        self._boundary_runtime_inodes: dict[Path, int] = {}
+        self._nic_counter_paths: tuple[Path, ...] | None = None
 
     @property
     def source_record_ids(self) -> tuple[str, ...]:
         return ()
 
-    def begin_capture(self) -> None:
+    @staticmethod
+    def _revision_token(revision) -> tuple[str, Any]:
+        revision_id = getattr(revision, "revision_id", None)
+        if isinstance(revision_id, str) and revision_id:
+            return ("revision_id", revision_id)
+        return ("object_identity", id(revision))
+
+    def begin_capture(self, revision) -> None:
         """Fix the log offset before a contiguous collection interval."""
         self._boundary_capture_enabled = True
         self._boundary_memory = {}
         self._boundary_nic = {}
         self._read_log()
+        paths = self._runtime_counter_paths(revision)
+        self._boundary_revision_token = self._revision_token(revision)
+        self._boundary_runtime_paths = dict(paths)
+        self._boundary_runtime_inodes = {
+            path: cgroup_id for cgroup_id, path in paths.items()
+        }
+        self._nic_counter_paths = self._resolve_nic_counter_paths()
 
     def _runtime_counter_paths(self, revision) -> dict[int, Path]:
         identities = tuple(runtime_identities(revision))
         needs_refresh = False
         container_ids = []
         for identity in identities:
+            if not identity.service_ids or getattr(
+                    identity, "container_type", "app") != "app":
+                continue
             if (
                 not identity.ready
                 or not identity.started
                 or not identity.full_container_id
-                or not identity.service_ids
             ):
-                continue
+                raise RawCollectionError(
+                    "Burst runtime container identity is incomplete"
+                )
             container_id = identity.full_container_id.rsplit(
                 "://", 1
             )[-1]
@@ -275,7 +305,9 @@ class FinalLiveBurstSource:
                 or path is None
                 or not path.is_dir()
             ):
-                continue
+                raise RawCollectionError(
+                    "Burst cgroup identity is missing or ambiguous"
+                )
             cgroup_id = path.stat().st_ino
             previous = output.setdefault(cgroup_id, path)
             if previous != path:
@@ -286,32 +318,78 @@ class FinalLiveBurstSource:
 
     @staticmethod
     def _memory_totals(path: Path) -> tuple[int, int, int]:
+        memory_stat_path = path / "memory.stat"
+        memory_events_path = path / "memory.events"
+        memory_stat = _read_counter_values(memory_stat_path)
+        memory_events = _read_counter_values(memory_events_path)
         return (
-            _read_counter(path / "memory.stat", "pgfault"),
-            _read_counter(path / "memory.stat", "pgmajfault"),
-            _read_counter(path / "memory.events", "oom_kill"),
+            _counter_value(memory_stat, memory_stat_path, "pgfault"),
+            _counter_value(memory_stat, memory_stat_path, "pgmajfault"),
+            _counter_value(memory_events, memory_events_path, "oom_kill"),
         )
 
-    def _nic_totals(self) -> tuple[int, int, int]:
-        packets = drops = errors = 0
+    def _resolve_nic_counter_paths(self) -> tuple[Path, ...]:
         root = Path(self.config.network_class_path)
-        for interface in root.iterdir():
+        paths = []
+        try:
+            interfaces = tuple(sorted(root.iterdir(), key=lambda item: item.name))
+        except OSError as error:
+            raise RawCollectionError(
+                "Burst NIC counter directory is unavailable"
+            ) from error
+        for interface in interfaces:
             if interface.name == "lo":
                 continue
             statistics = interface / "statistics"
-            packets += sum(
-                int((statistics / name).read_text(encoding="ascii"))
-                for name in ("rx_packets", "tx_packets")
+            paths.extend(
+                statistics / name
+                for name in (
+                    "rx_packets", "tx_packets", "rx_dropped",
+                    "tx_dropped", "rx_errors", "tx_errors",
+                )
             )
-            drops += sum(
-                int((statistics / name).read_text(encoding="ascii"))
-                for name in ("rx_dropped", "tx_dropped")
+        return tuple(paths)
+
+    def _nic_totals(self) -> tuple[int, int, int]:
+        paths = self._nic_counter_paths
+        if paths is None:
+            paths = self._resolve_nic_counter_paths()
+        values = []
+        for path in paths:
+            try:
+                value = int(path.read_text(encoding="ascii"))
+            except (OSError, ValueError) as error:
+                raise RawCollectionError(
+                    f"cannot read Burst NIC counter {path}"
+                ) from error
+            if value < 0:
+                raise RawCollectionError(
+                    f"Burst NIC counter is negative: {path}"
+                )
+            values.append(value)
+        return (
+            sum(values[0::6]) + sum(values[1::6]),
+            sum(values[2::6]) + sum(values[3::6]),
+            sum(values[4::6]) + sum(values[5::6]),
+        )
+
+    def _frozen_runtime_counter_paths(self, revision) -> dict[int, Path]:
+        if self._revision_token(revision) != self._boundary_revision_token:
+            raise RawCollectionError(
+                "Burst runtime identity changed during boundary capture"
             )
-            errors += sum(
-                int((statistics / name).read_text(encoding="ascii"))
-                for name in ("rx_errors", "tx_errors")
-            )
-        return packets, drops, errors
+        for path, expected_inode in self._boundary_runtime_inodes.items():
+            try:
+                current_inode = path.stat().st_ino
+            except OSError as error:
+                raise RawCollectionError(
+                    "Burst cgroup path disappeared during boundary capture"
+                ) from error
+            if not path.is_dir() or current_inode != expected_inode:
+                raise RawCollectionError(
+                    "Burst cgroup identity changed during boundary capture"
+                )
+        return self._boundary_runtime_paths
 
     def capture_boundary(self, timestamp_ns: int, revision) -> None:
         """Snapshot raw cumulative counters at an exact window boundary."""
@@ -336,8 +414,7 @@ class FinalLiveBurstSource:
             raise RawCollectionError(
                 "Burst boundaries must be captured in order"
             )
-        self._read_log()
-        paths = self._runtime_counter_paths(revision)
+        paths = self._frozen_runtime_counter_paths(revision)
         self._boundary_memory[timestamp_ns] = {
             cgroup_id: self._memory_totals(path)
             for cgroup_id, path in paths.items()
@@ -556,9 +633,7 @@ class FinalLiveBurstSource:
         current = {}
         for cgroup_id, identity in cgroups.items():
             path = identity["path"]
-            pgfault = _read_counter(path / "memory.stat", "pgfault")
-            pgmajfault = _read_counter(path / "memory.stat", "pgmajfault")
-            oom_kill = _read_counter(path / "memory.events", "oom_kill")
+            pgfault, pgmajfault, oom_kill = self._memory_totals(path)
             current[cgroup_id] = (pgfault, pgmajfault, oom_kill)
             previous = self._memory_state.get(cgroup_id)
             if previous is None:

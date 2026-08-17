@@ -92,6 +92,7 @@ def _filesystem(tmp_path: Path):
 def _inventory():
     return SimpleNamespace(
         cluster_id="cluster",
+        revision_id="revision-1",
         objects_by_kind={
             "Service": {
                 "dst": {
@@ -332,7 +333,7 @@ def test_continuous_counters_use_exact_captured_window_boundaries(
         _config(tmp_path),
         burst_config_fingerprint=fingerprint({"burst": "contract"}),
     )
-    source.begin_capture()
+    source.begin_capture(_inventory())
     source.capture_boundary(START, _inventory())
 
     (cgroup / "memory.stat").write_text(
@@ -366,6 +367,162 @@ def test_continuous_counters_use_exact_captured_window_boundaries(
     nic = samples[("host", "nic.queue_drop_rate")]
     assert nic.value == 2
     assert nic.exposure == 15
+
+
+def test_boundary_defers_log_read_and_collects_all_timestamped_events(
+    tmp_path, monkeypatch,
+):
+    cgroup = _filesystem(tmp_path)
+    cgroup_id = cgroup.stat().st_ino
+    event_path = Path(_config(tmp_path).event_log_path)
+    initial = [
+        {
+            "record_type": "control",
+            "schema_version": 1,
+            "state": "ready",
+            "timestamp_ns": START - 1,
+            "program_count": 31,
+            "timeout_ms": 5000,
+            "sampling_profile": "low",
+        },
+        {
+            "record_type": "checkpoint",
+            "schema_version": 1,
+            "timestamp_ns": START,
+            "monotonic_ns": 0,
+            "emitted": 0,
+            "reserve_failed": 0,
+            "program_count": 31,
+            "sampling_profile": "low",
+        },
+    ]
+    event_path.write_text(
+        "".join(json.dumps(item) + "\n" for item in initial),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "proberca.dataplane.burst_live.runtime_identities",
+        lambda revision: (_identity(),),
+    )
+    source = FinalLiveBurstSource(
+        _config(tmp_path),
+        burst_config_fingerprint=fingerprint({"burst": "contract"}),
+    )
+    inventory = _inventory()
+    source.begin_capture(inventory)
+    later = [
+        _event(5, cgroup_id),
+        {
+            "record_type": "checkpoint",
+            "schema_version": 1,
+            "timestamp_ns": END,
+            "monotonic_ns": 1_000_000_000,
+            "emitted": 1,
+            "reserve_failed": 0,
+            "program_count": 31,
+            "sampling_profile": "low",
+        },
+    ]
+    with event_path.open("a", encoding="utf-8") as handle:
+        handle.write("".join(json.dumps(item) + "\n" for item in later))
+    original_read_log = source._read_log
+    read_calls = []
+
+    def counted_read_log():
+        read_calls.append(True)
+        return original_read_log()
+
+    monkeypatch.setattr(source, "_read_log", counted_read_log)
+    source.capture_boundary(START, inventory)
+    source.capture_boundary(END, inventory)
+    assert read_calls == []
+    window = source.collect_window(
+        sequence=1,
+        window_start_ns=START,
+        window_end_ns=END,
+        inventory_revision=inventory,
+        normal_raw_window=_normal_raw_window(),
+    )
+    assert read_calls == [True]
+    futex = next(
+        sample for sample in window.samples
+        if sample.channel_id == "futex.wait_count"
+    )
+    assert futex.value == 1
+    assert window.event_loss_rate == 0
+
+
+def test_memory_totals_reads_each_counter_file_once(tmp_path, monkeypatch):
+    cgroup = _filesystem(tmp_path)
+    original_read_text = Path.read_text
+    reads = []
+
+    def counted_read_text(path, *args, **kwargs):
+        if path.name in {"memory.stat", "memory.events"}:
+            reads.append(path.name)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read_text)
+    assert FinalLiveBurstSource._memory_totals(cgroup) == (10, 2, 0)
+    assert reads == ["memory.stat", "memory.events"]
+
+
+def test_boundary_reuses_frozen_cgroup_and_nic_paths(tmp_path, monkeypatch):
+    _filesystem(tmp_path)
+    monkeypatch.setattr(
+        "proberca.dataplane.burst_live.runtime_identities",
+        lambda revision: (_identity(),),
+    )
+    event_path = Path(_config(tmp_path).event_log_path)
+    event_path.write_text("", encoding="utf-8")
+    source = FinalLiveBurstSource(
+        _config(tmp_path),
+        burst_config_fingerprint=fingerprint({"burst": "contract"}),
+    )
+    inventory = _inventory()
+    source.begin_capture(inventory)
+    monkeypatch.setattr(
+        source,
+        "_refresh_cgroup_paths",
+        lambda _root: pytest.fail("boundary rescanned cgroup directories"),
+    )
+    original_iterdir = Path.iterdir
+
+    def guarded_iterdir(path):
+        if path == Path(source.config.network_class_path):
+            pytest.fail("boundary rescanned NIC directories")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
+    source.capture_boundary(START, inventory)
+    source.capture_boundary(END, inventory)
+
+
+def test_boundary_rejects_revision_or_cgroup_identity_change(
+    tmp_path, monkeypatch,
+):
+    cgroup = _filesystem(tmp_path)
+    monkeypatch.setattr(
+        "proberca.dataplane.burst_live.runtime_identities",
+        lambda revision: (_identity(),),
+    )
+    Path(_config(tmp_path).event_log_path).write_text("", encoding="utf-8")
+    source = FinalLiveBurstSource(
+        _config(tmp_path),
+        burst_config_fingerprint=fingerprint({"burst": "contract"}),
+    )
+    inventory = _inventory()
+    source.begin_capture(inventory)
+    changed = _inventory()
+    changed.revision_id = "revision-2"
+    with pytest.raises(RawCollectionError, match="runtime identity changed"):
+        source.capture_boundary(START, changed)
+
+    replacement = cgroup.with_name(cgroup.name + ".old")
+    cgroup.rename(replacement)
+    cgroup.mkdir()
+    with pytest.raises(RawCollectionError, match="cgroup identity changed"):
+        source.capture_boundary(START, inventory)
 
 
 def test_tcp_kernel_reverse_events_use_frozen_call_direction(
