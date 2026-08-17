@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
+import socket
+import threading
+from urllib.error import HTTPError
+from urllib.request import urlopen
 
 import pytest
 import yaml
 
 import scripts.install_final_dataplane as install_module
+import proberca.dataplane.primitive_exporter as primitive_module
 from scripts.install_final_dataplane import (
     _service_matches_contract,
 )
@@ -107,19 +113,61 @@ def test_formal_live_collector_has_tcp_queries_but_no_dns_queries():
     )
 
 
-def test_inventory_refresh_is_pipelined_for_the_next_snapshot():
-    source = Path(
-        "proberca/dataplane/primitive_exporter.py"
-    ).read_text(encoding="utf-8")
-    cached = source.index("inventory = self._inventory_cache")
-    refresh = source.index(
-        "next_inventory_future = executor.submit(self._inventory)"
+def test_inventory_refresh_is_single_inflight_and_installed_atomically():
+    stale = SimpleNamespace(containers=(
+        SimpleNamespace(container_id="a" * 64),
+    ))
+    refreshed = SimpleNamespace(containers=(
+        SimpleNamespace(container_id="b" * 64),
+    ))
+    future = Future()
+    submissions = []
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter._inventory_cache = stale
+    exporter._inventory_refresh_lock = threading.Lock()
+    exporter._inventory_refresh_future = None
+    exporter._inventory = lambda: refreshed
+    exporter._inventory_refresh_executor = SimpleNamespace(
+        submit=lambda function: submissions.append(function) or future
     )
-    publish = source.index("self._inventory_cache = next_inventory")
-    aggregate = source.index(
-        "service_rows = self._request_rows(", publish
-    )
-    assert cached < refresh < publish < aggregate
+
+    exporter._start_inventory_refresh()
+    exporter._start_inventory_refresh()
+    assert submissions == [exporter._inventory]
+    with pytest.raises(
+        RawCollectionError, match="missed the next snapshot deadline"
+    ):
+        exporter._accept_inventory_refresh()
+    assert exporter._inventory_cache is stale
+
+    future.set_result(refreshed)
+    exporter._accept_inventory_refresh()
+    assert exporter._inventory_cache is refreshed
+    assert exporter._inventory_refresh_future is None
+
+
+def test_source_parser_warmup_is_read_only_and_uses_frozen_inventory():
+    pod = SimpleNamespace(container_id="coredns-container")
+    inventory = SimpleNamespace(coredns_pods=(pod,))
+    calls = []
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.config = SimpleNamespace(node_exporter_url="http://node/metrics")
+    exporter._inventory_and_cgroup_paths = lambda: (inventory, {})
+    exporter._beyla = lambda selected: calls.append(("beyla", selected))
+    exporter._fetch_url = lambda url: calls.append(("node", url))
+    exporter._coredns = lambda selected: calls.append(("coredns", selected))
+
+    exporter._warm_source_parsers()
+
+    assert sorted(name for name, _value in calls) == [
+        "beyla", "coredns", "node",
+    ]
+    assert next(value for name, value in calls if name == "beyla") \
+        is inventory
+    assert next(value for name, value in calls if name == "coredns") \
+        is pod
+    assert next(value for name, value in calls if name == "node") \
+        == "http://node/metrics"
 
 
 def test_final_bpf_normal_path_is_map_aggregated_and_window_safe():
@@ -210,6 +258,274 @@ def test_futex_counter_is_monotonic_and_bounded_by_thread_capacity():
     assert exporter._bounded_futex_counter(
         "container", 1_005.0, 10.0
     ) == 21.0
+
+
+def test_capacity_gap_fails_once_rebases_and_recovers(tmp_path):
+    cgroup = tmp_path / "container"
+    cgroup.mkdir()
+    (cgroup / "cpu.stat").write_text(
+        "usage_usec 100\nnr_throttled 0\nnr_periods 10\n",
+        encoding="utf-8",
+    )
+    (cgroup / "cpu.max").write_text("100000 100000\n", encoding="utf-8")
+    (cgroup / "memory.current").write_text("1024\n", encoding="utf-8")
+    (cgroup / "memory.max").write_text("2048\n", encoding="utf-8")
+    (cgroup / "memory.stat").write_text(
+        "inactive_file 128\n", encoding="utf-8"
+    )
+    (cgroup / "io.pressure").write_text(
+        "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        encoding="utf-8",
+    )
+    (cgroup / "cgroup.procs").write_text("1\n2\n", encoding="utf-8")
+    (cgroup / "cgroup.threads").write_text("1\n2\n3\n", encoding="utf-8")
+
+    identity = SimpleNamespace(
+        container_id="container-id",
+        namespace="online-boutique",
+        pod="service-pod",
+        container="server",
+        cpu_request_cores=1.0,
+        series="container-series",
+    )
+    inventory = SimpleNamespace(containers=(identity,))
+    cgroup_id = cgroup.stat().st_ino
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter._active_task_ns = {}
+    exporter._active_thread_ns = {}
+    exporter._futex_raw_high_water_ns = {}
+    exporter._futex_wait_ns = {}
+    exporter._last_capacity_ns = None
+
+    def bpf(raw_wait_ns):
+        return ({
+            "record_type": "cgroup",
+            "cgroup_id": cgroup_id,
+            "futex_wait_ns_total": raw_wait_ns,
+        },)
+
+    exporter._resource_samples(inventory, {"container-id": cgroup}, bpf(100), 1_000_000_000)
+    exporter._resource_samples(inventory, {"container-id": cgroup}, bpf(106), 2_000_000_000)
+    assert exporter._active_task_ns["container-id"] == 2_000_000_000
+    assert exporter._active_thread_ns["container-id"] == 3_000_000_000
+    assert exporter._futex_wait_ns["container-id"] == 6
+
+    with pytest.raises(
+        RawCollectionError, match="capacity_integration_gap_rebased"
+    ):
+        exporter._resource_samples(
+            inventory, {"container-id": cgroup}, bpf(160), 10_000_000_000
+        )
+    assert exporter._last_capacity_ns == 10_000_000_000
+    assert exporter._active_task_ns["container-id"] == 2_000_000_000
+    assert exporter._active_thread_ns["container-id"] == 3_000_000_000
+    assert exporter._futex_raw_high_water_ns["container-id"] == 160
+    assert exporter._futex_wait_ns["container-id"] == 6
+
+    recovered = exporter._resource_samples(
+        inventory, {"container-id": cgroup}, bpf(165), 11_000_000_000
+    )
+    values = {item.name: item.value for item in recovered}
+    assert values[
+        "proberca_cgroup_active_task_nanoseconds_total"
+    ] == 4_000_000_000
+    assert values[
+        "proberca_cgroup_active_thread_nanoseconds_total"
+    ] == 6_000_000_000
+    assert values[
+        "proberca_cgroup_futex_wait_nanoseconds_total"
+    ] == 11
+
+
+def test_snapshot_http_gate_recovers_after_one_gap(monkeypatch):
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter._lock = threading.Lock()
+    exporter._snapshot = ""
+    exporter._snapshot_ns = 0
+    exporter._last_error = None
+    exporter.wall_clock_ns = lambda: 11_000_000_000
+    outcomes = iter((
+        RawCollectionError("capacity_integration_gap_rebased"),
+        "metric_total 1 11000\n",
+    ))
+
+    def collect_snapshot(_timestamp_ns):
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(exporter, "collect_snapshot", collect_snapshot)
+    with pytest.raises(
+        RawCollectionError, match="capacity_integration_gap_rebased"
+    ):
+        exporter.snapshot_once(10_000_000_000)
+    assert "capacity_integration_gap_rebased" in exporter._response()[2]
+
+    exporter.snapshot_once(11_000_000_000)
+    snapshot, timestamp_ns, error = exporter._response()
+    assert snapshot == "metric_total 1 11000\n"
+    assert timestamp_ns == 11_000_000_000
+    assert error == ""
+    assert exporter._last_error is None
+
+
+def test_http_endpoints_return_to_200_after_rebased_gap(monkeypatch):
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.config = SimpleNamespace(
+        listen_host="127.0.0.1", listen_port=port
+    )
+    exporter._lock = threading.Lock()
+    exporter._stop = threading.Event()
+    exporter._snapshot = ""
+    exporter._snapshot_ns = 0
+    exporter._last_error = None
+    exporter._inventory_refresh_executor = SimpleNamespace(
+        shutdown=lambda **_kwargs: None
+    )
+    exporter.wall_clock_ns = lambda: 11_000_000_000
+    outcomes = iter((
+        RawCollectionError("capacity_integration_gap_rebased"),
+        "metric_total 1 11000\n",
+    ))
+    gap_ready = threading.Event()
+    continue_after_gap = threading.Event()
+    recovery_ready = threading.Event()
+    server_ready = threading.Event()
+    server_holder = {}
+
+    def collect_snapshot(_timestamp_ns):
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def snapshot_loop():
+        try:
+            exporter.snapshot_once(10_000_000_000)
+        except RawCollectionError:
+            gap_ready.set()
+        assert continue_after_gap.wait(timeout=5)
+        exporter.snapshot_once(11_000_000_000)
+        recovery_ready.set()
+
+    server_type = primitive_module.ThreadingHTTPServer
+
+    def server_factory(address, handler):
+        server = server_type(address, handler)
+        server_holder["server"] = server
+        server_ready.set()
+        return server
+
+    monkeypatch.setattr(exporter, "collect_snapshot", collect_snapshot)
+    monkeypatch.setattr(exporter, "_snapshot_loop", snapshot_loop)
+    monkeypatch.setattr(exporter, "_warm_source_parsers", lambda: None)
+    monkeypatch.setattr(
+        primitive_module, "ThreadingHTTPServer", server_factory
+    )
+    thread = threading.Thread(target=exporter.serve_forever, daemon=True)
+    thread.start()
+    assert server_ready.wait(timeout=5)
+    assert gap_ready.wait(timeout=5)
+
+    def http_status(path):
+        try:
+            with urlopen(
+                f"http://127.0.0.1:{port}{path}", timeout=2
+            ) as response:
+                return response.status
+        except HTTPError as error:
+            return error.code
+
+    assert http_status("/healthz") == 503
+    assert http_status("/metrics") == 503
+    continue_after_gap.set()
+    assert recovery_ready.wait(timeout=5)
+    assert http_status("/healthz") == 200
+    assert http_status("/metrics") == 200
+
+    server_holder["server"].shutdown()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
+def test_snapshot_loop_uses_fixed_one_second_deadlines():
+    clock = {"ns": 100_000_000}
+    targets = []
+
+    class Stop:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, seconds):
+            clock["ns"] += int(seconds * 1_000_000_000)
+            return False
+
+    stop = Stop()
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.config = SimpleNamespace(snapshot_period_sec=1)
+    exporter.wall_clock_ns = lambda: clock["ns"]
+    exporter._stop = stop
+    exporter._lock = threading.Lock()
+    exporter._last_error = None
+    exporter._snapshot_deadline_misses_total = 0
+
+    def snapshot_once(target_ns):
+        targets.append(target_ns)
+        clock["ns"] += 200_000_000
+        if len(targets) == 3:
+            stop.stopped = True
+
+    exporter.snapshot_once = snapshot_once
+    exporter._snapshot_loop()
+
+    assert targets == [1_000_000_000, 2_000_000_000, 3_000_000_000]
+    assert exporter._snapshot_deadline_misses_total == 0
+
+
+def test_snapshot_loop_reports_missed_deadline_without_backfill():
+    clock = {"ns": 100_000_000}
+    targets = []
+
+    class Stop:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, seconds):
+            clock["ns"] += int(seconds * 1_000_000_000)
+            return False
+
+    stop = Stop()
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.config = SimpleNamespace(snapshot_period_sec=1)
+    exporter.wall_clock_ns = lambda: clock["ns"]
+    exporter._stop = stop
+    exporter._lock = threading.Lock()
+    exporter._last_error = None
+    exporter._snapshot_deadline_misses_total = 0
+
+    def snapshot_once(target_ns):
+        targets.append(target_ns)
+        clock["ns"] += (
+            1_200_000_000 if len(targets) == 1 else 200_000_000
+        )
+        if len(targets) == 2:
+            stop.stopped = True
+
+    exporter.snapshot_once = snapshot_once
+    exporter._snapshot_loop()
+
+    assert targets == [1_000_000_000, 3_000_000_000]
+    assert exporter._snapshot_deadline_misses_total == 1
+    assert exporter._last_error.startswith("snapshot_deadline_missed:")
 
 
 def test_dns_query_counter_is_completed_responses_plus_timeouts():

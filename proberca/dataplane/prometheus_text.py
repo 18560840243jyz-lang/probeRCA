@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Iterable
 
 from .raw import RawCollectionError
@@ -52,6 +53,7 @@ def _unescape_label(value: str) -> str:
     return "".join(output)
 
 
+@lru_cache(maxsize=16_384)
 def _parse_labels(text: str | None) -> tuple[tuple[str, str], ...]:
     if text is None or text == "":
         return ()

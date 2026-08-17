@@ -16,7 +16,7 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -447,9 +447,16 @@ class FinalPrimitiveExporter:
         self._qdisc_drop_state: dict[str, tuple[float, float]] = {}
         self._last_capacity_ns: int | None = None
         self._inventory_cache: Inventory | None = None
+        self._inventory_refresh_lock = threading.Lock()
+        self._inventory_refresh_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="final-primitive-inventory",
+        )
+        self._inventory_refresh_future: Future[Inventory] | None = None
         self._cgroup_path_cache: tuple[
             tuple[str, ...], dict[str, Path]
         ] | None = None
+        self._snapshot_deadline_misses_total = 0
         self.dns_policy: DnsAggregationPolicy | None = None
         if self.config.experimental_dns_enabled:
             policy_payload = yaml.safe_load(Path(
@@ -779,6 +786,28 @@ class FinalPrimitiveExporter:
         self._futex_wait_ns[key] = value
         return value
 
+    def _rebase_capacity_integration(
+        self,
+        timestamp_ns: int,
+        cgroup_ids: dict[int, ContainerIdentity],
+        cgroup_records: dict[int, dict[str, Any]],
+    ) -> None:
+        """Discard an unobserved interval without poisoning later snapshots."""
+        raw_by_key: dict[str, float] = {}
+        for cgroup_id, identity in cgroup_ids.items():
+            raw_wait_ns = float(
+                cgroup_records.get(cgroup_id, {}).get(
+                    "futex_wait_ns_total", 0
+                )
+            )
+            if not math.isfinite(raw_wait_ns) or raw_wait_ns < 0:
+                raise RawCollectionError("futex counter input is invalid")
+            raw_by_key[identity.container_id] = raw_wait_ns
+        for key, raw_wait_ns in raw_by_key.items():
+            self._futex_raw_high_water_ns[key] = raw_wait_ns
+            self._futex_wait_ns.setdefault(key, 0.0)
+        self._last_capacity_ns = timestamp_ns
+
     def _active_cgroup_paths(
         self, inventory: Inventory,
     ) -> dict[str, Path]:
@@ -942,10 +971,15 @@ class FinalPrimitiveExporter:
         elapsed_ns = (
             0 if previous_ns is None else timestamp_ns - previous_ns
         )
-        if elapsed_ns < 0 or elapsed_ns > 5_000_000_000:
+        if elapsed_ns < 0:
             raise RawCollectionError(
                 "active task/thread integration interval is invalid"
             )
+        if elapsed_ns > 5_000_000_000:
+            self._rebase_capacity_integration(
+                timestamp_ns, cgroup_ids, cgroup_records
+            )
+            raise RawCollectionError("capacity_integration_gap_rebased")
         for cgroup_id, identity in cgroup_ids.items():
             path = cgroup_paths[identity.container_id]
             try:
@@ -1950,6 +1984,31 @@ class FinalPrimitiveExporter:
             self._inventory_cache = refreshed
             return refreshed, paths
 
+    def _accept_inventory_refresh(self) -> None:
+        with self._inventory_refresh_lock:
+            future = self._inventory_refresh_future
+        if future is None:
+            return
+        if not future.done():
+            raise RawCollectionError(
+                "inventory refresh missed the next snapshot deadline"
+            )
+        try:
+            refreshed = future.result()
+        finally:
+            with self._inventory_refresh_lock:
+                if self._inventory_refresh_future is future:
+                    self._inventory_refresh_future = None
+        self._inventory_cache = refreshed
+
+    def _start_inventory_refresh(self) -> None:
+        with self._inventory_refresh_lock:
+            if self._inventory_refresh_future is not None:
+                return
+            self._inventory_refresh_future = (
+                self._inventory_refresh_executor.submit(self._inventory)
+            )
+
     def collect_snapshot(
         self, timestamp_ns: int | None = None,
     ) -> str:
@@ -1958,15 +2017,16 @@ class FinalPrimitiveExporter:
             raise RawCollectionError(
                 "final primitive snapshot must align to an epoch second"
             )
+        self._accept_inventory_refresh()
         inventory, cgroup_paths = self._inventory_and_cgroup_paths()
         cgroup_identity = self._cgroup_identity(
             inventory, cgroup_paths
         )
+        self._start_inventory_refresh()
         worker_count = (
-            4 + len(inventory.coredns_pods)
+            3 + len(inventory.coredns_pods)
         )
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            next_inventory_future = executor.submit(self._inventory)
             coredns_futures = {
                 pod.container_id: executor.submit(self._coredns, pod)
                 for pod in inventory.coredns_pods
@@ -1985,12 +2045,6 @@ class FinalPrimitiveExporter:
             bpf = bpf_future.result()
             beyla = beyla_future.result()
             host = host_future.result()
-            next_inventory = next_inventory_future.result()
-        # The immutable inventory used to label this snapshot is never
-        # replaced mid-collection.  A refresh is prepared concurrently for
-        # the next snapshot; a changed Pod/container then either maps cleanly
-        # on that next window or fails closed as missing coverage.
-        self._inventory_cache = next_inventory
         service_rows = self._request_rows(
             beyla, inventory, edge=False
         )
@@ -2064,6 +2118,24 @@ class FinalPrimitiveExporter:
             samples, timestamp_ms=timestamp_ns // 1_000_000
         )
 
+    def _warm_source_parsers(self) -> None:
+        """Populate exact-label parse caches before publishing snapshots."""
+        inventory, _cgroup_paths = self._inventory_and_cgroup_paths()
+        worker_count = 2 + len(inventory.coredns_pods)
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            beyla_future = executor.submit(self._beyla, inventory)
+            host_future = executor.submit(
+                self._fetch_url, self.config.node_exporter_url
+            )
+            coredns_futures = tuple(
+                executor.submit(self._coredns, pod)
+                for pod in inventory.coredns_pods
+            )
+            beyla_future.result()
+            host_future.result()
+            for future in coredns_futures:
+                future.result()
+
     def snapshot_once(self, timestamp_ns: int | None = None) -> None:
         timestamp_ns = timestamp_ns or (
             self.wall_clock_ns() // 1_000_000_000
@@ -2080,14 +2152,16 @@ class FinalPrimitiveExporter:
             self._last_error = None
 
     def _snapshot_loop(self) -> None:
+        second_ns = self.config.snapshot_period_sec * 1_000_000_000
+        target = (
+            (self.wall_clock_ns() // second_ns) + 1
+        ) * second_ns
         while not self._stop.is_set():
-            now = self.wall_clock_ns()
-            second_ns = self.config.snapshot_period_sec * 1_000_000_000
-            target = ((now + second_ns - 1) // second_ns) * second_ns
             remaining = target - self.wall_clock_ns()
             if remaining > 0 and self._stop.wait(
                     remaining / 1_000_000_000):
                 return
+            started_ns = time.perf_counter_ns()
             try:
                 self.snapshot_once(target)
             except Exception as error:
@@ -2097,7 +2171,30 @@ class FinalPrimitiveExporter:
                     file=sys.stderr,
                     flush=True,
                 )
-                continue
+            else:
+                duration_ns = time.perf_counter_ns() - started_ns
+                print(
+                    "final primitive snapshot completed: "
+                    f"target_ns={target} duration_ns={duration_ns}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            target += second_ns
+            now = self.wall_clock_ns()
+            while now > target:
+                self._snapshot_deadline_misses_total += 1
+                error = (
+                    "snapshot_deadline_missed: "
+                    f"target_ns={target} observed_ns={now}"
+                )
+                with self._lock:
+                    self._last_error = error
+                print(
+                    f"final primitive snapshot failed: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                target += second_ns
 
     def _response(self) -> tuple[str, int, str]:
         with self._lock:
@@ -2113,6 +2210,7 @@ class FinalPrimitiveExporter:
         return snapshot, timestamp_ns, "" if fresh else (error or "stale")
 
     def serve_forever(self) -> None:
+        self._warm_source_parsers()
         exporter = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -2165,6 +2263,9 @@ class FinalPrimitiveExporter:
             self._stop.set()
             server.server_close()
             worker.join(timeout=5.0)
+            self._inventory_refresh_executor.shutdown(
+                wait=True, cancel_futures=True
+            )
 
 
 def load_final_primitive_exporter_config(
