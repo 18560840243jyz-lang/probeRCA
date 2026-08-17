@@ -29,6 +29,7 @@ class NormalizedObservation:
     baseline_center: float
     baseline_scale: float
     scale_source: str
+    alert_eligible: bool = True
 
 
 @dataclass(frozen=True)

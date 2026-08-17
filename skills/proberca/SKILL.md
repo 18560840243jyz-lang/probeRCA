@@ -1372,7 +1372,9 @@ Ridge项用于防止候选指标数量较多时出现过拟合和系数不稳定
 十四、步骤12：只保留跨指标传播
 14.1 这一步的作用
 我们不希望指标自身的持续异常被自身历史解释掉。
-因此虽然 (A_v) 可以学习到指标自身的自相关系数，但构造残差前要清除对角线。
+因此 (A_v) 从语义掩码构造开始就排除目标指标自身，任何自身 lag 都不进入
+Ridge 特征。若某个目标没有合法跨指标父节点，则其健康跨指标传播恒为 0，
+该目标直接 Ready、系数为空，不拟合空 Ridge。残差阶段继续保持对角线为 0。
 [
 \boxed{
 A_{v,\times}^{(\ell)}
@@ -2161,7 +2163,8 @@ A_v\text{健康传播扣除}
 - 采集完整但请求/操作计数为0时，计数是有效零；无定义的P95和失败率使用`invalid_reason=no_exposure`。
 - 累计直方图没有负delta、但开始/结束快照、桶delta或`+Inf`与独立count不一致时，只将对应latency写成`invalid_reason=inconsistent_histogram`；count和failure保持独立有效。任何负bucket delta仍是累计生命周期硬失败。
 - 缺失指标不能进入Healthy基线、告警或(A_v)训练。
-- latency P95必须满足最小样本数。
+- latency P95的建模有效性继续使用冻结的`latency_min_samples`；满足该门槛的观测可以进入Baseline和(A_v)。
+- latency P95只有在样本数达到`ceil(1 / (1 - quantile))`时才有告警资格；低于该告警门槛但满足建模门槛的观测不得贡献Soft/Hard分数。
 - failure rate必须拥有足够的请求暴露量；无请求窗口是缺失，不是健康零值。
 - 数据面保留raw value、validity、coverage、sample count、request count来源、quality和lineage；控制面先尊重数据面原因，再追加最小样本数和质量门禁。
 
@@ -2191,6 +2194,8 @@ s_{\min,f(i)}
 逐目标(A_v)：
 
 - Masked Ridge必须按目标坐标分别拟合。
+- 语义掩码必须排除目标自身，(A_v)只学习跨指标父节点的滞后传播。
+- 没有合法跨指标父节点的目标定义为零传播并直接Ready：allowed feature count和valid training rows均为0、系数为空、not-ready reason为空。
 - 目标(i)只使用“目标值及其允许父指标滞后值均有效”的训练行。
 - 默认最低训练行数为：
 

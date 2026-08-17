@@ -31,7 +31,11 @@ from proberca.controlplane.model import (
     MetricTargetReadiness,
     NormalizedObservation,
 )
-from proberca.controlplane.observations import MetricResolver, RobustBaselineStore
+from proberca.controlplane.observations import (
+    MetricResolver,
+    RobustBaselineStore,
+    quantile_required_samples,
+)
 from proberca.controlplane.service_model import (
     AllowedServiceGraph,
     ServiceRLS,
@@ -682,6 +686,290 @@ def test_edge_identity_and_cross_metric_only_prediction():
     assert spec.role == "edge_latency"
 
 
+def test_quantile_required_samples_is_derived_from_the_tail_probability():
+    assert quantile_required_samples(0.95) == 20
+    assert quantile_required_samples(0.9) == 10
+    assert quantile_required_samples(0.99) == 100
+    for invalid in (0.0, 1.0, float("nan"), float("inf"), True):
+        with pytest.raises(ValueError, match="quantile"):
+            quantile_required_samples(invalid)
+
+
+def test_service_quantile_reliability_filters_alerts_without_hiding_exposure():
+    config = replace(
+        FinalControlConfig(),
+        baseline_min_windows=3,
+        baseline_family_min_scales={
+            "count": 0.5,
+            "latency": 0.5,
+            "psi": 0.0005,
+            "ratio": 0.0005,
+        },
+        latency_min_samples=5,
+    )
+    resolver = MetricResolver(config)
+    baseline = RobustBaselineStore(config)
+    records = _node_records(1)
+    rate = next(item for item in records if item.metric_name == "request_rate")
+    failure = next(
+        item for item in records
+        if item.metric_name == "request_failure_rate"
+    )
+    latency = next(
+        item for item in records
+        if item.metric_name == "request_latency_p95"
+    )
+    metric, spec = resolver.resolve(latency)
+    for _ in range(3):
+        baseline.update(metric.node_id, baseline.transform(10.0, spec), spec)
+
+    too_sparse_latency = replace(latency, value=1000.0, sample_count=4)
+    sparse_observations, sparse_raw = resolver.normalize_window(
+        SimpleNamespace(
+            node_metrics=(rate, failure, too_sparse_latency), edge_metrics=(),
+        ),
+        baseline,
+    )
+    rate_id = resolver.resolve(rate)[0].node_id
+    failure_id = resolver.resolve(failure)[0].node_id
+    assert metric.node_id not in sparse_observations
+    assert metric.node_id not in sparse_raw
+    assert {rate_id, failure_id} <= set(sparse_raw)
+    validity = resolver.last_validity[metric.node_id]
+    assert validity["invalid_reason"] == "insufficient_sample_count"
+    assert validity["model_valid"] is False
+    assert validity["alert_eligible"] is False
+    assert validity["quantile"] == 0.95
+    assert validity["quantile_required_samples"] == 20
+    assert validity["model_latency_min_samples"] == 5
+    assert validity["alert_latency_min_samples"] == 20
+
+    service = metric.entity_id
+    graph = AllowedServiceGraph(
+        services=(service,), relations=(), physical_edges=(), placements=(),
+        snapshot_id="snapshot",
+    )
+    control = FinalControlPlane(config)
+    for sample_count in (5, 19):
+        low_latency = replace(latency, value=1000.0, sample_count=sample_count)
+        low_observations, low_raw = resolver.normalize_window(
+            SimpleNamespace(
+                node_metrics=(rate, failure, low_latency), edge_metrics=(),
+            ),
+            baseline,
+        )
+        assert metric.node_id in low_observations
+        assert {rate_id, failure_id, metric.node_id} <= set(low_raw)
+        validity = resolver.last_validity[metric.node_id]
+        assert validity["invalid_reason"] is None
+        assert validity["model_valid"] is True
+        assert validity["alert_eligible"] is False
+        assert low_observations[metric.node_id].alert_eligible is False
+        service_scores, edge_scores = control._scores(
+            low_observations, graph,
+        )
+        assert service_scores == {}
+        assert edge_scores == {}
+        for _ in range(config.soft_consecutive_windows):
+            soft, hard = control._advance_alert_counters(
+                service_scores, edge_scores,
+            )
+            assert soft == set()
+            assert hard == set()
+
+    high_latency = replace(latency, value=1000.0, sample_count=20)
+    high_observations, high_raw = resolver.normalize_window(
+        SimpleNamespace(
+            node_metrics=(rate, failure, high_latency), edge_metrics=(),
+        ),
+        baseline,
+    )
+    assert metric.node_id in high_observations
+    assert {rate_id, failure_id, metric.node_id} <= set(high_raw)
+    validity = resolver.last_validity[metric.node_id]
+    assert validity["model_valid"] is True
+    assert validity["alert_eligible"] is True
+    assert high_observations[metric.node_id].alert_eligible is True
+    service_scores, edge_scores = control._scores(high_observations, graph)
+    assert service_scores[service] >= config.soft_threshold
+    for _ in range(config.soft_consecutive_windows - 1):
+        soft, hard = control._advance_alert_counters(
+            service_scores, edge_scores,
+        )
+        assert ("service", service) not in soft
+        assert ("service", service) not in hard
+    soft, hard = control._advance_alert_counters(
+        service_scores, edge_scores,
+    )
+    assert ("service", service) in soft
+    assert ("service", service) not in hard
+
+
+def test_edge_quantile_reliability_uses_the_same_rule_as_service_latency():
+    config = replace(
+        FinalControlConfig(),
+        baseline_min_windows=3,
+        baseline_family_min_scales={
+            "count": 0.5,
+            "latency": 0.5,
+            "psi": 0.0005,
+            "ratio": 0.0005,
+        },
+        latency_min_samples=5,
+    )
+    specs = {
+        spec.metric_name: spec
+        for spec in config.metric_roles
+        if spec.entity_type == "edge"
+    }
+
+    def record(name: str, value: float, sample_count: int) -> EdgeMetricRecord:
+        spec = specs[name]
+        return EdgeMetricRecord(
+            schema_version=METRIC_RECORD_SCHEMA_VERSION,
+            timestamp_ns=0,
+            window_sec=1,
+            cluster_id="cluster",
+            namespace="ns",
+            src_service="checkout",
+            dst_service="payment",
+            src_pod_uid=None,
+            dst_pod_uid=None,
+            src_node="node-a",
+            dst_node="node-b",
+            protocol="tcp",
+            metric_name=name,
+            value=value,
+            valid=True,
+            invalid_reason=None,
+            unit=spec.unit,
+            sample_count=sample_count,
+            coverage=1.0,
+            event_loss_rate=0.0,
+            mapping_quality=1.0,
+            source="final_window_aggregation",
+            metric_kind=spec.metric_kind,
+            scope="service_pair",
+            histogram_upper_bound=None,
+            histogram_is_inf_bucket=False,
+            histogram_is_cumulative=None,
+            quantile=spec.quantile,
+        )
+
+    count = record("edge_request_count", 25.0, 1)
+    failure = record("edge_failure_rate", 0.0, 25)
+    latency = record("edge_latency_p95", 50.0, 4)
+    resolver = MetricResolver(config)
+    baseline = RobustBaselineStore(config)
+    latency_metric, latency_spec = resolver.resolve(latency)
+    for _ in range(3):
+        baseline.update(
+            latency_metric.node_id,
+            baseline.transform(10.0, latency_spec),
+            latency_spec,
+        )
+
+    sparse_observations, sparse_raw = resolver.normalize_window(
+        SimpleNamespace(
+            node_metrics=(), edge_metrics=(count, failure, latency),
+        ),
+        baseline,
+    )
+    count_id = resolver.resolve(count)[0].node_id
+    failure_id = resolver.resolve(failure)[0].node_id
+    assert latency_metric.node_id not in sparse_observations
+    assert latency_metric.node_id not in sparse_raw
+    assert {count_id, failure_id} <= set(sparse_raw)
+    validity = resolver.last_validity[latency_metric.node_id]
+    assert validity["invalid_reason"] == "insufficient_sample_count"
+    assert validity["model_valid"] is False
+    assert validity["alert_eligible"] is False
+
+    edge = latency_metric.entity_id
+    source = "cluster::ns::checkout"
+    target = "cluster::ns::payment"
+    graph = AllowedServiceGraph(
+        services=(source, target),
+        relations=((source, target, "call"), (target, source, "call")),
+        physical_edges=((edge, source, target, "tcp"),),
+        placements=(),
+        snapshot_id="snapshot",
+    )
+    control = FinalControlPlane(config)
+    for sample_count in (5, 19):
+        low_latency = replace(latency, sample_count=sample_count)
+        low_observations, low_raw = resolver.normalize_window(
+            SimpleNamespace(
+                node_metrics=(),
+                edge_metrics=(count, failure, low_latency),
+            ),
+            baseline,
+        )
+        assert latency_metric.node_id in low_observations
+        assert {count_id, failure_id, latency_metric.node_id} <= set(low_raw)
+        validity = resolver.last_validity[latency_metric.node_id]
+        assert validity["invalid_reason"] is None
+        assert validity["model_valid"] is True
+        assert validity["alert_eligible"] is False
+        assert low_observations[latency_metric.node_id].alert_eligible is False
+        _, edge_scores = control._scores(low_observations, graph)
+        assert edge_scores == {edge: 0.0}
+        for _ in range(config.soft_consecutive_windows):
+            soft, hard = control._advance_alert_counters({}, edge_scores)
+            assert soft == set()
+            assert hard == set()
+
+    failure_metric, failure_spec = resolver.resolve(failure)
+    for _ in range(3):
+        baseline.update(
+            failure_metric.node_id,
+            baseline.transform(0.0, failure_spec),
+            failure_spec,
+        )
+    failing = replace(failure, value=0.01)
+    low_latency = replace(latency, sample_count=19)
+    failure_observations, _ = resolver.normalize_window(
+        SimpleNamespace(
+            node_metrics=(), edge_metrics=(count, failing, low_latency),
+        ),
+        baseline,
+    )
+    assert failure_observations[latency_metric.node_id].alert_eligible is False
+    assert failure_observations[failure_metric.node_id].alert_eligible is True
+    failure_control = FinalControlPlane(config)
+    _, failure_scores = failure_control._scores(failure_observations, graph)
+    assert failure_scores[edge] >= config.hard_threshold
+    soft, hard = failure_control._advance_alert_counters({}, failure_scores)
+    assert soft == set()
+    assert hard == set()
+    _, hard = failure_control._advance_alert_counters({}, failure_scores)
+    assert ("edge", edge) in hard
+
+    high_latency = replace(latency, sample_count=20)
+    high_observations, high_raw = resolver.normalize_window(
+        SimpleNamespace(
+            node_metrics=(),
+            edge_metrics=(count, failure, high_latency),
+        ),
+        baseline,
+    )
+    assert latency_metric.node_id in high_observations
+    assert {count_id, failure_id, latency_metric.node_id} <= set(high_raw)
+    validity = resolver.last_validity[latency_metric.node_id]
+    assert validity["model_valid"] is True
+    assert validity["alert_eligible"] is True
+    assert high_observations[latency_metric.node_id].alert_eligible is True
+    _, edge_scores = control._scores(high_observations, graph)
+    assert edge_scores[edge] >= config.soft_threshold
+    for _ in range(config.soft_consecutive_windows - 1):
+        soft, hard = control._advance_alert_counters({}, edge_scores)
+        assert ("edge", edge) not in soft
+        assert ("edge", edge) not in hard
+    soft, hard = control._advance_alert_counters({}, edge_scores)
+    assert ("edge", edge) in soft
+    assert ("edge", edge) not in hard
+
+
 def test_data_plane_invalid_record_does_not_enter_healthy_baseline():
     config = _config()
     record = replace(
@@ -713,7 +1001,8 @@ def test_data_plane_invalid_record_does_not_enter_healthy_baseline():
         "request_count": None,
         "quality": 0.0,
         "formal_scope": "included",
-        "alert_eligible": True,
+        "model_valid": False,
+        "alert_eligible": False,
         "root_eligible": False,
         "readiness_required": False,
     }
@@ -893,7 +1182,16 @@ def test_zero_mad_prefers_iqr_when_iqr_exceeds_family_floor():
 def test_metric_ridge_is_fitted_per_target_not_by_global_complete_rows():
     service_a = "cluster::ns::a"
     service_b = "cluster::ns::b"
-    metric_a = MetricNode(
+    rate_a = MetricNode(
+        node_id=f"{service_a}::request_rate",
+        entity_id=service_a,
+        entity_type="service",
+        metric_name="request_rate",
+        role="request_rate",
+        root_category=None,
+        root_eligible=False,
+    )
+    cpu_a = MetricNode(
         node_id=f"{service_a}::cpu_usage_rate",
         entity_id=service_a,
         entity_type="service",
@@ -902,10 +1200,11 @@ def test_metric_ridge_is_fitted_per_target_not_by_global_complete_rows():
         root_category="CPU",
         root_eligible=True,
     )
-    metric_b = replace(
-        metric_a,
-        node_id=f"{service_b}::cpu_usage_rate",
-        entity_id=service_b,
+    rate_b = replace(
+        rate_a, node_id=f"{service_b}::request_rate", entity_id=service_b,
+    )
+    cpu_b = replace(
+        cpu_a, node_id=f"{service_b}::cpu_usage_rate", entity_id=service_b,
     )
     candidate = CandidateEntityGraph(
         seed_services=(service_a, service_b),
@@ -924,16 +1223,19 @@ def test_metric_ridge_is_fitted_per_target_not_by_global_complete_rows():
         snapshot_id="topology",
     )
     history = {
-        1: {metric_a.node_id: 1.0, metric_b.node_id: 1.0},
-        2: {metric_a.node_id: 2.0},
-        3: {metric_a.node_id: 3.0},
-        4: {metric_a.node_id: 4.0},
+        1: {
+            rate_a.node_id: 1.0, cpu_a.node_id: 1.0,
+            rate_b.node_id: 1.0, cpu_b.node_id: 1.0,
+        },
+        2: {rate_a.node_id: 2.0, cpu_a.node_id: 2.0},
+        3: {rate_a.node_id: 3.0, cpu_a.node_id: 3.0},
+        4: {rate_a.node_id: 4.0, cpu_a.node_id: 4.0},
     }
 
     model = fit_metric_propagation(
         metrics={
-            metric_a.node_id: metric_a,
-            metric_b.node_id: metric_b,
+            item.node_id: item
+            for item in (rate_a, cpu_a, rate_b, cpu_b)
         },
         healthy_history=history,
         candidate=candidate,
@@ -946,18 +1248,21 @@ def test_metric_ridge_is_fitted_per_target_not_by_global_complete_rows():
         ),
     )
 
-    ready = model.target_readiness[metric_a.node_id]
-    sparse = model.target_readiness[metric_b.node_id]
+    ready = model.target_readiness[cpu_a.node_id]
+    sparse = model.target_readiness[cpu_b.node_id]
     assert ready.ready is True
     assert ready.valid_training_rows == 3
-    assert (metric_a.node_id, metric_a.node_id, 1) in model.coefficients
+    assert (cpu_a.node_id, rate_a.node_id, 1) in model.coefficients
+    assert all(target != parent for target, parent in model.semantic_mask)
+    assert model.target_readiness[rate_a.node_id].ready is True
+    assert model.target_readiness[rate_a.node_id].allowed_feature_count == 0
     assert sparse.ready is False
     assert sparse.valid_training_rows == 0
     assert sparse.not_ready_reason == "insufficient_valid_history"
     assert model.ready is False
 
 
-def test_metric_ridge_accepts_rank_deficient_healthy_design_when_regularized():
+def test_metric_target_without_cross_metric_parents_is_ready_without_ridge():
     service = "cluster::ns::payment"
     metric = MetricNode(
         node_id=f"{service}::local_socket_failure_rate",
@@ -984,10 +1289,7 @@ def test_metric_ridge_accepts_rank_deficient_healthy_design_when_regularized():
         placements=(),
         snapshot_id="topology",
     )
-    history = {
-        sequence: {metric.node_id: 0.0}
-        for sequence in range(1, 9)
-    }
+    history = {1: {metric.node_id: 0.0}, 6: {metric.node_id: 1.0}}
 
     model = fit_metric_propagation(
         metrics={metric.node_id: metric},
@@ -1005,17 +1307,89 @@ def test_metric_ridge_accepts_rank_deficient_healthy_design_when_regularized():
 
     readiness = model.target_readiness[metric.node_id]
     assert readiness.ready is True
-    assert readiness.allowed_feature_count == 2
-    assert readiness.valid_training_rows == 6
-    assert readiness.minimum_training_rows == 4
+    assert readiness.allowed_feature_count == 0
+    assert readiness.valid_training_rows == 0
+    assert readiness.minimum_training_rows == 0
     assert readiness.effective_rank == 0
     assert readiness.raw_design_rank_ratio == 0.0
-    assert readiness.regularized_gram_condition_number == 1.0
+    assert readiness.regularized_gram_condition_number is None
     assert readiness.not_ready_reason is None
-    assert all(
-        value == 0.0
-        for value in model.coefficients.values()
+    assert model.semantic_mask == ()
+    assert model.coefficients == {}
+    assert model.ready is True
+
+
+def test_metric_ridge_uses_cross_metric_lags_and_drops_incomplete_rows():
+    service = "cluster::ns::payment"
+    rate = MetricNode(
+        node_id=f"{service}::request_rate",
+        entity_id=service,
+        entity_type="service",
+        metric_name="request_rate",
+        role="request_rate",
+        root_category=None,
+        root_eligible=False,
     )
+    cpu = MetricNode(
+        node_id=f"{service}::cpu_usage_rate",
+        entity_id=service,
+        entity_type="service",
+        metric_name="cpu_usage_rate",
+        role="service_cpu_usage",
+        root_category="CPU",
+        root_eligible=True,
+    )
+    candidate = CandidateEntityGraph(
+        seed_services=(service,),
+        seed_edges=(),
+        services=(service,),
+        hosts=(),
+        edges=(),
+        strong_service_relations=(),
+        topology_snapshot_id="topology",
+    )
+    graph = AllowedServiceGraph(
+        services=(service,),
+        relations=(),
+        physical_edges=(),
+        placements=(),
+        snapshot_id="topology",
+    )
+    history = {
+        sequence: {
+            **({rate.node_id: float(sequence)} if sequence != 3 else {}),
+            cpu.node_id: float(sequence),
+        }
+        for sequence in range(1, 8)
+    }
+
+    model = fit_metric_propagation(
+        metrics={rate.node_id: rate, cpu.node_id: cpu},
+        healthy_history=history,
+        candidate=candidate,
+        service_graph=graph,
+        healthy_cutoff_ns=8 * _NS,
+        config=replace(
+            _config(),
+            metric_lags=(1, 2),
+            metric_min_training_rows=2,
+            metric_rows_per_feature=1.0,
+        ),
+    )
+
+    readiness = model.target_readiness[cpu.node_id]
+    assert model.semantic_mask == ((cpu.node_id, rate.node_id),)
+    assert all(target != parent for target, parent in model.semantic_mask)
+    assert readiness.ready is True
+    assert readiness.allowed_feature_count == 2
+    assert readiness.valid_training_rows == 3
+    assert readiness.minimum_training_rows == 2
+    assert set(model.coefficients) == {
+        (cpu.node_id, rate.node_id, 1),
+        (cpu.node_id, rate.node_id, 2),
+    }
+    assert model.target_readiness[rate.node_id].ready is True
+    assert model.target_readiness[rate.node_id].allowed_feature_count == 0
 
 
 def test_fully_missing_service_symptom_is_not_treated_as_healthy_zero():

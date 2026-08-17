@@ -174,6 +174,15 @@ The final ProbeRCA-BPF path must collect and seal all input windows before the R
 
 Final normal metrics are service-level, node-level, or directed service-pair aggregates exactly as declared in `configs/final_collection_contract.yaml`; incomplete entity metric sets fail closed. Ground-truth, target configuration, injection paths, and expected-root fields are forbidden across the boundary. Burst evidence is collected after Hard in a distinct following window, is required to be independent from residual metrics, and may only reduce the matching `(entity, root category)` group penalty. The final path does not subtract Burst evidence from residuals, add a direct evidence ranking term, introduce a composite relation-strength variable, or perform counterfactual repeat solves.
 
+Final `A_v` models cross-metric propagation only. Its semantic mask excludes
+the target coordinate itself at every lag; a target with no legal cross-metric
+parents is Ready with an empty coefficient set and an exact zero propagation
+contribution. P95 modeling validity remains governed by
+`latency_min_samples`, while alert eligibility additionally requires
+`ceil(1 / (1 - quantile))` samples. Observations between those two thresholds
+remain available to Baseline and `A_v` but cannot contribute latency to
+Soft/Hard scores.
+
 ## Final Formal Root-Cause Scope and Experimental DNS Decision
 
 The formal ProbeRCA-BPF paper scope contains only:

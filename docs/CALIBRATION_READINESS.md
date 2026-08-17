@@ -15,13 +15,17 @@
 - 原始采集覆盖为零：`invalid_reason=zero_coverage`，不进入基线、告警和 `A_v`。
 - 完整采集但请求或操作计数为零：计数是有效零；没有分母或样本的P95/失败率
   使用 `invalid_reason=no_exposure`。
-- 延迟 P95 的样本数低于 `latency_min_samples`：缺失。
+- 延迟 P95 的样本数低于 `latency_min_samples`：建模无效，不进入基线、`A_v`或告警。
+- 达到 `latency_min_samples` 的 P95 是建模有效观测，可以进入基线和 `A_v`；
+  只有样本数达到 `ceil(1 / (1 - quantile))` 时才具备告警资格。P95=0.95时该
+  告警门槛自然为20，不能硬编码成指标或实体特例。
 - 失败率找不到请求/查询计数，或计数低于 `failure_min_requests`：缺失。
 - 缺失值不得补零、前向填充、插值或复用上一窗口 P95。
 
 `CalibrationReadinessReport.latest_observation_validity` 保存最新窗口中每个指标的
 `raw_value`、`coverage`、`mapping_quality`、`sample_count`、`request_count`、`quality`、
-`data_plane_invalid_reason`、`control_plane_invalid_reason` 和最终拒绝原因。
+`data_plane_invalid_reason`、`control_plane_invalid_reason`、`model_valid`、
+`alert_eligible` 和最终拒绝原因。
 
 ## 稳健尺度
 
@@ -47,7 +51,9 @@
 ## 逐目标 `A_v` Readiness
 
 Masked Ridge 按目标坐标分别拟合，不再要求整个候选矩阵同时完整。对目标坐标
-`i`，只使用目标值及其允许父指标滞后值均有效的训练行。
+`i`，语义掩码排除目标自身，只使用目标值及其允许跨指标父指标滞后值均有效的
+训练行。若目标没有任何合法跨指标父节点，其健康跨指标传播定义为0，该目标
+直接Ready、系数为空，不拟合空Ridge。
 
 默认最低训练行数为：
 

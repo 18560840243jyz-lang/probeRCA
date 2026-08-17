@@ -44,7 +44,7 @@ def _semantic_allowed(
     graph: AllowedServiceGraph,
 ) -> bool:
     if target.node_id == parent.node_id:
-        return True
+        return False
     if target.entity_id == parent.entity_id:
         return (parent.role, target.role) in _SAME_ENTITY_ROLE_PAIRS
     strong = {
@@ -146,6 +146,25 @@ def fit_metric_propagation(
             for parent_id in parent_ids
             for lag in config.metric_lags
         ]
+        feature_count = len(features)
+        if not features:
+            # A_v represents cross-metric propagation only. A target with no
+            # semantic cross-metric parents has an exact zero propagation
+            # contribution and requires no empty Ridge fit.
+            target_readiness[target_id] = MetricTargetReadiness(
+                target_metric=target_id,
+                root_eligible=metrics[target_id].root_eligible,
+                allowed_feature_count=0,
+                valid_training_rows=0,
+                minimum_training_rows=0,
+                effective_rank=0,
+                raw_design_rank_ratio=0.0,
+                condition_number=None,
+                regularized_gram_condition_number=None,
+                ready=True,
+                not_ready_reason=None,
+            )
+            continue
         rows = []
         targets = []
         for sequence in sequences:
@@ -163,7 +182,6 @@ def fit_metric_propagation(
             if complete and features:
                 rows.append(values)
                 targets.append(current[target_id])
-        feature_count = len(features)
         minimum_rows = max(
             config.metric_min_training_rows,
             int(math.ceil(config.metric_rows_per_feature * feature_count)),
@@ -201,9 +219,7 @@ def fit_metric_propagation(
             else None
         )
         reason = None
-        if not features:
-            reason = "no_allowed_features"
-        elif valid_rows < minimum_rows:
+        if valid_rows < minimum_rows:
             reason = "insufficient_valid_history"
         # Raw rank remains an explicit diagnostic.  It is not a failure gate:
         # the frozen Ridge term makes the Gram system identifiable even when

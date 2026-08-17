@@ -573,6 +573,7 @@ class FinalControlPlane:
                     "baseline_center": item.baseline_center,
                     "baseline_scale": item.baseline_scale,
                     "scale_source": item.scale_source,
+                    "alert_eligible": item.alert_eligible,
                 }
                 for node_id, item in sorted(observations.items())
             },
@@ -663,6 +664,7 @@ class FinalControlPlane:
                     "baseline_center": item.baseline_center,
                     "baseline_scale": item.baseline_scale,
                     "scale_source": item.scale_source,
+                    "alert_eligible": item.alert_eligible,
                 }
                 for node_id, item in sorted(observations.items())
             },
@@ -683,6 +685,8 @@ class FinalControlPlane:
     def _scores(self, observations, graph: AllowedServiceGraph):
         by_entity: dict[str, dict[str, float]] = {}
         for item in observations.values():
+            if not item.alert_eligible:
+                continue
             by_entity.setdefault(item.metric.entity_id, {})[item.metric.role] = item.anomaly
         service_scores = {}
         for service in graph.services:
@@ -712,7 +716,7 @@ class FinalControlPlane:
                 "request_latency", "request_failure",
                 "edge_latency", "edge_failure",
             }
-            for item in observations.values()
+            and item.alert_eligible for item in observations.values()
         )
 
     def _update_healthy_models(
@@ -900,6 +904,7 @@ class FinalControlPlane:
                     "baseline_center": item.baseline_center,
                     "baseline_scale": item.baseline_scale,
                     "scale_source": item.scale_source,
+                    "alert_eligible": item.alert_eligible,
                 }
                 for node_id, item in sorted(observations.items())
             },

@@ -6,6 +6,7 @@ import math
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any
 
 from proberca.data.schema import EdgeMetricRecord, NodeMetricRecord
@@ -20,6 +21,16 @@ from .model import MetricNode, NormalizedObservation
 
 class MetricContractError(ValueError):
     """A collected metric cannot be mapped to exactly one final-scheme role."""
+
+
+def quantile_required_samples(quantile: float) -> int:
+    """Return the minimum observations needed to resolve a quantile tail."""
+    if isinstance(quantile, bool) or not isinstance(quantile, (int, float)) \
+            or not math.isfinite(float(quantile)) \
+            or not 0.0 < float(quantile) < 1.0:
+        raise MetricContractError("quantile must be finite and in (0,1)")
+    tail = Fraction(1, 1) - Fraction(str(quantile))
+    return (tail.denominator + tail.numerator - 1) // tail.numerator
 
 
 @dataclass(frozen=True)
@@ -204,6 +215,13 @@ class MetricResolver:
     def is_excluded_from_formal_rca(self, spec: MetricRoleSpec) -> bool:
         return spec in self._excluded_roles
 
+    def latency_alert_min_samples(self, spec: MetricRoleSpec) -> int:
+        if spec.metric_kind != "quantile" or spec.quantile is None:
+            raise MetricContractError(
+                "latency sample reliability requires a quantile metric role"
+            )
+        return quantile_required_samples(spec.quantile)
+
     def formal_scope_metadata(
         self, metric: MetricNode,
     ) -> dict[str, bool | str]:
@@ -311,6 +329,20 @@ class MetricResolver:
                 * record.mapping_quality
             )
             scope = self.formal_scope_metadata(metric)
+            quantile_validity = {}
+            if spec.metric_kind == "quantile":
+                quantile_validity = {
+                    "quantile": spec.quantile,
+                    "quantile_required_samples": quantile_required_samples(
+                        spec.quantile
+                    ),
+                    "model_latency_min_samples": (
+                        self.config.latency_min_samples
+                    ),
+                    "alert_latency_min_samples": (
+                        self.latency_alert_min_samples(spec)
+                    ),
+                }
             data_plane_reason = (
                 None if record.valid else record.invalid_reason
             )
@@ -322,7 +354,10 @@ class MetricResolver:
                     else "excluded_from_formal_scope"
                 )
                 validity[metric.node_id] = {
+                    **scope,
                     "valid": False,
+                    "model_valid": False,
+                    "alert_eligible": False,
                     "invalid_reason": reason,
                     "data_plane_invalid_reason": data_plane_reason,
                     "control_plane_invalid_reason": None,
@@ -333,7 +368,7 @@ class MetricResolver:
                     "sample_count": record.sample_count,
                     "request_count": count_by_entity.get(metric.entity_id),
                     "quality": quality,
-                    **scope,
+                    **quantile_validity,
                 }
                 continue
             control_plane_reason = None
@@ -342,8 +377,9 @@ class MetricResolver:
                     control_plane_reason = "excessive_event_loss"
                 elif quality <= 0.0:
                     control_plane_reason = "zero_coverage"
-                elif spec.role in {"request_latency", "edge_latency"} \
-                        and record.sample_count < self.config.latency_min_samples:
+                elif spec.metric_kind == "quantile" \
+                        and record.sample_count \
+                        < self.config.latency_min_samples:
                     control_plane_reason = "insufficient_sample_count"
                 elif spec.role in {"request_failure", "edge_failure"}:
                     exposure = count_by_entity.get(metric.entity_id)
@@ -352,8 +388,18 @@ class MetricResolver:
                     elif exposure < self.config.failure_min_requests:
                         control_plane_reason = "insufficient_request_count"
             reason = data_plane_reason or control_plane_reason
+            model_valid = reason is None
+            alert_eligible = model_valid
+            if model_valid and spec.metric_kind == "quantile":
+                alert_eligible = (
+                    record.sample_count
+                    >= self.latency_alert_min_samples(spec)
+                )
             validity[metric.node_id] = {
-                "valid": reason is None,
+                **scope,
+                "valid": model_valid,
+                "model_valid": model_valid,
+                "alert_eligible": alert_eligible,
                 "invalid_reason": reason,
                 "data_plane_invalid_reason": data_plane_reason,
                 "control_plane_invalid_reason": control_plane_reason,
@@ -363,7 +409,7 @@ class MetricResolver:
                 "sample_count": record.sample_count,
                 "request_count": count_by_entity.get(metric.entity_id),
                 "quality": quality,
-                **scope,
+                **quantile_validity,
             }
             if reason is not None:
                 continue
@@ -388,6 +434,7 @@ class MetricResolver:
                 baseline_center=scale.center,
                 baseline_scale=scale.final_scale,
                 scale_source=scale.scale_source,
+                alert_eligible=alert_eligible,
             )
         self.last_validity = validity
         return normalized, raw
@@ -399,5 +446,5 @@ class MetricResolver:
         roles = {"request_latency", "request_failure", "edge_latency", "edge_failure"}
         return tuple(sorted(
             node_id for node_id, item in observations.items()
-            if item.metric.role in roles
+            if item.metric.role in roles and item.alert_eligible
         ))
