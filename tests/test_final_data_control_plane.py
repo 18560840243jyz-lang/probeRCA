@@ -1053,7 +1053,13 @@ def test_data_plane_reason_is_preserved_before_control_plane_thresholds():
     assert validity["raw_value"] is None
 
 
-def test_inconsistent_histogram_never_enters_control_plane_math():
+@pytest.mark.parametrize(
+    "data_plane_reason",
+    ("inconsistent_histogram", "series_lifecycle_transition"),
+)
+def test_invalid_data_plane_observation_never_enters_control_plane_math(
+    data_plane_reason,
+):
     config = _config()
     record = replace(
         next(
@@ -1062,7 +1068,7 @@ def test_inconsistent_histogram_never_enters_control_plane_math():
         ),
         value=None,
         valid=False,
-        invalid_reason="inconsistent_histogram",
+        invalid_reason=data_plane_reason,
         sample_count=5,
     )
     resolver = MetricResolver(config)
@@ -1073,8 +1079,7 @@ def test_inconsistent_histogram_never_enters_control_plane_math():
     assert normalized == {}
     assert raw == {}
     validity = resolver.last_validity[record.stable_id]
-    assert validity["data_plane_invalid_reason"] \
-        == "inconsistent_histogram"
+    assert validity["data_plane_invalid_reason"] == data_plane_reason
     assert validity["control_plane_invalid_reason"] is None
 
 

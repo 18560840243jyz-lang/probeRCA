@@ -235,11 +235,12 @@ def _host_samples(output, node):
 def _edge_samples(
     output, protocol, *, count_delta=None, error_delta=None,
     timeout_delta=None, histogram_deltas=None,
+    src_service="frontend", dst_service="payment", series=None,
 ):
     identity = {
         "namespace": NAMESPACE,
-        "src_service": "frontend",
-        "dst_service": "payment",
+        "src_service": src_service,
+        "dst_service": dst_service,
         "dst_namespace": NAMESPACE,
         "src_pod_uid": "pod-frontend",
         "dst_pod_uid": "pod-payment",
@@ -272,7 +273,7 @@ def _edge_samples(
     for component, delta in components:
         _counter(
             output, component, 100, delta,
-            entity="edge", series=f"{protocol}-flow", **identity,
+            entity="edge", series=series or f"{protocol}-flow", **identity,
         )
     _histogram(
         output, histogram, (
@@ -282,7 +283,13 @@ def _edge_samples(
             )
             if histogram_deltas is None else histogram_deltas
         ),
-        entity="edge", series=f"{protocol}-flow", **identity,
+        entity="edge", series=series or f"{protocol}-flow", **identity,
+    )
+
+
+def _edge_id(source="frontend", destination="payment"):
+    return (
+        f"{CLUSTER}::{NAMESPACE}::{source}->{destination}::tcp"
     )
 
 
@@ -562,6 +569,93 @@ def test_histogram_count_mismatch_invalidates_latency_only(contract):
     assert metrics["edge_latency_p95"].invalid_reason \
         == "inconsistent_histogram"
     assert metrics["edge_latency_p95"].sample_count == 4
+
+
+def test_formal_tcp_series_birth_is_explicitly_invalid_for_one_window(contract):
+    samples = [
+        item for item in _raw_window(include_dns=False).samples
+        if item.entity_type != "edge"
+    ]
+    edge_samples = []
+    _edge_samples(edge_samples, "tcp")
+    samples.extend(
+        item for item in edge_samples if item.timestamp_ns == END
+    )
+    result = FinalWindowAggregator(
+        contract,
+        formal_tcp_edge_entity_ids=(_edge_id(),),
+    ).aggregate(RawCollectionWindow.create(
+        sequence=1,
+        window_start_ns=START,
+        window_end_ns=END,
+        cluster_id=CLUSTER,
+        samples=samples,
+    ))
+    metrics = {item.metric_name: item for item in result.edge_metrics}
+    assert set(metrics) == FORMAL_TCP_METRICS
+    assert all(item.value is None for item in metrics.values())
+    assert all(item.valid is False for item in metrics.values())
+    assert {
+        item.invalid_reason for item in metrics.values()
+    } == {"series_lifecycle_transition"}
+    assert all(item.sample_count == 0 for item in metrics.values())
+
+    recovered = FinalWindowAggregator(
+        contract,
+        formal_tcp_edge_entity_ids=(_edge_id(),),
+    ).aggregate(_raw_window(include_dns=False))
+    recovered_metrics = {
+        item.metric_name: item for item in recovered.edge_metrics
+    }
+    assert recovered_metrics["edge_request_count"].value == 50
+    assert recovered_metrics["edge_failure_rate"].value == pytest.approx(3 / 50)
+    assert recovered_metrics["edge_latency_p95"].value == 10.0
+    assert all(item.valid is True for item in recovered_metrics.values())
+
+
+def test_out_of_scope_dynamic_tcp_edge_cannot_block_formal_projection(contract):
+    samples = list(_raw_window(include_dns=False).samples)
+    reverse_samples = []
+    _edge_samples(
+        reverse_samples,
+        "tcp",
+        src_service="payment",
+        dst_service="frontend",
+        series="reverse-flow",
+    )
+    samples.extend(
+        item for item in reverse_samples if item.timestamp_ns == END
+    )
+    result = FinalWindowAggregator(
+        contract,
+        formal_tcp_edge_entity_ids=(_edge_id(),),
+    ).aggregate(RawCollectionWindow.create(
+        sequence=1,
+        window_start_ns=START,
+        window_end_ns=END,
+        cluster_id=CLUSTER,
+        samples=samples,
+    ))
+    assert len(result.edge_metrics) == 3
+    assert {
+        item.stable_id.rsplit("::", 1)[0] for item in result.edge_metrics
+    } == {_edge_id()}
+    assert all(item.valid is True for item in result.edge_metrics)
+    assert not any(
+        item.source_record_id in result.residual_source_record_ids
+        for item in reverse_samples
+    )
+
+
+def test_missing_formal_tcp_edge_fails_the_frozen_projection(contract):
+    with pytest.raises(RawCollectionError, match="formal TCP edge scope mismatch"):
+        FinalWindowAggregator(
+            contract,
+            formal_tcp_edge_entity_ids=(
+                _edge_id(),
+                _edge_id("payment", "frontend"),
+            ),
+        ).aggregate(_raw_window(include_dns=False))
 
 
 def test_idle_pressure_and_lock_zero_over_zero_are_no_exposure(contract):
@@ -1209,6 +1303,7 @@ def test_metric_record_validity_invariants(contract):
         "insufficient_sample_count",
         "excessive_event_loss",
         "missing_component",
+        "series_lifecycle_transition",
     }:
         projected = replace(
             record,
@@ -1509,6 +1604,27 @@ def test_example_live_source_config_is_complete():
         "edge_timeout_total",
         "edge_latency_histogram",
     } <= actual_components
+    assert len(config.formal_tcp_edge_entity_ids) == 15
+    assert len(set(config.formal_tcp_edge_entity_ids)) == 15
+    assert all(
+        item.startswith(f"{config.cluster_id}::")
+        and item.endswith("::tcp")
+        for item in config.formal_tcp_edge_entity_ids
+    )
+    assert (
+        "kind-proberca-ob::online-boutique::"
+        "emailservice->checkoutservice::tcp"
+    ) not in config.formal_tcp_edge_entity_ids
+    with open("configs/final_control.yaml", encoding="utf-8") as handle:
+        control = yaml.safe_load(handle)
+    required_control_edges = {
+        coordinate.rsplit("::", 1)[0]
+        for coordinate in control["calibration_required_root_coordinates"]
+        if "->" in coordinate and coordinate.endswith(
+            ("::edge_latency_p95", "::edge_failure_rate")
+        )
+    }
+    assert set(config.formal_tcp_edge_entity_ids) == required_control_edges
 
     with open(
         "configs/final_collection_contract.yaml", encoding="utf-8"

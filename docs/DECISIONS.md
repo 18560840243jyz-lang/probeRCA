@@ -235,3 +235,18 @@ Their original archive and contract fingerprints remain provenance. DNS
 coordinates and DNS Burst records from those archives are marked
 `excluded_from_formal_rca` and cannot enter calibration, alerting,
 propagation, residual construction, penalty adjustment, FISTA, or ranking.
+
+## Formal TCP Projection and Series Lifecycle Decision
+
+The live data plane freezes the exact directed TCP edge set before collection.
+Raw exporters and Prometheus may continue to observe additional dynamic TCP
+series for diagnostics, but the formal `9/4/3` archive projects them out before
+aggregation. An out-of-scope edge cannot alter formal topology identity or
+block a formal window; a missing frozen edge still fails closed.
+
+When an in-scope cumulative counter or histogram series exists at only one of
+the two exact window boundaries, its delta is unknowable. The affected metric
+is retained as `value=null`, `valid=false`, with
+`invalid_reason=series_lifecycle_transition`; neither zero nor a previous value
+is imputed. The next window recovers only after both boundaries are present.
+Negative deltas remain hard lifecycle violations.

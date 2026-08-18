@@ -30,8 +30,11 @@ proberca-analyze-collection
 `proberca.dataplane.final_aggregation.FinalWindowAggregator` is the only
 canonical final aggregator.
 
-- Every monotonic counter series must have exactly one sample at both
-  boundaries of the half-open 1-second window.
+- Every stable monotonic counter series normally has exactly one sample at both
+  boundaries of the half-open 1-second window. A series observed at only one
+  boundary is a lifecycle transition: its affected output remains present as
+  `value=null, valid=false, invalid_reason=series_lifecycle_transition` and
+  may recover at the next complete boundary pair. No boundary is imputed.
 - A counter decrease rejects the window. It is never hidden by summing other
   Pods, containers, interfaces, or flows.
 - Counter differences are computed per series before any cross-series sum.
@@ -62,6 +65,10 @@ canonical final aggregator.
 - The raw exporter rebases one request histogram family atomically: count,
   all finite buckets, `+Inf`, error, and timeout share one reset epoch. An
   inconsistent raw snapshot does not update histogram high-water state.
+- The live source configuration freezes the exact 15 formal directed TCP edge
+  identities. Raw extra edges remain observable in Prometheus for diagnostics,
+  but are projected out before formal aggregation and topology construction.
+  The collector still fails closed if any frozen edge is wholly absent.
 
 The output is exactly:
 
@@ -69,7 +76,7 @@ The output is exactly:
 - 4 metrics for every host that runs a monitored service;
 - 3 metrics for every known directed TCP edge;
 
-Known formal TCP edges remain in the topology during an idle second. Their
+The exact frozen formal TCP edges remain in the topology during an idle second. Their
 count is a valid real zero; their failure rate and latency remain present as
 `no_exposure` records. This keeps traffic sparsity from masquerading as a
 deployment-layout change without treating an undefined ratio or P95 as zero.

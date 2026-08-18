@@ -2162,6 +2162,7 @@ A_v\text{健康传播扣除}
 - 原始采集`coverage = 0`时使用`invalid_reason=zero_coverage`，不能补零、前向填充、插值或复用上一窗口值。
 - 采集完整但请求/操作计数为0时，计数是有效零；无定义的P95和失败率使用`invalid_reason=no_exposure`。
 - 累计直方图没有负delta、但开始/结束快照、桶delta或`+Inf`与独立count不一致时，只将对应latency写成`invalid_reason=inconsistent_histogram`；count和failure保持独立有效。任何负bucket delta仍是累计生命周期硬失败。
+- 累计counter或histogram原始序列只存在于一个窗口边界时，不能将缺失边界补0，也不能中止所有无关实体；该实体本窗的相关正式指标使用`value=null, valid=false, invalid_reason=series_lifecycle_transition`，下一完整窗口在两个边界均可观测后自动恢复。真正的负delta仍然硬失败。
 - 缺失指标不能进入Healthy基线、告警或(A_v)训练。
 - latency P95的建模有效性继续使用冻结的`latency_min_samples`；满足该门槛的观测可以进入Baseline和(A_v)。
 - latency P95只有在样本数达到`ceil(1 / (1 - quantile))`时才有告警资格；低于该告警门槛但满足建模门槛的观测不得贡献Soft/Hard分数。
@@ -2291,3 +2292,4 @@ TCP边独立告警
 - `kube-dns`属于范围外基础设施，`loadgenerator`属于实验负载发生器；两者均须标记为`formal_scope=excluded`、`alert_eligible=false`、`root_eligible=false`和`readiness_required=false`。
 - 范围外实体可以继续采集、兼容读取和诊断展示，但不得进入Baseline、(A_s)、(A_v)、健康验证告警、候选图或FISTA。
 - 所有正式范围过滤必须从冻结scope/config推导，禁止按具体服务名硬编码。
+- 正式live collector必须从冻结配置读取15条有向TCP边并在正式9/4/3聚合前完成投影；exporter/Prometheus仍可保留范围外动态边用于诊断，但这些原始序列不得进入正式窗口、拓扑指纹、Dataset特征或因边界不完整而阻断正式归档。冻结边若整体缺失，仍必须失败关闭。

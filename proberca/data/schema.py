@@ -17,6 +17,7 @@ METRIC_INVALID_REASONS = frozenset({
     "excessive_event_loss",
     "missing_component",
     "inconsistent_histogram",
+    "series_lifecycle_transition",
 })
 
 _LEGACY_COUNT_METRICS = frozenset({

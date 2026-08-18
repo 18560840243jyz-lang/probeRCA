@@ -6,7 +6,7 @@ required_scope_source: configs/final_control.yaml
 included:
   service_roots: all_root_eligible_metrics_for_11_service_backed_business_services
   host_roots: all_4_root_eligible_metrics_for_proberca-ob-control-plane
-  tcp_edges: all_15_observed_high_coverage_directed_edges
+  tcp_edges: configs/final_live_collector.example.yaml.formal_tcp_edge_entity_ids
 excluded_entities:
   infrastructure_services:
   - kind-proberca-ob::kube-system::kube-dns
@@ -37,6 +37,7 @@ load_adjustment_reason: >-
   histogram sample_count above the frozen five-sample validity floor in
   consecutive one-second windows without changing any validity threshold.
 primitive_exporter_schema: probeRCA-final-primitive-exporter-v5
+live_collector_schema: probeRCA-final-live-collector-v2
 container_resource_source: direct_cgroup_v2
 beyla_retired_series_ttl: 30s
 scale_floor_provenance:

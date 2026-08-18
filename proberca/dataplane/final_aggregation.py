@@ -22,7 +22,7 @@ from proberca.data.schema import (
 from .raw import RawCollectionError, RawCollectionWindow, RawMetricSample
 
 
-FINAL_AGGREGATION_VERSION = "probeRCA-final-window-aggregation-v1"
+FINAL_AGGREGATION_VERSION = "probeRCA-final-window-aggregation-v2"
 FINAL_OUTPUT_SOURCE = "final_window_aggregation"
 NANOSECONDS_PER_SECOND = 1_000_000_000
 RATIO_EPSILON = 1.0e-12
@@ -268,11 +268,52 @@ def _measured_value(
     )
 
 
+def _invalid_from_samples(
+    samples: Iterable[RawMetricSample],
+    reason: str,
+    *,
+    sample_count: int = 0,
+) -> _Value:
+    """Preserve source quality while explicitly rejecting an unknown delta."""
+
+    items = tuple(samples)
+    if not items:
+        raise RawCollectionError("invalid observation requires source samples")
+    coverage = min(item.coverage for item in items)
+    mapping_quality = min(item.mapping_quality for item in items)
+    effective_reason = (
+        "zero_coverage"
+        if coverage <= 0.0
+        else "missing_component"
+        if mapping_quality <= 0.0
+        else reason
+    )
+    return _Value(
+        value=None,
+        valid=False,
+        invalid_reason=effective_reason,
+        sample_count=sample_count,
+        coverage=coverage,
+        event_loss_rate=max(item.event_loss_rate for item in items),
+        mapping_quality=mapping_quality,
+        source_ids=frozenset(item.source_record_id for item in items),
+        object_ids=frozenset(item.source_object_id for item in items),
+    )
+
+
 class FinalWindowAggregator:
     """Fail-closed implementation of the final window formulas."""
 
-    def __init__(self, collection_contract: dict):
+    def __init__(
+        self,
+        collection_contract: dict,
+        *,
+        formal_tcp_edge_entity_ids: Iterable[str] = (),
+    ):
         self.contract = dict(collection_contract)
+        self._formal_tcp_edge_entity_ids = frozenset(
+            formal_tcp_edge_entity_ids
+        )
         if self.contract.get("aggregation_output_source") != FINAL_OUTPUT_SOURCE:
             raise RawCollectionError("final aggregation output source mismatch")
         if self.contract.get("window_sec") != 1:
@@ -288,12 +329,28 @@ class FinalWindowAggregator:
             for item in roles
         }
 
+    def _in_formal_projection(self, sample: RawMetricSample) -> bool:
+        if (
+            not self._formal_tcp_edge_entity_ids
+            or sample.entity_type != "edge"
+            or sample.protocol != "tcp"
+        ):
+            return True
+        entity_id = (
+            f"{sample.cluster_id}::{sample.namespace}::"
+            f"{sample.src_service}->{sample.dst_service}::{sample.protocol}"
+        )
+        return entity_id in self._formal_tcp_edge_entity_ids
+
     def aggregate(self, window: RawCollectionWindow) -> FinalAggregationResult:
         window.validate()
         if window.window_end_ns - window.window_start_ns \
                 != NANOSECONDS_PER_SECOND:
             raise RawCollectionError("final aggregation requires an exact 1-second window")
-        samples = tuple(window.samples)
+        samples = tuple(
+            sample for sample in window.samples
+            if self._in_formal_projection(sample)
+        )
         self._validate_component_semantics(samples)
         by_entity: dict[tuple[str, ...], list[RawMetricSample]] = defaultdict(list)
         for sample in samples:
@@ -327,6 +384,22 @@ class FinalWindowAggregator:
             used_objects.update(objects)
         if not nodes:
             raise RawCollectionError("final window has no service/host metrics")
+        if self._formal_tcp_edge_entity_ids:
+            observed_edges = {
+                item.stable_id.rsplit("::", 1)[0]
+                for item in edges if item.protocol == "tcp"
+            }
+            if observed_edges != self._formal_tcp_edge_entity_ids:
+                missing = sorted(
+                    self._formal_tcp_edge_entity_ids - observed_edges
+                )
+                extra = sorted(
+                    observed_edges - self._formal_tcp_edge_entity_ids
+                )
+                raise RawCollectionError(
+                    "formal TCP edge scope mismatch; "
+                    f"missing={missing or '-'}; extra={extra or '-'}"
+                )
         supplied_sources = {item.source_record_id for item in samples}
         unused = supplied_sources - used_sources
         if unused:
@@ -402,13 +475,27 @@ class FinalWindowAggregator:
                 by_time: dict[int, list[RawMetricSample]] = defaultdict(list)
                 for record in records:
                     by_time[record.timestamp_ns].append(record)
-                if set(by_time) != {
+                expected_times = {
                     window.window_start_ns, window.window_end_ns,
-                } or any(len(items) != 1 for items in by_time.values()):
+                }
+                observed_times = set(by_time)
+                if not observed_times <= expected_times or any(
+                    len(items) != 1 for items in by_time.values()
+                ):
                     raise RawCollectionError(
                         f"{component}/{series_id} requires exactly one "
                         "counter sample at each window boundary"
                     )
+                if observed_times != expected_times:
+                    if len(observed_times) != 1:
+                        raise RawCollectionError(
+                            f"{component}/{series_id} has invalid boundary coverage"
+                        )
+                    component_values[series_id] = _invalid_from_samples(
+                        records,
+                        "series_lifecycle_transition",
+                    )
+                    continue
                 start = by_time[window.window_start_ns][0]
                 end = by_time[window.window_end_ns][0]
                 delta = end.value - start.value
@@ -541,6 +628,7 @@ class FinalWindowAggregator:
         object_ids: set[str] = set()
         qualities: list[RawMetricSample] = []
         inconsistent = False
+        lifecycle_transition = False
         expected_buckets: set[tuple[float | None, bool]] | None = None
         for series_id, series in sorted(by_series.items()):
             by_time: dict[int, dict[tuple[float | None, bool], RawMetricSample]] = {
@@ -559,6 +647,14 @@ class FinalWindowAggregator:
                 by_time[item.timestamp_ns][item.bucket_key] = item
             start_keys = set(by_time[window.window_start_ns])
             end_keys = set(by_time[window.window_end_ns])
+            if bool(start_keys) != bool(end_keys):
+                lifecycle_transition = True
+                for values in by_time.values():
+                    for item in values.values():
+                        source_ids.add(item.source_record_id)
+                        object_ids.add(item.source_object_id)
+                        qualities.append(item)
+                continue
             if not start_keys or start_keys != end_keys:
                 raise RawCollectionError(
                     f"{component}/{series_id} histogram boundaries are incomplete"
@@ -606,12 +702,6 @@ class FinalWindowAggregator:
                     source_ids.add(item.source_record_id)
                     object_ids.add(item.source_object_id)
                     qualities.append(item)
-        ordered = sorted(
-            merged,
-            key=lambda item: math.inf if item[1] else float(item[0]),
-        )
-        cumulative = [merged[key] for key in ordered]
-        total = cumulative[-1]
         quality_value = _measured_value(
             0.0,
             sample_count=0,
@@ -621,6 +711,25 @@ class FinalWindowAggregator:
             source_ids=frozenset(source_ids),
             object_ids=frozenset(object_ids),
         )
+        if lifecycle_transition:
+            if not quality_value.valid:
+                return _combine(
+                    (quality_value,),
+                    None,
+                    sample_count=0,
+                )
+            return _combine(
+                (quality_value,),
+                None,
+                invalid_reason="series_lifecycle_transition",
+                sample_count=0,
+            )
+        ordered = sorted(
+            merged,
+            key=lambda item: math.inf if item[1] else float(item[0]),
+        )
+        cumulative = [merged[key] for key in ordered]
+        total = cumulative[-1]
         if not quality_value.valid:
             return _combine(
                 (quality_value,),

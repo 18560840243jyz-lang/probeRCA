@@ -34,7 +34,7 @@ from .raw import RawCollectionError, RawCollectionWindow
 from .sources import PrimitiveSource, PrometheusSourceConfig
 
 
-COLLECTOR_CONFIG_SCHEMA_VERSION = "probeRCA-final-live-collector-v1"
+COLLECTOR_CONFIG_SCHEMA_VERSION = "probeRCA-final-live-collector-v2"
 
 
 class RawBurstWindowSource(Protocol):
@@ -73,6 +73,7 @@ class FinalLiveCollectorConfig:
     window_sec: int
     collection_delay_sec: float
     window_lead_sec: float
+    formal_tcp_edge_entity_ids: tuple[str, ...]
     kubernetes: KubernetesConfig
     prometheus: PrometheusSourceConfig
 
@@ -82,6 +83,12 @@ class FinalLiveCollectorConfig:
         if not isinstance(payload, dict) or set(payload) != expected:
             raise RawCollectionError("live collector config fields mismatch")
         values = dict(payload)
+        formal_edges = values["formal_tcp_edge_entity_ids"]
+        if not isinstance(formal_edges, list):
+            raise RawCollectionError(
+                "formal_tcp_edge_entity_ids must be a list"
+            )
+        values["formal_tcp_edge_entity_ids"] = tuple(formal_edges)
         values["kubernetes"] = KubernetesConfig.from_dict(values["kubernetes"])
         values["prometheus"] = PrometheusSourceConfig.from_dict(
             values["prometheus"]
@@ -108,6 +115,25 @@ class FinalLiveCollectorConfig:
             raise RawCollectionError("Kubernetes discovery must be enabled")
         if self.kubernetes.cluster_id != self.cluster_id:
             raise RawCollectionError("Kubernetes cluster identity mismatch")
+        if (
+            not self.formal_tcp_edge_entity_ids
+            or len(self.formal_tcp_edge_entity_ids)
+            != len(set(self.formal_tcp_edge_entity_ids))
+        ):
+            raise RawCollectionError(
+                "formal TCP edge scope must be non-empty and unique"
+            )
+        prefix = f"{self.cluster_id}::"
+        for entity_id in self.formal_tcp_edge_entity_ids:
+            if (
+                not isinstance(entity_id, str)
+                or not entity_id.startswith(prefix)
+                or not entity_id.endswith("::tcp")
+                or entity_id.count("->") != 1
+            ):
+                raise RawCollectionError(
+                    "formal TCP edge identity is invalid"
+                )
 
     @property
     def public_fingerprint(self) -> str:
@@ -118,6 +144,9 @@ class FinalLiveCollectorConfig:
             "window_sec": self.window_sec,
             "collection_delay_sec": self.collection_delay_sec,
             "window_lead_sec": self.window_lead_sec,
+            "formal_tcp_edge_entity_ids": list(
+                self.formal_tcp_edge_entity_ids
+            ),
             "kubernetes": asdict(self.kubernetes),
             "prometheus": {
                 "config_fingerprint": self.prometheus.config_fingerprint,
@@ -473,6 +502,7 @@ class FinalDataPlaneCollector:
         *,
         collection_contract: dict[str, Any],
         collector_build_id: str,
+        formal_tcp_edge_entity_ids: Iterable[str] = (),
     ):
         if not isinstance(collector_build_id, str) \
                 or len(collector_build_id) != 64 \
@@ -483,7 +513,10 @@ class FinalDataPlaneCollector:
             )
         self.collection_contract = dict(collection_contract)
         self.collector_build_id = collector_build_id
-        self.aggregator = FinalWindowAggregator(self.collection_contract)
+        self.aggregator = FinalWindowAggregator(
+            self.collection_contract,
+            formal_tcp_edge_entity_ids=formal_tcp_edge_entity_ids,
+        )
 
     def assemble(
         self,
@@ -582,6 +615,9 @@ class FinalLiveCollectionRunner:
         self.assembler = FinalDataPlaneCollector(
             collection_contract=collection_contract,
             collector_build_id=build_id,
+            formal_tcp_edge_entity_ids=(
+                config.formal_tcp_edge_entity_ids
+            ),
         )
 
     def _wait_until(self, timestamp_ns: int) -> None:

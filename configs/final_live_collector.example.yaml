@@ -1,8 +1,24 @@
-schema_version: probeRCA-final-live-collector-v1
+schema_version: probeRCA-final-live-collector-v2
 cluster_id: kind-proberca-ob
 window_sec: 1
 collection_delay_sec: 1.0
 window_lead_sec: 1.0
+formal_tcp_edge_entity_ids:
+- kind-proberca-ob::online-boutique::cartservice->redis-cart::tcp
+- kind-proberca-ob::online-boutique::checkoutservice->cartservice::tcp
+- kind-proberca-ob::online-boutique::checkoutservice->currencyservice::tcp
+- kind-proberca-ob::online-boutique::checkoutservice->emailservice::tcp
+- kind-proberca-ob::online-boutique::checkoutservice->paymentservice::tcp
+- kind-proberca-ob::online-boutique::checkoutservice->productcatalogservice::tcp
+- kind-proberca-ob::online-boutique::checkoutservice->shippingservice::tcp
+- kind-proberca-ob::online-boutique::frontend->adservice::tcp
+- kind-proberca-ob::online-boutique::frontend->cartservice::tcp
+- kind-proberca-ob::online-boutique::frontend->checkoutservice::tcp
+- kind-proberca-ob::online-boutique::frontend->currencyservice::tcp
+- kind-proberca-ob::online-boutique::frontend->productcatalogservice::tcp
+- kind-proberca-ob::online-boutique::frontend->recommendationservice::tcp
+- kind-proberca-ob::online-boutique::frontend->shippingservice::tcp
+- kind-proberca-ob::online-boutique::recommendationservice->productcatalogservice::tcp
 
 kubernetes:
   enabled: true
