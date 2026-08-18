@@ -1620,6 +1620,89 @@ def test_fault_runner_subprocesses_use_frozen_kubeconfig(monkeypatch):
     assert observed["arguments"] == ["kubectl", "version"]
     assert observed["environment"]["KUBECONFIG"] == str(runner.KUBECONFIG)
 
+def test_fault_runner_validates_frozen_formal_burst_channels(
+    tmp_path, monkeypatch,
+):
+    import scripts.run_final_fault_matrix as runner
+
+    formal_channels = runner.formal_burst_channel_ids()
+    assert len(formal_channels) == 26
+    assert {
+        "tcp.retrans_rate",
+        "tcp.rto_rate",
+        "tcp.rtt_p95",
+        "tcp.connect_failure_rate",
+        "tcp.rst_rate",
+    } <= formal_channels
+    assert formal_channels.isdisjoint(
+        EXPERIMENTAL_DNS_BURST_CHANNEL_IDS
+    )
+    assert set(runner.BURST_CHANNEL_MODES) - formal_channels == set(
+        EXPERIMENTAL_DNS_BURST_CHANNEL_IDS
+    )
+
+    normal_root = tmp_path / "normal"
+    burst_root = tmp_path / "burst"
+    normal_root.mkdir()
+    burst_root.mkdir()
+    (normal_root / "collection-manifest.json").write_text(
+        "normal", encoding="utf-8",
+    )
+    (burst_root / "burst-manifest.json").write_text(
+        "burst", encoding="utf-8",
+    )
+    left = SimpleNamespace(
+        sequence=1,
+        window_start_ns=0,
+        window_end_ns=_NS,
+        burst_evidence=(),
+        node_metrics=(
+            SimpleNamespace(scope="service", service_name="checkoutservice"),
+        ),
+    )
+
+    def sample(channel_id):
+        return SimpleNamespace(
+            channel_id=channel_id,
+            mapping_quality=1.0,
+            entity_type="service",
+            entity_id="cluster::namespace::checkoutservice",
+        )
+
+    right = SimpleNamespace(
+        sequence=1,
+        window_start_ns=0,
+        window_end_ns=_NS,
+        samples=tuple(sample(item) for item in sorted(formal_channels)),
+        event_loss_rate=0.0,
+    )
+    normal = SimpleNamespace(
+        dataset_id="dataset",
+        manifest_fingerprint="normal-manifest",
+        iter_windows=lambda: iter((left,)),
+    )
+    burst = SimpleNamespace(
+        dataset_id="dataset",
+        manifest_fingerprint="burst-manifest",
+        iter_windows=lambda: iter((right,)),
+    )
+    monkeypatch.setattr(runner.CollectionArchive, "load", lambda _path: normal)
+    monkeypatch.setattr(runner.BurstArchive, "load", lambda _path: burst)
+
+    result = runner.validate_archives(normal_root, burst_root, 1)
+    assert result["window_count"] == 1
+
+    right.samples += (sample("dns.timeout_rate"),)
+    with pytest.raises(runner.ExperimentError, match="channel coverage"):
+        runner.validate_archives(normal_root, burst_root, 1)
+
+    right.samples = tuple(
+        sample(item) for item in sorted(formal_channels - {"tcp.rtt_p95"})
+    )
+    with pytest.raises(runner.ExperimentError, match="channel coverage"):
+        runner.validate_archives(normal_root, burst_root, 1)
+
+
 
 def test_fault_runner_observes_exporter_after_bounded_recovery_restart(
     tmp_path, monkeypatch,

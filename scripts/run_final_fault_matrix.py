@@ -381,6 +381,22 @@ def assert_current_readiness_handshake(
             ),
         }
 
+def formal_burst_channel_ids() -> frozenset[str]:
+    payload = yaml.safe_load(CONTROL_CONFIG.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ExperimentError("final control config is not a mapping")
+    config = FinalControlConfig.from_dict(payload)
+    channel_ids = frozenset(
+        role["channel_id"]
+        for role in config.collection_contract["burst_channel_roles"]
+    )
+    if not channel_ids or not channel_ids.issubset(BURST_CHANNEL_MODES):
+        raise ExperimentError(
+            "formal Burst channel roles are missing or unknown"
+        )
+    return channel_ids
+
+
 
 def validate_archives(
     normal_root: Path, burst_root: Path, expected_windows: int,
@@ -389,6 +405,7 @@ def validate_archives(
     burst = BurstArchive.load(burst_root)
     normal_windows = tuple(normal.iter_windows())
     burst_windows = tuple(burst.iter_windows())
+    expected_burst_channels = formal_burst_channel_ids()
     if normal.dataset_id != burst.dataset_id:
         raise ExperimentError("normal/Burst dataset identity mismatch")
     if len(normal_windows) != expected_windows \
@@ -415,7 +432,7 @@ def validate_archives(
                 "data plane embedded normalized Burst evidence"
             )
         channels = {item.channel_id for item in right.samples}
-        if channels != set(BURST_CHANNEL_MODES):
+        if channels != expected_burst_channels:
             raise ExperimentError("Burst channel coverage mismatch")
         normal_services = {
             item.service_name for item in left.node_metrics
