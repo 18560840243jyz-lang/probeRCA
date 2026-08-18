@@ -84,6 +84,22 @@ _COREDNS_METRICS = frozenset({
     "coredns_dns_request_duration_seconds_bucket",
     "coredns_dns_responses_total",
 })
+_TRANSIENT_SNAPSHOT_ERROR_PREFIXES = (
+    "capacity_integration_gap_rebased",
+    "Beyla/CoreDNS request coverage is incomplete:",
+)
+
+
+def _is_transient_snapshot_error(error: Exception) -> bool:
+    """Return whether one invalid snapshot may be retried at the next target."""
+
+    if not isinstance(error, RawCollectionError):
+        return False
+    reason = str(error)
+    return any(
+        reason.startswith(prefix)
+        for prefix in _TRANSIENT_SNAPSHOT_ERROR_PREFIXES
+    )
 
 
 def _select_metric_lines(
@@ -2744,7 +2760,7 @@ class FinalPrimitiveExporter:
                     self._pipeline_condition.notify_all()
             except Exception as error:
                 reason = f"{type(error).__name__}: {error}"
-                transient = str(error) == "capacity_integration_gap_rebased"
+                transient = _is_transient_snapshot_error(error)
                 self._record_pipeline_failure(reason, fatal=not transient)
             finally:
                 with self._pipeline_condition:

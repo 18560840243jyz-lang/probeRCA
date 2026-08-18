@@ -57,6 +57,7 @@ STATE_SERVICES = (
 )
 WINDOW_WALL_BUDGET_SEC = 10
 DATA_PLANE_READY_TIMEOUT_SEC = 90
+HOST_MEMORY_PILOT_BYTES = 4 * 1024 * 1024 * 1024
 
 
 class ExperimentError(RuntimeError):
@@ -899,11 +900,10 @@ def experiment_specs() -> list[dict[str, Any]]:
             "root_category": "Memory",
             "activate": actor_fault(
                 "memory", service=None,
-                # Keep enough headroom for kubelet and the instrumented
-                # workload.  Eight GiB caused health-probe restarts on this
-                # 16-GiB validation VM, changing topology rather than
+                # Six GiB still caused probe-driven container restarts on the
+                # frozen 16-GiB VM, changing runtime identity instead of
                 # producing a stable host-memory-pressure interval.
-                arguments=["--bytes", str(6 * 1024 * 1024 * 1024)],
+                arguments=["--bytes", str(HOST_MEMORY_PILOT_BYTES)],
             ),
         },
         {

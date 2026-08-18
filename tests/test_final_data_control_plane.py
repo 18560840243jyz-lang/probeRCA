@@ -2605,12 +2605,16 @@ def test_out_of_scope_service_records_keep_diagnostic_scope_flags():
 
 
 def test_formal_fault_matrix_keeps_tcp_and_excludes_dns():
-    from scripts.run_final_fault_matrix import experiment_specs
+    from scripts.run_final_fault_matrix import (
+        HOST_MEMORY_PILOT_BYTES,
+        experiment_specs,
+    )
 
     specs = experiment_specs()
     assert any(item["fault_type"] == "tcp_edge" for item in specs)
     assert all(item["fault_type"] != "dns_edge" for item in specs)
     assert all(item["root_category"] != "DNS" for item in specs)
+    assert HOST_MEMORY_PILOT_BYTES == 4 * 1024 * 1024 * 1024
 
 
 def test_dns_anomaly_is_marked_excluded_and_cannot_alert():

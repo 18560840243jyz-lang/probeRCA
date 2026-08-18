@@ -514,6 +514,29 @@ def test_fatal_pipeline_failure_exits_http_server_for_service_restart(
     assert "inventory refresh missed" in str(errors[0])
 
 
+def test_incomplete_beyla_coverage_fails_one_snapshot_without_killing_pipeline():
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter._lock = threading.Lock()
+    exporter._last_error = None
+    exporter._ensure_pipeline_state()
+    error = RawCollectionError(
+        "Beyla/CoreDNS request coverage is incomplete: "
+        "[('online-boutique', 'paymentservice')]"
+    )
+
+    assert primitive_module._is_transient_snapshot_error(error) is True
+    exporter._record_pipeline_failure(
+        f"{type(error).__name__}: {error}",
+        fatal=not primitive_module._is_transient_snapshot_error(error),
+    )
+
+    assert exporter._pipeline_failed.is_set() is False
+    assert "request coverage is incomplete" in exporter._last_error
+    assert primitive_module._is_transient_snapshot_error(
+        RawCollectionError("inventory refresh missed the next snapshot deadline")
+    ) is False
+
+
 def test_snapshot_loop_uses_fixed_one_second_deadlines():
     clock = {"ns": 100_000_000}
     targets = []
