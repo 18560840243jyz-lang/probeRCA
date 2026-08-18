@@ -1660,7 +1660,7 @@ def test_prometheus_source_preserves_raw_boundary_series_identity():
     ).config.range_query_chunk_windows == 120
     assert PrometheusPrimitiveSource(
         config, session=Session(),
-    ).config.range_query_max_workers == 4
+    ).config.range_query_max_workers == 1
 
 
 def test_query_range_chunks_bound_request_fanout_and_memory(monkeypatch):
@@ -1702,20 +1702,20 @@ def test_query_range_chunks_bound_request_fanout_and_memory(monkeypatch):
         bounds=bounds,
         inventory_revision=SimpleNamespace(),
     ))
-    assert len(chunks) == 10
-    assert all(len(chunk) == 120 for chunk in chunks)
-    assert len(requests_seen) == 30 * 10 == 300
-    assert source.last_range_query_stats["request_count"] == 300
-    assert source.last_range_query_stats["max_loaded_windows"] == 120
-    assert config.prometheus.range_query_max_workers == 4
-    assert concurrency["maximum"] == 4
+    assert len(chunks) == 40
+    assert all(len(chunk) == 30 for chunk in chunks)
+    assert len(requests_seen) == 30 * 40 == 1200
+    assert source.last_range_query_stats["request_count"] == 1200
+    assert source.last_range_query_stats["max_loaded_windows"] == 30
+    assert config.prometheus.range_query_max_workers == 1
+    assert concurrency["maximum"] == 1
     for component, timestamps in requests_seen:
         expected_count = (
-            121
+            31
             if COMPONENTS[component].metric_kind in {
                 "monotonic_counter", "histogram_bucket",
             }
-            else 120
+            else 30
         )
         assert len(timestamps) == expected_count
 

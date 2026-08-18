@@ -149,12 +149,12 @@ class PrometheusSourceConfig:
     reject_warnings: bool
     queries: tuple[PrometheusPrimitiveQuery, ...]
     range_query_chunk_windows: int = 120
-    range_query_max_workers: int = 4
+    range_query_max_workers: int = 1
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PrometheusSourceConfig":
         normalized = dict(payload)
-        normalized.setdefault("range_query_max_workers", 4)
+        normalized.setdefault("range_query_max_workers", 1)
         values = _strict_mapping(
             normalized, set(cls.__dataclass_fields__),
             "Prometheus source config",
