@@ -1,7 +1,7 @@
 """Live raw-primitive exporter for the frozen final ProbeRCA data plane.
 
 This module performs source adaptation only.  It never computes the final
-9/4/3/3 metrics, alert state, propagation matrices, residuals, or RCA scores.
+9/4/3 metrics, alert state, propagation matrices, residuals, or RCA scores.
 Every exposed series is a cumulative counter, cumulative histogram bucket, or
 instant gauge consumed later by :mod:`proberca.dataplane.final_aggregation`.
 """
@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import (
     Future,
     ProcessPoolExecutor,
@@ -46,7 +47,7 @@ from .raw import RawCollectionError
 
 
 FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION = (
-    "probeRCA-final-primitive-exporter-v4"
+    "probeRCA-final-primitive-exporter-v5"
 )
 DNS_BUCKETS_MS = (
     0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0,
@@ -141,6 +142,11 @@ class FinalPrimitiveExporterConfig:
     listen_port: int
     snapshot_period_sec: int
     source_timeout_sec: float
+    acquisition_max_pending: int = 4
+    beyla_acquisition_workers: int = 4
+    raw_acquisition_workers: int = 24
+    publish_queue_max_pending: int = 4
+    publish_visibility_sec: float = 0.5
     experimental_dns_enabled: bool = False
 
     @classmethod
@@ -149,6 +155,11 @@ class FinalPrimitiveExporterConfig:
     ) -> "FinalPrimitiveExporterConfig":
         normalized = dict(payload)
         normalized.setdefault("experimental_dns_enabled", False)
+        normalized.setdefault("acquisition_max_pending", 4)
+        normalized.setdefault("beyla_acquisition_workers", 4)
+        normalized.setdefault("raw_acquisition_workers", 24)
+        normalized.setdefault("publish_queue_max_pending", 4)
+        normalized.setdefault("publish_visibility_sec", 0.5)
         values = _strict_mapping(
             normalized, set(cls.__dataclass_fields__),
             "final primitive exporter config",
@@ -222,6 +233,31 @@ class FinalPrimitiveExporterConfig:
                 or not isinstance(self.source_timeout_sec, (int, float)) \
                 or not 0 < float(self.source_timeout_sec) <= 30:
             raise RawCollectionError("source_timeout_sec is invalid")
+        for name, minimum, maximum in (
+            ("acquisition_max_pending", 2, 32),
+            ("beyla_acquisition_workers", 2, 32),
+            ("raw_acquisition_workers", 4, 128),
+            ("publish_queue_max_pending", 2, 32),
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) \
+                    or not minimum <= value <= maximum:
+                raise RawCollectionError(f"{name} is outside its safe range")
+        if self.beyla_acquisition_workers > self.acquisition_max_pending:
+            raise RawCollectionError(
+                "Beyla workers cannot exceed acquisition pending capacity"
+            )
+        if self.raw_acquisition_workers < self.acquisition_max_pending * 4:
+            raise RawCollectionError(
+                "raw workers cannot launch every base source at pending capacity"
+            )
+        visibility = self.publish_visibility_sec
+        if isinstance(visibility, bool) or not isinstance(
+            visibility, (int, float)
+        ) or not 0.25 <= float(visibility) < float(self.snapshot_period_sec):
+            raise RawCollectionError(
+                "publish_visibility_sec must be in [0.25, snapshot period)"
+            )
 
 
 @dataclass(frozen=True)
@@ -288,6 +324,62 @@ class _RequestRow:
     container: str
     destination_namespace: str | None = None
     destination_service: str | None = None
+
+
+@dataclass(frozen=True)
+class _RawCgroupPrimitive:
+    identity: ContainerIdentity
+    cgroup_id: int
+    cpu_stat_lines: tuple[str, ...]
+    cpu_max_fields: tuple[str, ...]
+    memory_current_text: str
+    memory_max_text: str
+    memory_stat_lines: tuple[str, ...]
+    io_pressure: str
+    process_count: int
+    thread_count: int
+
+
+@dataclass(frozen=True)
+class _AcquisitionContext:
+    target_timestamp_ns: int
+    inventory: Inventory
+    cgroup_paths: tuple[tuple[str, Path], ...]
+    cgroup_identity: tuple[tuple[int, ContainerIdentity], ...]
+    started_perf_ns: int
+    acquisition_lag_ns: int
+
+
+@dataclass(frozen=True)
+class _PendingAcquisition:
+    context: _AcquisitionContext
+    beyla_future: Future
+    bpf_future: Future
+    node_future: Future
+    cgroup_future: Future
+    qdisc_future: Future
+    coredns_futures: tuple[tuple[str, Future], ...]
+
+
+@dataclass(frozen=True)
+class _RawAcquisition:
+    context: _AcquisitionContext
+    beyla: tuple[PrometheusSample, ...]
+    bpf: tuple[dict[str, Any], ...]
+    node: tuple[PrometheusSample, ...]
+    cgroups: tuple[_RawCgroupPrimitive, ...]
+    qdisc_raw: tuple[tuple[str, float], ...]
+    coredns: tuple[tuple[str, tuple[PrometheusSample, ...]], ...]
+    source_durations_ns: tuple[tuple[str, int], ...]
+    completed_perf_ns: int
+
+
+@dataclass(frozen=True)
+class _CompletedSnapshot:
+    target_timestamp_ns: int
+    rendered: str
+    raw: _RawAcquisition
+    stage_durations_ns: tuple[tuple[str, int], ...]
 
 
 def _labels_without(
@@ -441,6 +533,8 @@ class FinalPrimitiveExporter:
         config.validate()
         self.config = config
         self.session = session or requests.Session()
+        self._session_was_provided = session is not None
+        self._http_session_local = threading.local()
         self.wall_clock_ns = wall_clock_ns
         self.sleep = sleep
         self._lock = threading.Lock()
@@ -475,11 +569,16 @@ class FinalPrimitiveExporter:
             initializer=_initialize_inventory_worker,
             initargs=(self.config,),
         )
-        # Source workers are long-lived so the one-second critical path does
-        # not repeatedly create and tear down an executor and its threads.
-        self._source_executor = ThreadPoolExecutor(
-            max_workers=8,
-            thread_name_prefix="final-primitive-source",
+        # Raw reads may overlap across target seconds.  The slow Beyla source
+        # has an independent bounded channel so it cannot prevent the next
+        # target's BPF/cgroup/node reads from starting.
+        self._beyla_executor = ThreadPoolExecutor(
+            max_workers=self.config.beyla_acquisition_workers,
+            thread_name_prefix="final-primitive-beyla",
+        )
+        self._raw_source_executor = ThreadPoolExecutor(
+            max_workers=self.config.raw_acquisition_workers,
+            thread_name_prefix="final-primitive-raw",
         )
         self._inventory_refresh_future: Future[Inventory] | None = None
         self._cgroup_path_cache: tuple[
@@ -487,6 +586,18 @@ class FinalPrimitiveExporter:
         ] | None = None
         self._snapshot_deadline_misses_total = 0
         self._last_snapshot_stage_durations_ns: dict[str, int] = {}
+        self._pipeline_condition = threading.Condition()
+        self._pending_acquisitions: deque[_PendingAcquisition] = deque()
+        self._publish_queue: deque[_CompletedSnapshot] = deque()
+        self._pipeline_failed = threading.Event()
+        self._acquisition_targets_total = 0
+        self._acquisition_backpressure_total = 0
+        self._missing_targets_total = 0
+        self._max_pending_depth = 0
+        self._max_publish_queue_depth = 0
+        self._last_published_target_ns = 0
+        self._last_publish_perf_ns = 0
+        self._pipeline_diagnostics: list[dict[str, int]] = []
         self.dns_policy: DnsAggregationPolicy | None = None
         if self.config.experimental_dns_enabled:
             policy_payload = yaml.safe_load(Path(
@@ -512,6 +623,19 @@ class FinalPrimitiveExporter:
                 "inventory worker did not initialize before its deadline"
             ) from error
         self._inventory_cache = initial_inventory
+        required_raw_workers = self.config.acquisition_max_pending * (
+            4 + len(initial_inventory.coredns_pods)
+        )
+        if self.config.raw_acquisition_workers < required_raw_workers:
+            self._beyla_executor.shutdown(wait=False, cancel_futures=True)
+            self._raw_source_executor.shutdown(wait=False, cancel_futures=True)
+            self._inventory_refresh_executor.shutdown(
+                wait=False, cancel_futures=True
+            )
+            raise RawCollectionError(
+                "raw acquisition workers cannot cover all frozen sources at "
+                "pending capacity"
+            )
 
     def _resolve_kind_node_cgroup(self) -> Path:
         result = subprocess.run(
@@ -695,7 +819,21 @@ class FinalPrimitiveExporter:
         *,
         metric_names: frozenset[str] | None = None,
     ) -> tuple[PrometheusSample, ...]:
-        response = self.session.get(
+        # A caller-supplied session is retained for deterministic tests.  In
+        # production every acquisition worker owns its own Session; requests
+        # never concurrently share a mutable requests.Session.
+        if getattr(self, "_session_was_provided", False):
+            session = self.session
+        else:
+            local = getattr(self, "_http_session_local", None)
+            if local is None:
+                local = threading.local()
+                self._http_session_local = local
+            session = getattr(local, "session", None)
+            if session is None:
+                session = requests.Session()
+                local.session = session
+        response = session.get(
             url,
             headers={"Accept-Encoding": "gzip"},
             timeout=float(self.config.source_timeout_sec),
@@ -714,7 +852,8 @@ class FinalPrimitiveExporter:
     ) -> tuple[PrometheusSample, ...]:
         name = f"http:{pod.pod}:9153"
         text = self.core.connect_get_namespaced_pod_proxy_with_path(
-            name, pod.namespace, "metrics"
+            name, pod.namespace, "metrics",
+            _request_timeout=float(self.config.source_timeout_sec),
         )
         return parse_prometheus_text(
             _select_metric_lines(text, _COREDNS_METRICS)
@@ -894,42 +1033,102 @@ class FinalPrimitiveExporter:
         self._cgroup_path_cache = (active_ids, dict(resolved))
         return resolved
 
-    def _resource_samples(
+    def _read_cgroup_primitives(
         self,
         inventory: Inventory,
         cgroup_paths: dict[str, Path],
-        bpf: tuple[dict[str, Any], ...],
-        timestamp_ns: int,
-    ) -> tuple[PrometheusSample, ...]:
-        cgroup_ids: dict[int, ContainerIdentity] = {}
+    ) -> tuple[_RawCgroupPrimitive, ...]:
+        """Read immutable per-target cgroup inputs without updating state."""
+
         output = []
+        seen_cgroup_ids: set[int] = set()
         for identity in inventory.containers:
-            labels = self._resource_labels(identity)
             path = cgroup_paths.get(identity.container_id)
             if path is None:
                 raise RawCollectionError(
                     "monitored container lacks a resolved cgroup"
                 )
             try:
-                cpu_stat_lines = (path / "cpu.stat").read_text(
+                cgroup_id = path.stat().st_ino
+                cpu_stat_lines = tuple((path / "cpu.stat").read_text(
                     encoding="utf-8"
-                ).splitlines()
-                cpu_max_fields = (path / "cpu.max").read_text(
+                ).splitlines())
+                cpu_max_fields = tuple((path / "cpu.max").read_text(
                     encoding="utf-8"
-                ).split()
+                ).split())
                 memory_current_text = (path / "memory.current").read_text(
                     encoding="utf-8"
                 ).strip()
                 memory_max_text = (path / "memory.max").read_text(
                     encoding="utf-8"
                 ).strip()
-                memory_stat_lines = (path / "memory.stat").read_text(
+                memory_stat_lines = tuple((path / "memory.stat").read_text(
                     encoding="utf-8"
-                ).splitlines()
+                ).splitlines())
+                io_pressure = (path / "io.pressure").read_text(
+                    encoding="utf-8"
+                )
+                process_count = len((path / "cgroup.procs").read_text(
+                    encoding="utf-8"
+                ).splitlines())
+                thread_count = len((path / "cgroup.threads").read_text(
+                    encoding="utf-8"
+                ).splitlines())
             except OSError as error:
                 raise RawCollectionError(
                     "cannot read monitored cgroup resource primitives"
                 ) from error
+            if cgroup_id in seen_cgroup_ids:
+                raise RawCollectionError(
+                    "multiple containers share one cgroup identity"
+                )
+            seen_cgroup_ids.add(cgroup_id)
+            output.append(_RawCgroupPrimitive(
+                identity=identity,
+                cgroup_id=cgroup_id,
+                cpu_stat_lines=cpu_stat_lines,
+                cpu_max_fields=cpu_max_fields,
+                memory_current_text=memory_current_text,
+                memory_max_text=memory_max_text,
+                memory_stat_lines=memory_stat_lines,
+                io_pressure=io_pressure,
+                process_count=process_count,
+                thread_count=thread_count,
+            ))
+        return tuple(output)
+
+    def _resource_samples(
+        self,
+        inventory: Inventory,
+        cgroup_paths: dict[str, Path],
+        bpf: tuple[dict[str, Any], ...],
+        timestamp_ns: int,
+        *,
+        raw_cgroups: tuple[_RawCgroupPrimitive, ...] | None = None,
+    ) -> tuple[PrometheusSample, ...]:
+        cgroup_ids: dict[int, ContainerIdentity] = {}
+        output = []
+        reads = raw_cgroups
+        if reads is None:
+            reads = self._read_cgroup_primitives(inventory, cgroup_paths)
+        expected = {item.container_id for item in inventory.containers}
+        if {item.identity.container_id for item in reads} != expected:
+            raise RawCollectionError(
+                "raw cgroup acquisition does not match frozen inventory"
+            )
+        for raw in reads:
+            identity = raw.identity
+            labels = self._resource_labels(identity)
+            path = cgroup_paths.get(identity.container_id)
+            if path is None:
+                raise RawCollectionError(
+                    "monitored container lacks a resolved cgroup"
+                )
+            cpu_stat_lines = raw.cpu_stat_lines
+            cpu_max_fields = raw.cpu_max_fields
+            memory_current_text = raw.memory_current_text
+            memory_max_text = raw.memory_max_text
+            memory_stat_lines = raw.memory_stat_lines
             cpu_stat: dict[str, int] = {}
             for line in cpu_stat_lines:
                 fields = line.split()
@@ -996,7 +1195,11 @@ class FinalPrimitiveExporter:
                 output.append(PrometheusSample.create(
                     metric_name, labels, metric_value
                 ))
-            cgroup_id = path.stat().st_ino
+            cgroup_id = raw.cgroup_id
+            if path.stat().st_ino != cgroup_id:
+                raise RawCollectionError(
+                    "cgroup identity changed after raw acquisition"
+                )
             if cgroup_id in cgroup_ids:
                 raise RawCollectionError(
                     "multiple containers share one cgroup identity"
@@ -1019,26 +1222,12 @@ class FinalPrimitiveExporter:
                 timestamp_ns, cgroup_ids, cgroup_records
             )
             raise RawCollectionError("capacity_integration_gap_rebased")
+        reads_by_cgroup = {item.cgroup_id: item for item in reads}
         for cgroup_id, identity in cgroup_ids.items():
-            path = cgroup_paths[identity.container_id]
-            try:
-                io_pressure = (path / "io.pressure").read_text(
-                    encoding="utf-8"
-                )
-                process_count = len(
-                    (path / "cgroup.procs").read_text(
-                        encoding="utf-8"
-                    ).splitlines()
-                )
-                thread_count = len(
-                    (path / "cgroup.threads").read_text(
-                        encoding="utf-8"
-                    ).splitlines()
-                )
-            except OSError as error:
-                raise RawCollectionError(
-                    "cannot read monitored cgroup primitives"
-                ) from error
+            raw = reads_by_cgroup[cgroup_id]
+            io_pressure = raw.io_pressure
+            process_count = raw.process_count
+            thread_count = raw.thread_count
             match = re.search(r"(?m)^some .*?\btotal=([0-9]+)\b", io_pressure)
             if match is None:
                 raise RawCollectionError("cgroup io.pressure is invalid")
@@ -1869,7 +2058,8 @@ class FinalPrimitiveExporter:
                 ))
         return tuple(output)
 
-    def _qdisc_transmit_drop_totals(self) -> dict[str, float]:
+    def _read_qdisc_transmit_drops(self) -> tuple[tuple[str, float], ...]:
+        """Read one immutable qdisc counter snapshot without rebasing it."""
         result = subprocess.run(
             ["tc", "-j", "-s", "qdisc", "show"],
             check=False,
@@ -1904,6 +2094,16 @@ class FinalPrimitiveExporter:
             # than one level.  The maximum is a conservative non-duplicating
             # interface total.
             raw[interface] = max(raw.get(interface, 0.0), float(drops))
+        return tuple(sorted(raw.items()))
+
+    def _qdisc_transmit_drop_totals(
+        self,
+        raw_snapshot: tuple[tuple[str, float], ...] | None = None,
+    ) -> dict[str, float]:
+        raw = dict(
+            self._read_qdisc_transmit_drops()
+            if raw_snapshot is None else raw_snapshot
+        )
         totals: dict[str, float] = {}
         for interface in sorted(set(raw) | set(self._qdisc_drop_state)):
             current = raw.get(interface, 0.0)
@@ -1925,6 +2125,8 @@ class FinalPrimitiveExporter:
         self,
         inventory: Inventory,
         collected: tuple[PrometheusSample, ...] | None = None,
+        *,
+        qdisc_raw: tuple[tuple[str, float], ...] | None = None,
     ) -> tuple[PrometheusSample, ...]:
         if len(inventory.node_names) != 1:
             raise RawCollectionError(
@@ -1964,7 +2166,7 @@ class FinalPrimitiveExporter:
             "proberca_node_network_transmit_error_total":
                 "node_network_transmit_errs_total",
         }
-        qdisc_transmit_drops = self._qdisc_transmit_drop_totals()
+        qdisc_transmit_drops = self._qdisc_transmit_drop_totals(qdisc_raw)
         for output_name, source_name in network.items():
             values = index.get(source_name, ())
             if not values:
@@ -2058,74 +2260,127 @@ class FinalPrimitiveExporter:
                 self._inventory_refresh_executor.submit(_inventory_worker)
             )
 
-    def collect_snapshot(
-        self, timestamp_ns: int | None = None,
-    ) -> str:
-        collect_started_ns = time.perf_counter_ns()
-        stage_durations_ns: dict[str, int] = {}
-        timestamp_ns = timestamp_ns or self.wall_clock_ns()
+    def _freeze_acquisition_context(
+        self, timestamp_ns: int,
+    ) -> _AcquisitionContext:
         if timestamp_ns % 1_000_000_000 != 0:
             raise RawCollectionError(
                 "final primitive snapshot must align to an epoch second"
             )
-        inventory_started_ns = time.perf_counter_ns()
+        started_perf_ns = time.perf_counter_ns()
+        acquisition_lag_ns = max(0, self.wall_clock_ns() - timestamp_ns)
         self._accept_inventory_refresh()
         inventory, cgroup_paths = self._inventory_and_cgroup_paths()
-        cgroup_identity = self._cgroup_identity(
-            inventory, cgroup_paths
-        )
+        cgroup_identity = self._cgroup_identity(inventory, cgroup_paths)
         self._start_inventory_refresh()
-        stage_durations_ns["inventory"] = (
-            time.perf_counter_ns() - inventory_started_ns
-        )
-        source_started_ns = time.perf_counter_ns()
-        executor = self._source_executor
-        coredns_futures = {
-            pod.container_id: executor.submit(
-                _timed_call, self._coredns, pod
-            )
-            for pod in inventory.coredns_pods
-        }
-        beyla_future = executor.submit(
-            _timed_call, self._beyla, inventory
-        )
-        host_future = executor.submit(
-            _timed_call, self._fetch_url,
-            self.config.node_exporter_url,
-        )
-        bpf_future = executor.submit(
-            _timed_call, self._bpf_snapshot, cgroup_identity
-        )
-        source_futures = (
-            *coredns_futures.values(),
-            beyla_future,
-            host_future,
-            bpf_future,
-        )
-        # A failed source read must not leave an old task running into the
-        # next one-second snapshot on the persistent worker pool.
-        wait(source_futures)
-        coredns_results = {
-            container_id: future.result()
-            for container_id, future in coredns_futures.items()
-        }
-        bpf, stage_durations_ns["bpf"] = bpf_future.result()
-        beyla, stage_durations_ns["beyla"] = beyla_future.result()
-        host, stage_durations_ns["node_exporter"] = host_future.result()
-        coredns = {
-            container_id: result[0]
-            for container_id, result in coredns_results.items()
-        }
-        stage_durations_ns["coredns_max"] = max(
-            (result[1] for result in coredns_results.values()),
-            default=0,
-        )
-        stage_durations_ns["sources_wall"] = (
-            time.perf_counter_ns() - source_started_ns
+        return _AcquisitionContext(
+            target_timestamp_ns=timestamp_ns,
+            inventory=inventory,
+            cgroup_paths=tuple(sorted(cgroup_paths.items())),
+            cgroup_identity=tuple(sorted(cgroup_identity.items())),
+            started_perf_ns=started_perf_ns,
+            acquisition_lag_ns=acquisition_lag_ns,
         )
 
+    def _launch_raw_acquisition(
+        self, context: _AcquisitionContext,
+    ) -> _PendingAcquisition:
+        """Launch all target-bound raw reads without waiting for any source."""
+
+        inventory = context.inventory
+        cgroup_paths = dict(context.cgroup_paths)
+        cgroup_identity = dict(context.cgroup_identity)
+        raw_executor = self._raw_source_executor
+        return _PendingAcquisition(
+            context=context,
+            beyla_future=self._beyla_executor.submit(
+                _timed_call, self._beyla, inventory
+            ),
+            bpf_future=raw_executor.submit(
+                _timed_call, self._bpf_snapshot, cgroup_identity
+            ),
+            node_future=raw_executor.submit(
+                _timed_call, self._fetch_url,
+                self.config.node_exporter_url,
+            ),
+            cgroup_future=raw_executor.submit(
+                _timed_call, self._read_cgroup_primitives,
+                inventory, cgroup_paths,
+            ),
+            qdisc_future=raw_executor.submit(
+                _timed_call, self._read_qdisc_transmit_drops,
+            ),
+            coredns_futures=tuple(
+                (pod.container_id, raw_executor.submit(
+                    _timed_call, self._coredns, pod
+                ))
+                for pod in inventory.coredns_pods
+            ),
+        )
+
+    @staticmethod
+    def _complete_raw_acquisition(
+        pending: _PendingAcquisition,
+    ) -> _RawAcquisition:
+        futures = (
+            pending.beyla_future,
+            pending.bpf_future,
+            pending.node_future,
+            pending.cgroup_future,
+            pending.qdisc_future,
+            *(future for _key, future in pending.coredns_futures),
+        )
+        wait(futures)
+        beyla, beyla_ns = pending.beyla_future.result()
+        bpf, bpf_ns = pending.bpf_future.result()
+        node, node_ns = pending.node_future.result()
+        cgroups, cgroup_ns = pending.cgroup_future.result()
+        qdisc_raw, qdisc_ns = pending.qdisc_future.result()
+        coredns_results = tuple(
+            (container_id, future.result())
+            for container_id, future in pending.coredns_futures
+        )
+        return _RawAcquisition(
+            context=pending.context,
+            beyla=beyla,
+            bpf=bpf,
+            node=node,
+            cgroups=cgroups,
+            qdisc_raw=qdisc_raw,
+            coredns=tuple(
+                (container_id, result[0])
+                for container_id, result in coredns_results
+            ),
+            source_durations_ns=tuple(sorted({
+                "beyla": beyla_ns,
+                "bpf": bpf_ns,
+                "node_exporter": node_ns,
+                "cgroup": cgroup_ns,
+                "qdisc": qdisc_ns,
+                "coredns_max": max(
+                    (result[1] for _key, result in coredns_results),
+                    default=0,
+                ),
+            }.items())),
+            completed_perf_ns=time.perf_counter_ns(),
+        )
+
+    def _assemble_raw_acquisition(
+        self, raw: _RawAcquisition,
+    ) -> tuple[str, dict[str, int]]:
+        """Apply every persistent transform once, in target order."""
+
+        assembly_started_ns = time.perf_counter_ns()
+        stage_durations_ns = dict(raw.source_durations_ns)
+        context = raw.context
+        timestamp_ns = context.target_timestamp_ns
+        inventory = context.inventory
+        cgroup_paths = dict(context.cgroup_paths)
+        cgroup_identity = dict(context.cgroup_identity)
+        coredns = dict(raw.coredns)
+
         request_index_started_ns = time.perf_counter_ns()
-        request_index = _sample_index(beyla)
+        request_index = _sample_index(raw.beyla)
         request_histogram_index = _histogram_index(
             request_index, _BEYLA_REQUEST_BUCKET_METRICS
         )
@@ -2134,7 +2389,7 @@ class FinalPrimitiveExporter:
         )
         service_rows_started_ns = time.perf_counter_ns()
         service_rows = self._request_rows(
-            beyla, inventory, edge=False,
+            raw.beyla, inventory, edge=False,
             sample_index=request_index,
             histogram_index=request_histogram_index,
         )
@@ -2143,7 +2398,7 @@ class FinalPrimitiveExporter:
         )
         edge_rows_started_ns = time.perf_counter_ns()
         edge_rows = self._request_rows(
-            beyla, inventory, edge=True,
+            raw.beyla, inventory, edge=True,
             sample_index=request_index,
             histogram_index=request_histogram_index,
         )
@@ -2178,14 +2433,13 @@ class FinalPrimitiveExporter:
             time.perf_counter_ns() - edge_processing_started_ns
         )
         covered_services = {
-            (item.label_dict["namespace"],
-             next(
-                 identity.service
-                 for identity in inventory.containers
-                 if identity.namespace == item.label_dict["namespace"]
-                 and identity.pod == item.label_dict["pod"]
-                 and identity.container == item.label_dict["container"]
-             ))
+            (item.label_dict["namespace"], next(
+                identity.service
+                for identity in inventory.containers
+                if identity.namespace == item.label_dict["namespace"]
+                and identity.pod == item.label_dict["pod"]
+                and identity.container == item.label_dict["container"]
+            ))
             for item in service_samples
             if item.name == "proberca_service_request_total"
         }
@@ -2195,28 +2449,27 @@ class FinalPrimitiveExporter:
                 f"Beyla/CoreDNS request coverage is incomplete: {missing}"
             )
         dns_samples = (
-            self._dns_samples(inventory, bpf, cgroup_identity)
-            if self.config.experimental_dns_enabled
-            else ()
+            self._dns_samples(inventory, raw.bpf, cgroup_identity)
+            if self.config.experimental_dns_enabled else ()
         )
         resources_started_ns = time.perf_counter_ns()
         resource_samples = self._resource_samples(
-            inventory, cgroup_paths, bpf, timestamp_ns
+            inventory, cgroup_paths, raw.bpf, timestamp_ns,
+            raw_cgroups=raw.cgroups,
         )
         stage_durations_ns["resources"] = (
             time.perf_counter_ns() - resources_started_ns
         )
         host_started_ns = time.perf_counter_ns()
-        host_samples = self._host_samples(inventory, host)
+        host_samples = self._host_samples(
+            inventory, raw.node, qdisc_raw=raw.qdisc_raw
+        )
         stage_durations_ns["host_processing"] = (
             time.perf_counter_ns() - host_started_ns
         )
         samples = [
-            *service_samples,
-            *edge_samples,
-            *dns_samples,
-            *resource_samples,
-            *host_samples,
+            *service_samples, *edge_samples, *dns_samples,
+            *resource_samples, *host_samples,
             PrometheusSample.create(
                 "proberca_final_primitive_exporter_ready",
                 {"cluster_id": self.config.cluster_id}, 1.0,
@@ -2238,10 +2491,25 @@ class FinalPrimitiveExporter:
         stage_durations_ns["render"] = (
             time.perf_counter_ns() - render_started_ns
         )
-        stage_durations_ns["collect_total"] = (
-            time.perf_counter_ns() - collect_started_ns
+        stage_durations_ns["assembly"] = (
+            time.perf_counter_ns() - assembly_started_ns
+        )
+        stage_durations_ns["acquisition_wall"] = (
+            raw.completed_perf_ns - context.started_perf_ns
         )
         self._last_snapshot_stage_durations_ns = stage_durations_ns
+        return rendered, stage_durations_ns
+
+    def collect_snapshot(
+        self, timestamp_ns: int | None = None,
+    ) -> str:
+        """Synchronous compatibility path using the same two stages."""
+
+        timestamp_ns = timestamp_ns or self.wall_clock_ns()
+        context = self._freeze_acquisition_context(timestamp_ns)
+        pending = self._launch_raw_acquisition(context)
+        raw = self._complete_raw_acquisition(pending)
+        rendered, _stages = self._assemble_raw_acquisition(raw)
         return rendered
 
     def _warm_source_parsers(self) -> None:
@@ -2277,59 +2545,247 @@ class FinalPrimitiveExporter:
             self._snapshot_ns = timestamp_ns
             self._last_error = None
 
+    def _ensure_pipeline_state(self) -> None:
+        """Initialize pipeline bookkeeping for lightweight test instances."""
+
+        if not hasattr(self, "_pipeline_condition"):
+            self._pipeline_condition = threading.Condition()
+        if not hasattr(self, "_pending_acquisitions"):
+            self._pending_acquisitions = deque()
+        if not hasattr(self, "_publish_queue"):
+            self._publish_queue = deque()
+        if not hasattr(self, "_pipeline_failed"):
+            self._pipeline_failed = threading.Event()
+        for name in (
+            "_acquisition_targets_total", "_acquisition_backpressure_total",
+            "_missing_targets_total", "_max_pending_depth",
+            "_max_publish_queue_depth", "_last_published_target_ns",
+            "_last_publish_perf_ns",
+        ):
+            if not hasattr(self, name):
+                setattr(self, name, 0)
+        if not hasattr(self, "_pipeline_diagnostics"):
+            self._pipeline_diagnostics = []
+
+    def _record_pipeline_failure(
+        self, reason: str, *, fatal: bool,
+    ) -> None:
+        with self._lock:
+            self._last_error = reason
+        if fatal:
+            self._pipeline_failed.set()
+        with self._pipeline_condition:
+            self._pipeline_condition.notify_all()
+        print(
+            f"final primitive snapshot failed: {reason}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _publish_ordered(
+        self,
+        *,
+        target_ns: int,
+        rendered: str,
+        raw: _RawAcquisition,
+        stage_durations_ns: dict[str, int],
+    ) -> None:
+        if target_ns <= self._last_published_target_ns:
+            raise RawCollectionError(
+                "primitive publication target order is invalid"
+            )
+        visibility_ns = int(
+            float(self.config.publish_visibility_sec) * 1_000_000_000
+        )
+        if self._last_publish_perf_ns:
+            remaining_ns = (
+                self._last_publish_perf_ns + visibility_ns
+                - time.perf_counter_ns()
+            )
+            if remaining_ns > 0 and self._stop.wait(
+                remaining_ns / 1_000_000_000
+            ):
+                return
+        published_perf_ns = time.perf_counter_ns()
+        with self._lock:
+            self._snapshot = rendered
+            self._snapshot_ns = target_ns
+            self._last_error = None
+        self._last_published_target_ns = target_ns
+        self._last_publish_perf_ns = published_perf_ns
+        publish_lag_ns = max(0, self.wall_clock_ns() - target_ns)
+        diagnostic = {
+            "target_ns": target_ns,
+            "beyla_duration_ns": stage_durations_ns.get("beyla", 0),
+            "acquisition_lag_ns": raw.context.acquisition_lag_ns,
+            "assembly_lag_ns": max(
+                0, raw.completed_perf_ns - raw.context.started_perf_ns
+            ),
+            "publish_lag_ns": publish_lag_ns,
+            "pending_depth": len(self._pending_acquisitions),
+            "publish_queue_depth": len(self._publish_queue),
+            "max_pending_depth": self._max_pending_depth,
+            "max_publish_queue_depth": self._max_publish_queue_depth,
+            "backpressure_count": self._acquisition_backpressure_total,
+            "missing_target_count": self._missing_targets_total,
+        }
+        self._pipeline_diagnostics.append(diagnostic)
+        if len(self._pipeline_diagnostics) > 4096:
+            del self._pipeline_diagnostics[:-2048]
+        print(
+            "final primitive snapshot published: "
+            + json.dumps(diagnostic, sort_keys=True, separators=(",", ":")),
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _launch_target(self, target_ns: int) -> _PendingAcquisition:
+        context = self._freeze_acquisition_context(target_ns)
+        return self._launch_raw_acquisition(context)
+
     def _snapshot_loop(self) -> None:
+        """Launch one immutable raw acquisition for every epoch second."""
+
+        self._ensure_pipeline_state()
         second_ns = self.config.snapshot_period_sec * 1_000_000_000
         target = (
             (self.wall_clock_ns() // second_ns) + 1
         ) * second_ns
-        while not self._stop.is_set():
+        while not self._stop.is_set() and not self._pipeline_failed.is_set():
             remaining = target - self.wall_clock_ns()
             if remaining > 0 and self._stop.wait(
                     remaining / 1_000_000_000):
                 return
-            started_ns = time.perf_counter_ns()
-            try:
-                self.snapshot_once(target)
-            except Exception as error:
-                print(
-                    "final primitive snapshot failed: "
-                    f"{type(error).__name__}: {error}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            else:
-                duration_ns = time.perf_counter_ns() - started_ns
-                slow_stages = ""
-                if duration_ns >= 800_000_000:
-                    stages = getattr(
-                        self, "_last_snapshot_stage_durations_ns", {}
-                    )
-                    slow_stages = " stages_ns=" + json.dumps(
-                        stages, sort_keys=True, separators=(",", ":")
-                    )
-                print(
-                    "final primitive snapshot completed: "
-                    f"target_ns={target} duration_ns={duration_ns}"
-                    f"{slow_stages}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            target += second_ns
-            now = self.wall_clock_ns()
-            while now > target:
+            observed_ns = self.wall_clock_ns()
+            if observed_ns >= target + second_ns:
+                self._missing_targets_total += 1
                 self._snapshot_deadline_misses_total += 1
-                error = (
-                    "snapshot_deadline_missed: "
-                    f"target_ns={target} observed_ns={now}"
+                self._record_pipeline_failure(
+                    "primitive_acquisition_target_missed: "
+                    f"target_ns={target} observed_ns={observed_ns}",
+                    fatal=True,
                 )
-                with self._lock:
-                    self._last_error = error
-                print(
-                    f"final primitive snapshot failed: {error}",
-                    file=sys.stderr,
-                    flush=True,
+                return
+            with self._pipeline_condition:
+                pending_depth = len(self._pending_acquisitions)
+            if pending_depth >= self.config.acquisition_max_pending:
+                self._acquisition_backpressure_total += 1
+                self._record_pipeline_failure(
+                    "primitive_acquisition_backpressure: "
+                    f"target_ns={target} pending_depth={pending_depth}",
+                    fatal=True,
                 )
-                target += second_ns
+                return
+            try:
+                pending = self._launch_target(target)
+            except Exception as error:
+                self._record_pipeline_failure(
+                    f"{type(error).__name__}: {error}", fatal=True
+                )
+                return
+            with self._pipeline_condition:
+                self._pending_acquisitions.append(pending)
+                self._acquisition_targets_total += 1
+                self._max_pending_depth = max(
+                    self._max_pending_depth,
+                    len(self._pending_acquisitions),
+                )
+                self._pipeline_condition.notify_all()
+            target += second_ns
+
+    def _assembly_loop(self) -> None:
+        """Resolve, transform, and publish acquisitions in target order."""
+
+        self._ensure_pipeline_state()
+        while not self._stop.is_set():
+            with self._pipeline_condition:
+                self._pipeline_condition.wait_for(
+                    lambda: bool(self._pending_acquisitions)
+                    or self._stop.is_set()
+                    or self._pipeline_failed.is_set(),
+                    timeout=0.25,
+                )
+                if self._stop.is_set():
+                    return
+                if not self._pending_acquisitions:
+                    if self._pipeline_failed.is_set():
+                        return
+                    continue
+                pending = self._pending_acquisitions[0]
+            try:
+                raw = self._complete_raw_acquisition(pending)
+                rendered, stages = self._assemble_raw_acquisition(raw)
+                completed = _CompletedSnapshot(
+                    target_timestamp_ns=raw.context.target_timestamp_ns,
+                    rendered=rendered,
+                    raw=raw,
+                    stage_durations_ns=tuple(sorted(stages.items())),
+                )
+                with self._pipeline_condition:
+                    if len(self._publish_queue) \
+                            >= self.config.publish_queue_max_pending:
+                        raise RawCollectionError(
+                            "primitive_publish_backpressure: "
+                            f"target_ns={completed.target_timestamp_ns} "
+                            f"publish_depth={len(self._publish_queue)}"
+                        )
+                    self._publish_queue.append(completed)
+                    self._max_publish_queue_depth = max(
+                        self._max_publish_queue_depth,
+                        len(self._publish_queue),
+                    )
+                    self._pipeline_condition.notify_all()
+            except Exception as error:
+                reason = f"{type(error).__name__}: {error}"
+                transient = str(error) == "capacity_integration_gap_rebased"
+                self._record_pipeline_failure(reason, fatal=not transient)
+            finally:
+                with self._pipeline_condition:
+                    if self._pending_acquisitions \
+                            and self._pending_acquisitions[0] is pending:
+                        self._pending_acquisitions.popleft()
+                    self._pipeline_condition.notify_all()
+            if self._pipeline_failed.is_set():
+                return
+
+    def _publication_loop(self) -> None:
+        """Expose completed targets in order with bounded scrape visibility."""
+
+        self._ensure_pipeline_state()
+        while not self._stop.is_set():
+            with self._pipeline_condition:
+                self._pipeline_condition.wait_for(
+                    lambda: bool(self._publish_queue)
+                    or self._stop.is_set()
+                    or self._pipeline_failed.is_set(),
+                    timeout=0.25,
+                )
+                if self._stop.is_set():
+                    return
+                if not self._publish_queue:
+                    if self._pipeline_failed.is_set():
+                        return
+                    continue
+                completed = self._publish_queue[0]
+            try:
+                self._publish_ordered(
+                    target_ns=completed.target_timestamp_ns,
+                    rendered=completed.rendered,
+                    raw=completed.raw,
+                    stage_durations_ns=dict(completed.stage_durations_ns),
+                )
+            except Exception as error:
+                self._record_pipeline_failure(
+                    f"{type(error).__name__}: {error}", fatal=True
+                )
+            finally:
+                with self._pipeline_condition:
+                    if self._publish_queue \
+                            and self._publish_queue[0] is completed:
+                        self._publish_queue.popleft()
+                    self._pipeline_condition.notify_all()
+            if self._pipeline_failed.is_set():
+                return
 
     def _response(self) -> tuple[str, int, str]:
         with self._lock:
@@ -2345,6 +2801,7 @@ class FinalPrimitiveExporter:
         return snapshot, timestamp_ns, "" if fresh else (error or "stale")
 
     def serve_forever(self) -> None:
+        self._ensure_pipeline_state()
         self._warm_source_parsers()
         exporter = self
 
@@ -2383,12 +2840,24 @@ class FinalPrimitiveExporter:
             def log_message(self, format: str, *args: Any) -> None:
                 return
 
-        worker = threading.Thread(
+        acquisition_worker = threading.Thread(
             target=self._snapshot_loop,
-            name="final-primitive-snapshot",
+            name="final-primitive-acquisition",
             daemon=True,
         )
-        worker.start()
+        assembly_worker = threading.Thread(
+            target=self._assembly_loop,
+            name="final-primitive-assembly",
+            daemon=True,
+        )
+        publication_worker = threading.Thread(
+            target=self._publication_loop,
+            name="final-primitive-publication",
+            daemon=True,
+        )
+        acquisition_worker.start()
+        assembly_worker.start()
+        publication_worker.start()
         server = ThreadingHTTPServer(
             (self.config.listen_host, self.config.listen_port), Handler
         )
@@ -2397,15 +2866,20 @@ class FinalPrimitiveExporter:
         finally:
             self._stop.set()
             server.server_close()
-            worker.join(timeout=5.0)
+            with self._pipeline_condition:
+                self._pipeline_condition.notify_all()
+            acquisition_worker.join(timeout=5.0)
+            assembly_worker.join(timeout=5.0)
+            publication_worker.join(timeout=5.0)
             self._inventory_refresh_executor.shutdown(
                 wait=True, cancel_futures=True
             )
-            source_executor = getattr(self, "_source_executor", None)
-            if source_executor is not None:
-                source_executor.shutdown(
-                    wait=True, cancel_futures=True
-                )
+            for name in ("_beyla_executor", "_raw_source_executor"):
+                source_executor = getattr(self, name, None)
+                if source_executor is not None:
+                    source_executor.shutdown(
+                        wait=True, cancel_futures=True
+                    )
 
 
 _INVENTORY_WORKER_EXPORTER: FinalPrimitiveExporter | None = None

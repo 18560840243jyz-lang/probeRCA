@@ -39,6 +39,8 @@ prometheus:
   # Keep hot-TSDB history reads serialized so they cannot starve the
   # independent one-second primitive snapshot publisher on the 4-vCPU VM.
   range_query_max_workers: 1
+  final_target_wait_timeout_sec: 15.0
+  sentinel_poll_interval_sec: 0.1
   reject_warnings: true
   queries:
     # Service request symptoms. The exporter must expose raw counters and

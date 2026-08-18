@@ -589,6 +589,16 @@ class FinalLiveCollectionRunner:
         if remaining > 0:
             self.sleep(remaining / 1_000_000_000)
 
+    def _wait_for_primitive_target(self, timestamp_ns: int) -> None:
+        waiter = getattr(
+            self.primitive_source, "wait_for_target_timestamp", None
+        )
+        if callable(waiter):
+            waiter(
+                target_timestamp_ns=timestamp_ns,
+                cluster_id=self.config.cluster_id,
+            )
+
     def collect_one(self, sequence: int) -> CollectedWindow:
         before = self.discovery.discover_once(self.wall_clock_ns()).freeze(
             self.wall_clock_ns()
@@ -603,6 +613,7 @@ class FinalLiveCollectionRunner:
                 self.config.collection_delay_sec * 1_000_000_000
             )
         )
+        self._wait_for_primitive_target(end_ns)
         after_inventory = self.discovery.discover_once(
             self.wall_clock_ns()
         ).freeze(self.wall_clock_ns())
@@ -700,6 +711,7 @@ class FinalLiveCollectionRunner:
                     * 1_000_000_000
                 )
             )
+        self._wait_for_primitive_target(bounds[-1][1])
         after = self.discovery.discover_once(
             self.wall_clock_ns()
         ).freeze(self.wall_clock_ns())

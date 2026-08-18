@@ -84,6 +84,11 @@ def test_final_exporter_config_is_frozen_and_one_second():
     config = FinalPrimitiveExporterConfig.from_dict(payload)
     assert config.schema_version == FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION
     assert config.snapshot_period_sec == 1
+    assert config.acquisition_max_pending == 4
+    assert config.beyla_acquisition_workers == 4
+    assert config.raw_acquisition_workers == 24
+    assert config.publish_queue_max_pending == 4
+    assert config.publish_visibility_sec == 0.5
     assert config.experimental_dns_enabled is False
     assert "kube-system/kube-dns" in config.include_services
     assert len(config.include_services) == 12
@@ -468,27 +473,30 @@ def test_snapshot_loop_uses_fixed_one_second_deadlines():
 
     stop = Stop()
     exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
-    exporter.config = SimpleNamespace(snapshot_period_sec=1)
+    exporter.config = SimpleNamespace(
+        snapshot_period_sec=1, acquisition_max_pending=4,
+    )
     exporter.wall_clock_ns = lambda: clock["ns"]
     exporter._stop = stop
     exporter._lock = threading.Lock()
     exporter._last_error = None
     exporter._snapshot_deadline_misses_total = 0
 
-    def snapshot_once(target_ns):
+    def launch_target(target_ns):
         targets.append(target_ns)
         clock["ns"] += 200_000_000
         if len(targets) == 3:
             stop.stopped = True
+        return SimpleNamespace(target_ns=target_ns)
 
-    exporter.snapshot_once = snapshot_once
+    exporter._launch_target = launch_target
     exporter._snapshot_loop()
 
     assert targets == [1_000_000_000, 2_000_000_000, 3_000_000_000]
     assert exporter._snapshot_deadline_misses_total == 0
 
 
-def test_snapshot_loop_reports_missed_deadline_without_backfill():
+def test_snapshot_loop_launches_next_target_while_prior_source_is_slow():
     clock = {"ns": 100_000_000}
     targets = []
 
@@ -504,27 +512,28 @@ def test_snapshot_loop_reports_missed_deadline_without_backfill():
 
     stop = Stop()
     exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
-    exporter.config = SimpleNamespace(snapshot_period_sec=1)
+    exporter.config = SimpleNamespace(
+        snapshot_period_sec=1, acquisition_max_pending=4,
+    )
     exporter.wall_clock_ns = lambda: clock["ns"]
     exporter._stop = stop
     exporter._lock = threading.Lock()
     exporter._last_error = None
     exporter._snapshot_deadline_misses_total = 0
 
-    def snapshot_once(target_ns):
+    def launch_target(target_ns):
         targets.append(target_ns)
-        clock["ns"] += (
-            1_200_000_000 if len(targets) == 1 else 200_000_000
-        )
+        clock["ns"] += 20_000_000
         if len(targets) == 2:
             stop.stopped = True
+        return SimpleNamespace(target_ns=target_ns)
 
-    exporter.snapshot_once = snapshot_once
+    exporter._launch_target = launch_target
     exporter._snapshot_loop()
 
-    assert targets == [1_000_000_000, 3_000_000_000]
-    assert exporter._snapshot_deadline_misses_total == 1
-    assert exporter._last_error.startswith("snapshot_deadline_missed:")
+    assert targets == [1_000_000_000, 2_000_000_000]
+    assert exporter._snapshot_deadline_misses_total == 0
+    assert exporter._missing_targets_total == 0
 
 
 def test_request_rows_reuses_precomputed_beyla_indexes(monkeypatch):
@@ -551,12 +560,13 @@ def test_exporter_uses_persistent_source_workers_and_slow_stage_logging():
     source = Path(
         "proberca/dataplane/primitive_exporter.py"
     ).read_text(encoding="utf-8")
-    assert "self._source_executor = ThreadPoolExecutor(" in source
-    assert "executor = self._source_executor" in source
+    assert "self._beyla_executor = ThreadPoolExecutor(" in source
+    assert "self._raw_source_executor = ThreadPoolExecutor(" in source
     assert "self._inventory_refresh_executor = ProcessPoolExecutor(" in source
     assert 'multiprocessing.get_context("spawn")' in source
-    assert "wait(source_futures)" in source
-    assert 'slow_stages = " stages_ns=" + json.dumps(' in source
+    assert "wait(futures)" in source
+    assert "final primitive snapshot published:" in source
+    assert '"beyla_duration_ns"' in source
 
 
 def test_dns_query_counter_is_completed_responses_plus_timeouts():
@@ -1276,7 +1286,7 @@ def test_snapshot_loop_reports_source_failures():
     source = Path(
         "proberca/dataplane/primitive_exporter.py"
     ).read_text(encoding="utf-8")
-    assert '"final primitive snapshot failed: "' in source
+    assert "final primitive snapshot failed:" in source
     assert "file=sys.stderr" in source
 
 

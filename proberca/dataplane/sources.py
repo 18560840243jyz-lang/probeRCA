@@ -8,6 +8,7 @@ aggregation semantics unverifiable.
 
 from __future__ import annotations
 
+import json
 import re
 import math
 import time
@@ -150,11 +151,15 @@ class PrometheusSourceConfig:
     queries: tuple[PrometheusPrimitiveQuery, ...]
     range_query_chunk_windows: int = 120
     range_query_max_workers: int = 1
+    final_target_wait_timeout_sec: float = 15.0
+    sentinel_poll_interval_sec: float = 0.1
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PrometheusSourceConfig":
         normalized = dict(payload)
         normalized.setdefault("range_query_max_workers", 1)
+        normalized.setdefault("final_target_wait_timeout_sec", 15.0)
+        normalized.setdefault("sentinel_poll_interval_sec", 0.1)
         values = _strict_mapping(
             normalized, set(cls.__dataclass_fields__),
             "Prometheus source config",
@@ -208,6 +213,22 @@ class PrometheusSourceConfig:
             raise RawCollectionError(
                 "range_query_max_workers must be in [1, 30]"
             )
+        if isinstance(self.final_target_wait_timeout_sec, bool) \
+                or not isinstance(
+                    self.final_target_wait_timeout_sec, (int, float)
+                ) \
+                or not 1 <= float(self.final_target_wait_timeout_sec) <= 120:
+            raise RawCollectionError(
+                "final_target_wait_timeout_sec must be in [1, 120]"
+            )
+        if isinstance(self.sentinel_poll_interval_sec, bool) \
+                or not isinstance(
+                    self.sentinel_poll_interval_sec, (int, float)
+                ) \
+                or not 0.05 <= float(self.sentinel_poll_interval_sec) <= 1:
+            raise RawCollectionError(
+                "sentinel_poll_interval_sec must be in [0.05, 1]"
+            )
         if not self.queries:
             raise RawCollectionError("Prometheus source requires queries")
         query_ids = [item.query_id for item in self.queries]
@@ -229,6 +250,10 @@ class PrometheusSourceConfig:
             "reject_warnings": self.reject_warnings,
             "range_query_chunk_windows": self.range_query_chunk_windows,
             "range_query_max_workers": self.range_query_max_workers,
+            "final_target_wait_timeout_sec": (
+                self.final_target_wait_timeout_sec
+            ),
+            "sentinel_poll_interval_sec": self.sentinel_poll_interval_sec,
             "queries": [item.to_dict() for item in self.queries],
         })
 
@@ -282,6 +307,102 @@ class PrometheusPrimitiveSource:
             tuple[str, tuple[tuple[str, str], ...]], str
         ] = {}
         self.last_range_query_stats: dict[str, Any] = {}
+        self.last_sentinel_wait_stats: dict[str, Any] = {}
+
+    def wait_for_target_timestamp(
+        self, *, target_timestamp_ns: int, cluster_id: str,
+    ) -> None:
+        """Wait until Prometheus has stored the exact final target sentinel."""
+
+        if isinstance(target_timestamp_ns, bool) \
+                or not isinstance(target_timestamp_ns, int) \
+                or target_timestamp_ns <= 0 \
+                or target_timestamp_ns % 1_000_000_000:
+            raise RawCollectionError(
+                "final primitive sentinel target must be an epoch second"
+            )
+        if not isinstance(cluster_id, str) or not cluster_id:
+            raise RawCollectionError("sentinel cluster identity is required")
+        target_sec = f"{target_timestamp_ns / 1_000_000_000:.9f}"
+        promql = (
+            "proberca_final_primitive_exporter_ready{cluster_id="
+            + json.dumps(cluster_id)
+            + "}"
+        )
+        started = time.monotonic()
+        deadline = started + float(
+            self.config.final_target_wait_timeout_sec
+        )
+        attempts = 0
+        while True:
+            attempts += 1
+            response = self.session.get(
+                self.config.base_url.rstrip("/") + "/api/v1/query_range",
+                params={
+                    "query": promql,
+                    "start": target_sec,
+                    "end": target_sec,
+                    "step": "1",
+                },
+                timeout=float(self.config.timeout_sec),
+            )
+            if response.status_code >= 400:
+                raise RawCollectionError(
+                    "Prometheus final sentinel query failed with HTTP "
+                    f"{response.status_code}"
+                )
+            try:
+                payload = response.json()
+            except Exception as error:
+                raise RawCollectionError(
+                    "Prometheus final sentinel response is not JSON"
+                ) from error
+            if payload.get("status") != "success":
+                raise RawCollectionError(
+                    "Prometheus final sentinel query did not succeed"
+                )
+            if self.config.reject_warnings and payload.get("warnings"):
+                raise RawCollectionError(
+                    "Prometheus final sentinel query returned warnings"
+                )
+            data = payload.get("data") or {}
+            if data.get("resultType") != "matrix":
+                raise RawCollectionError(
+                    "Prometheus final sentinel result is not a matrix"
+                )
+            matches = []
+            for series in data.get("result") or []:
+                labels = series.get("metric") or {}
+                if labels.get("cluster_id") != cluster_id:
+                    continue
+                for pair in series.get("values") or []:
+                    if not isinstance(pair, list) or len(pair) != 2:
+                        raise RawCollectionError(
+                            "Prometheus final sentinel sample is invalid"
+                        )
+                    observed_ns = int(round(
+                        float(pair[0]) * 1_000_000_000
+                    ))
+                    value = float(pair[1])
+                    if observed_ns == target_timestamp_ns and value == 1.0:
+                        matches.append((tuple(sorted(labels.items())), value))
+            if len(matches) > 1:
+                raise RawCollectionError(
+                    "Prometheus final sentinel is duplicated"
+                )
+            if matches:
+                self.last_sentinel_wait_stats = {
+                    "target_timestamp_ns": target_timestamp_ns,
+                    "attempts": attempts,
+                    "wall_seconds": time.monotonic() - started,
+                }
+                return
+            if time.monotonic() >= deadline:
+                raise RawCollectionError(
+                    "Prometheus did not store the final primitive target "
+                    f"{target_timestamp_ns} before timeout"
+                )
+            time.sleep(float(self.config.sentinel_poll_interval_sec))
 
     def _range(
         self,
