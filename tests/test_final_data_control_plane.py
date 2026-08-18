@@ -1546,8 +1546,14 @@ def test_fault_runner_requires_current_readiness_fingerprint_handshake(
         runner.CONTROL_CONFIG.read_text(encoding="utf-8")
     )
     config = FinalControlConfig.from_dict(payload)
-    snapshot = _topology()
-    graph = allowed_service_graph(snapshot)
+    snapshot = _formal_service_scope_topology(config)
+    full_graph = allowed_service_graph(snapshot)
+    graph = formal_service_graph(snapshot, config)
+    assert full_graph.topology_fingerprint != graph.topology_fingerprint
+    assert (
+        full_graph.runtime_identity_fingerprint
+        != graph.runtime_identity_fingerprint
+    )
     readiness = {
         "control_config_fingerprint": config.config_fingerprint,
         "collection_contract_fingerprint": (
@@ -1596,6 +1602,75 @@ def test_fault_runner_requires_current_readiness_fingerprint_handshake(
         match="readiness/config fingerprint mismatch",
     ):
         runner.assert_current_readiness_handshake(bad, tmp_path)
+
+def test_fault_runner_subprocesses_use_frozen_kubeconfig(monkeypatch):
+    import scripts.run_final_fault_matrix as runner
+
+    observed = {}
+
+    def fake_subprocess_run(arguments, **kwargs):
+        observed["arguments"] = arguments
+        observed["environment"] = kwargs["env"]
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_subprocess_run)
+
+    runner.run(["kubectl", "version"], check=False)
+
+    assert observed["arguments"] == ["kubectl", "version"]
+    assert observed["environment"]["KUBECONFIG"] == str(runner.KUBECONFIG)
+
+
+def test_fault_runner_observes_exporter_after_bounded_recovery_restart(
+    tmp_path, monkeypatch,
+):
+    import scripts.run_final_fault_matrix as runner
+
+    clock = {"now": 0.0}
+    restarted = {"value": False}
+    events = []
+
+    def fake_run(arguments, *args, **kwargs):
+        del args, kwargs
+        if arguments[:2] == ["systemctl", "restart"]:
+            restarted["value"] = True
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "http://127.0.0.1:9477/metrics" in arguments:
+            if not restarted["value"]:
+                # Model a failed exporter probe consuming its HTTP timeout.
+                clock["now"] += 8.0
+                return SimpleNamespace(returncode=22, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout="metrics", stderr="")
+        if "http://127.0.0.1:9090/api/v1/query" in arguments:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({
+                    "data": {"result": [{"value": [clock["now"], "1"]}]},
+                }),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(runner, "run", fake_run)
+    monkeypatch.setattr(
+        runner.time, "monotonic", lambda: clock["now"],
+    )
+    monkeypatch.setattr(
+        runner.time, "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    monkeypatch.setattr(
+        runner, "log_event",
+        lambda _root, event, **_fields: events.append(event),
+    )
+
+    runner.wait_data_plane(tmp_path)
+
+    assert restarted["value"] is True
+    assert events == ["primitive_exporter_restarted"]
+    assert clock["now"] >= runner.DATA_PLANE_READY_TIMEOUT_SEC
+    assert clock["now"] < 2 * runner.DATA_PLANE_READY_TIMEOUT_SEC
+
 
 
 def test_call_identity_stays_directed_but_service_mask_is_bidirectional():

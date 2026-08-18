@@ -26,7 +26,7 @@ from proberca.controlplane import (
     FinalControlConfig,
     load_ready_calibration_report,
 )
-from proberca.controlplane.service_model import allowed_service_graph
+from proberca.controlplane.service_model import formal_service_graph
 
 
 REPOSITORY = Path(os.environ.get(
@@ -56,6 +56,7 @@ STATE_SERVICES = (
     "prometheus.service",
 )
 WINDOW_WALL_BUDGET_SEC = 10
+DATA_PLANE_READY_TIMEOUT_SEC = 90
 
 
 class ExperimentError(RuntimeError):
@@ -69,6 +70,8 @@ def run(
     timeout: float | None = None,
     capture: bool = True,
 ) -> subprocess.CompletedProcess:
+    environment = dict(os.environ)
+    environment["KUBECONFIG"] = str(KUBECONFIG)
     return subprocess.run(
         arguments,
         check=check,
@@ -76,6 +79,7 @@ def run(
         text=True,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
+        env=environment,
     )
 
 
@@ -201,7 +205,7 @@ def node_command(arguments: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 
 def wait_data_plane(root: Path, *, restart_on_failure: bool = True) -> None:
-    deadline = time.monotonic() + 90
+    deadline = time.monotonic() + DATA_PLANE_READY_TIMEOUT_SEC
     restarted = False
     exporter_failures = 0
     while time.monotonic() < deadline:
@@ -263,7 +267,23 @@ def wait_data_plane(root: Path, *, restart_on_failure: bool = True) -> None:
             restarted = True
             exporter_failures = 0
             log_event(root, "primitive_exporter_restarted")
+            # A restart is a new, bounded recovery attempt.  Do not charge its
+            # readiness checks against time spent detecting the original fault.
+            deadline = time.monotonic() + DATA_PLANE_READY_TIMEOUT_SEC
+
         time.sleep(3)
+    # A failed exporter probe can consume its full HTTP timeout, so ten
+    # sustained failures may outlive the nominal readiness deadline before the
+    # count-based restart branch above is reached.  Give exactly one restart a
+    # fresh bounded recovery interval and then continue to fail closed.
+    if restart_on_failure and not restarted and exporter_failures:
+        run([
+            "systemctl", "restart",
+            "proberca-final-primitive-exporter.service",
+        ])
+        log_event(root, "primitive_exporter_restarted")
+        return wait_data_plane(root, restart_on_failure=False)
+
     raise ExperimentError("data plane did not become ready")
 
 
@@ -330,8 +350,8 @@ def assert_current_readiness_handshake(
                 "fault injection refused: readiness preflight has "
                 "ambiguous topology"
             )
-        graph = allowed_service_graph(
-            windows[0].topology_events[0]
+        graph = formal_service_graph(
+            windows[0].topology_events[0], config,
         )
         live = {
             "collection_contract_fingerprint": (
