@@ -112,6 +112,9 @@ def main(argv=None) -> int:
     burst_source = FinalLiveBurstSource(
         burst_config,
         burst_config_fingerprint=contract["burst_config_fingerprint"],
+        formal_tcp_edge_entity_ids=(
+            source_config.formal_tcp_edge_entity_ids
+        ),
     )
     burst_writer = BurstArchiveWriter(
         args.burst_output,

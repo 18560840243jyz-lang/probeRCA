@@ -650,6 +650,133 @@ def test_tcp_kernel_reverse_events_use_frozen_call_direction(
     assert all(sample.mapping_quality == 1 for sample in tcp.values())
 
 
+def test_formal_tcp_scope_excludes_observed_reverse_edge_from_burst(
+    tmp_path, monkeypatch,
+):
+    source_cgroup = _filesystem(tmp_path)
+    destination_container_id = "b" * 64
+    destination_cgroup = (
+        tmp_path / "cgroup"
+        / f"cri-containerd-{destination_container_id}.scope"
+    )
+    destination_cgroup.mkdir()
+    (destination_cgroup / "memory.stat").write_text(
+        "pgfault 10\npgmajfault 2\n", encoding="utf-8"
+    )
+    (destination_cgroup / "memory.events").write_text(
+        "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n",
+        encoding="utf-8",
+    )
+    records = [
+        {
+            "record_type": "control",
+            "schema_version": 1,
+            "state": "ready",
+            "timestamp_ns": START - 1,
+            "program_count": 31,
+            "timeout_ms": 5000,
+            "sampling_profile": "low",
+        },
+        {
+            "record_type": "checkpoint",
+            "schema_version": 1,
+            "timestamp_ns": START,
+            "monotonic_ns": 0,
+            "emitted": 0,
+            "reserve_failed": 0,
+            "program_count": 31,
+            "sampling_profile": "low",
+        },
+        _event(
+            13, source_cgroup.stat().st_ino,
+            src_ipv4=_ip("10.0.0.2"),
+            dst_ipv4=_ip("10.96.0.20"),
+            protocol=6,
+        ),
+        {
+            "record_type": "checkpoint",
+            "schema_version": 1,
+            "timestamp_ns": END,
+            "monotonic_ns": 1_000_000_000,
+            "emitted": 1,
+            "reserve_failed": 0,
+            "program_count": 31,
+            "sampling_profile": "low",
+        },
+    ]
+    Path(_config(tmp_path).event_log_path).write_text(
+        "".join(json.dumps(item) + "\n" for item in records),
+        encoding="utf-8",
+    )
+    identities = (
+        _identity(),
+        SimpleNamespace(
+            ready=True,
+            started=True,
+            full_container_id=destination_container_id,
+            service_ids=("cluster::ns::dst",),
+            node_name="node-a",
+            pod_ips=("10.0.0.3",),
+        ),
+    )
+    monkeypatch.setattr(
+        "proberca.dataplane.burst_live.runtime_identities",
+        lambda revision: identities,
+    )
+    normal = SimpleNamespace(samples=(
+        SimpleNamespace(
+            entity_type="service",
+            namespace="ns",
+            service_name="svc",
+        ),
+        SimpleNamespace(
+            entity_type="service",
+            namespace="ns",
+            service_name="dst",
+        ),
+        SimpleNamespace(
+            entity_type="edge",
+            protocol="tcp",
+            namespace="ns",
+            src_service="svc",
+            dst_service="dst",
+        ),
+        SimpleNamespace(
+            entity_type="edge",
+            protocol="tcp",
+            namespace="ns",
+            src_service="dst",
+            dst_service="svc",
+        ),
+    ))
+    formal_edge = "cluster::ns::svc->dst::tcp"
+    source = FinalLiveBurstSource(
+        _config(tmp_path),
+        burst_config_fingerprint=fingerprint({"burst": "contract"}),
+        formal_tcp_edge_entity_ids=(formal_edge,),
+    )
+    window = source.collect_window(
+        sequence=1,
+        window_start_ns=START,
+        window_end_ns=END,
+        inventory_revision=_inventory(),
+        normal_raw_window=normal,
+    )
+
+    tcp = [
+        sample for sample in window.samples
+        if sample.entity_type == "edge"
+    ]
+    assert {sample.entity_id for sample in tcp} == {formal_edge}
+    assert {sample.channel_id for sample in tcp} == set(TCP_CHANNELS)
+    assert all(sample.mapping_quality == 1 for sample in tcp)
+    retransmit = next(
+        sample for sample in tcp
+        if sample.channel_id == "tcp.retrans_rate"
+    )
+    assert retransmit.value == 1
+
+
 def test_raw_burst_archive_is_write_once_and_integrity_checked(
     tmp_path, monkeypatch,
 ):

@@ -211,13 +211,34 @@ class FinalLiveBurstSource:
         config: FinalLiveBurstConfig,
         *,
         burst_config_fingerprint: str,
+        formal_tcp_edge_entity_ids: Iterable[str] = (),
     ):
         config.validate()
         self.config = config
         self.burst_config_fingerprint = burst_config_fingerprint
+        formal_tcp_edges = tuple(formal_tcp_edge_entity_ids)
+        if len(formal_tcp_edges) != len(set(formal_tcp_edges)):
+            raise RawCollectionError(
+                "formal Burst TCP edge scope contains duplicates"
+            )
+        prefix = f"{config.cluster_id}::"
+        if any(
+            not isinstance(entity_id, str)
+            or not entity_id.startswith(prefix)
+            or not entity_id.endswith("::tcp")
+            or entity_id.count("->") != 1
+            for entity_id in formal_tcp_edges
+        ):
+            raise RawCollectionError(
+                "formal Burst TCP edge identity is invalid"
+            )
+        self._formal_tcp_edge_entity_ids = frozenset(formal_tcp_edges)
         self.event_source_fingerprint = fingerprint({
             "implementation": "final-burst-ring-v1",
             "config": config.public_fingerprint,
+            "formal_tcp_edge_entity_ids": sorted(
+                self._formal_tcp_edge_entity_ids
+            ),
         })
         self._offset: int | None = None
         self._pending_line = ""
@@ -780,6 +801,7 @@ class FinalLiveBurstSource:
         tcp = defaultdict(lambda: defaultdict(list))
         dns = defaultdict(lambda: defaultdict(list))
         known_edges = {"tcp": set(), "dns": set()}
+        observed_tcp_edges = set()
         for sample in normal_raw_window.samples:
             if sample.entity_type != "edge" or sample.protocol not in known_edges:
                 continue
@@ -796,9 +818,25 @@ class FinalLiveBurstSource:
                 f"{sample.src_service}->{sample.dst_service}::"
                 f"{sample.protocol}"
             )
+            if sample.protocol == "tcp":
+                observed_tcp_edges.add(entity)
+                if (
+                    self._formal_tcp_edge_entity_ids
+                    and entity not in self._formal_tcp_edge_entity_ids
+                ):
+                    continue
             known_edges[sample.protocol].add(entity)
             target = tcp if sample.protocol == "tcp" else dns
             target[entity]["namespace"] = [sample.namespace]
+        if self._formal_tcp_edge_entity_ids:
+            missing = (
+                self._formal_tcp_edge_entity_ids - observed_tcp_edges
+            )
+            if missing:
+                raise RawCollectionError(
+                    "formal Burst TCP edge scope is missing from the "
+                    f"normal window: {sorted(missing)}"
+                )
         socket_exposure = defaultdict(int)
         tcp_exposure = defaultdict(int)
         dns_exposure = defaultdict(int)
