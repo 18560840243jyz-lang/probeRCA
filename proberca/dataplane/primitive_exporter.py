@@ -2868,13 +2868,33 @@ class FinalPrimitiveExporter:
         server = ThreadingHTTPServer(
             (self.config.listen_host, self.config.listen_port), Handler
         )
+        def stop_server_after_fatal_pipeline_error() -> None:
+            while not self._stop.wait(0.1):
+                if self._pipeline_failed.is_set():
+                    server.shutdown()
+                    return
+
+        pipeline_watchdog = threading.Thread(
+            target=stop_server_after_fatal_pipeline_error,
+            name="final-primitive-pipeline-watchdog",
+            daemon=True,
+        )
+        pipeline_watchdog.start()
+        fatal_error = None
         try:
             server.serve_forever(poll_interval=0.25)
+            if self._pipeline_failed.is_set():
+                with self._lock:
+                    reason = self._last_error or "unknown pipeline failure"
+                fatal_error = RawCollectionError(
+                    "primitive acquisition pipeline stopped: " + reason
+                )
         finally:
             self._stop.set()
             server.server_close()
             with self._pipeline_condition:
                 self._pipeline_condition.notify_all()
+            pipeline_watchdog.join(timeout=5.0)
             acquisition_worker.join(timeout=5.0)
             assembly_worker.join(timeout=5.0)
             publication_worker.join(timeout=5.0)
@@ -2887,6 +2907,8 @@ class FinalPrimitiveExporter:
                     source_executor.shutdown(
                         wait=True, cancel_futures=True
                     )
+        if fatal_error is not None:
+            raise fatal_error
 
 
 _INVENTORY_WORKER_EXPORTER: FinalPrimitiveExporter | None = None

@@ -457,6 +457,63 @@ def test_http_endpoints_return_to_200_after_rebased_gap(monkeypatch):
     assert not thread.is_alive()
 
 
+def test_fatal_pipeline_failure_exits_http_server_for_service_restart(
+    monkeypatch,
+):
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.config = SimpleNamespace(
+        listen_host="127.0.0.1", listen_port=port
+    )
+    exporter._lock = threading.Lock()
+    exporter._stop = threading.Event()
+    exporter._snapshot = ""
+    exporter._snapshot_ns = 0
+    exporter._last_error = None
+    exporter._inventory_refresh_executor = SimpleNamespace(
+        shutdown=lambda **_kwargs: None
+    )
+    exporter._beyla_executor = SimpleNamespace(
+        shutdown=lambda **_kwargs: None
+    )
+    exporter._raw_source_executor = SimpleNamespace(
+        shutdown=lambda **_kwargs: None
+    )
+    monkeypatch.setattr(exporter, "_warm_source_parsers", lambda: None)
+    monkeypatch.setattr(exporter, "_assembly_loop", lambda: None)
+    monkeypatch.setattr(exporter, "_publication_loop", lambda: None)
+
+    def fail_pipeline():
+        assert exporter._stop.wait(0.2) is False
+        exporter._record_pipeline_failure(
+            "RawCollectionError: inventory refresh missed the next "
+            "snapshot deadline",
+            fatal=True,
+        )
+
+    monkeypatch.setattr(exporter, "_snapshot_loop", fail_pipeline)
+    errors = []
+
+    def serve():
+        try:
+            exporter.serve_forever()
+        except Exception as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RawCollectionError)
+    assert "primitive acquisition pipeline stopped" in str(errors[0])
+    assert "inventory refresh missed" in str(errors[0])
+
+
 def test_snapshot_loop_uses_fixed_one_second_deadlines():
     clock = {"ns": 100_000_000}
     targets = []
