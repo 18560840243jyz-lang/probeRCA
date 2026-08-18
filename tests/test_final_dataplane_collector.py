@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import threading
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -1656,6 +1658,9 @@ def test_prometheus_source_preserves_raw_boundary_series_identity():
     assert PrometheusPrimitiveSource(
         config, session=Session(),
     ).config.range_query_chunk_windows == 120
+    assert PrometheusPrimitiveSource(
+        config, session=Session(),
+    ).config.range_query_max_workers == 4
 
 
 def test_query_range_chunks_bound_request_fanout_and_memory(monkeypatch):
@@ -1665,9 +1670,19 @@ def test_query_range_chunks_bound_request_fanout_and_memory(monkeypatch):
         config = FinalLiveCollectorConfig.from_dict(yaml.safe_load(handle))
     source = PrometheusPrimitiveSource(config.prometheus)
     requests_seen = []
+    concurrency_lock = threading.Lock()
+    concurrency = {"current": 0, "maximum": 0}
 
     def fake_range(query, *, expected_timestamps_ns):
+        with concurrency_lock:
+            concurrency["current"] += 1
+            concurrency["maximum"] = max(
+                concurrency["maximum"], concurrency["current"]
+            )
+        time.sleep(0.005)
         requests_seen.append((query.component, expected_timestamps_ns))
+        with concurrency_lock:
+            concurrency["current"] -= 1
         return (), 0.001, 10
 
     monkeypatch.setattr(source, "_range", fake_range)
@@ -1692,6 +1707,8 @@ def test_query_range_chunks_bound_request_fanout_and_memory(monkeypatch):
     assert len(requests_seen) == 30 * 10 == 300
     assert source.last_range_query_stats["request_count"] == 300
     assert source.last_range_query_stats["max_loaded_windows"] == 120
+    assert config.prometheus.range_query_max_workers == 4
+    assert concurrency["maximum"] == 4
     for component, timestamps in requests_seen:
         expected_count = (
             121

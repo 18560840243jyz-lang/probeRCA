@@ -126,14 +126,13 @@ def test_inventory_refresh_is_single_inflight_and_installed_atomically():
     exporter._inventory_cache = stale
     exporter._inventory_refresh_lock = threading.Lock()
     exporter._inventory_refresh_future = None
-    exporter._inventory = lambda: refreshed
     exporter._inventory_refresh_executor = SimpleNamespace(
         submit=lambda function: submissions.append(function) or future
     )
 
     exporter._start_inventory_refresh()
     exporter._start_inventory_refresh()
-    assert submissions == [exporter._inventory]
+    assert submissions == [primitive_module._inventory_worker]
     with pytest.raises(
         RawCollectionError, match="missed the next snapshot deadline"
     ):
@@ -526,6 +525,38 @@ def test_snapshot_loop_reports_missed_deadline_without_backfill():
     assert targets == [1_000_000_000, 3_000_000_000]
     assert exporter._snapshot_deadline_misses_total == 1
     assert exporter._last_error.startswith("snapshot_deadline_missed:")
+
+
+def test_request_rows_reuses_precomputed_beyla_indexes(monkeypatch):
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    inventory = SimpleNamespace(services=frozenset())
+
+    def unexpected_rebuild(*_args, **_kwargs):
+        raise AssertionError("Beyla indexes were rebuilt")
+
+    monkeypatch.setattr(primitive_module, "_sample_index", unexpected_rebuild)
+    monkeypatch.setattr(
+        primitive_module, "_histogram_index", unexpected_rebuild
+    )
+
+    rows = exporter._request_rows(
+        (), inventory, edge=False,
+        sample_index={}, histogram_index={},
+    )
+
+    assert rows == ()
+
+
+def test_exporter_uses_persistent_source_workers_and_slow_stage_logging():
+    source = Path(
+        "proberca/dataplane/primitive_exporter.py"
+    ).read_text(encoding="utf-8")
+    assert "self._source_executor = ThreadPoolExecutor(" in source
+    assert "executor = self._source_executor" in source
+    assert "self._inventory_refresh_executor = ProcessPoolExecutor(" in source
+    assert 'multiprocessing.get_context("spawn")' in source
+    assert "wait(source_futures)" in source
+    assert 'slow_stages = " stages_ns=" + json.dumps(' in source
 
 
 def test_dns_query_counter_is_completed_responses_plus_timeouts():

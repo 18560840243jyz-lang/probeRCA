@@ -11,12 +11,19 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import multiprocessing
 import re
 import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import (
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+    wait,
+)
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -63,6 +70,13 @@ _BEYLA_REQUEST_METRICS = frozenset({
     "rpc_server_duration_seconds_count",
     "rpc_server_duration_seconds_bucket",
 })
+_BEYLA_REQUEST_BUCKET_METRICS = frozenset({
+    "http_client_request_duration_seconds_bucket",
+    "rpc_client_duration_seconds_bucket",
+    "db_client_operation_duration_seconds_bucket",
+    "http_server_request_duration_seconds_bucket",
+    "rpc_server_duration_seconds_bucket",
+})
 _COREDNS_METRICS = frozenset({
     "coredns_dns_request_duration_seconds_count",
     "coredns_dns_request_duration_seconds_bucket",
@@ -79,6 +93,13 @@ def _select_metric_lines(
         and not line.startswith("#")
         and line.split("{", 1)[0].split(None, 1)[0] in metric_names
     )
+
+
+def _timed_call(function: Any, *args: Any) -> tuple[Any, int]:
+    """Run one independent source read and return its wall time."""
+    started_ns = time.perf_counter_ns()
+    result = function(*args)
+    return result, time.perf_counter_ns() - started_ns
 
 
 def _strict_mapping(
@@ -448,15 +469,24 @@ class FinalPrimitiveExporter:
         self._last_capacity_ns: int | None = None
         self._inventory_cache: Inventory | None = None
         self._inventory_refresh_lock = threading.Lock()
-        self._inventory_refresh_executor = ThreadPoolExecutor(
+        self._inventory_refresh_executor = ProcessPoolExecutor(
             max_workers=1,
-            thread_name_prefix="final-primitive-inventory",
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=_initialize_inventory_worker,
+            initargs=(self.config,),
+        )
+        # Source workers are long-lived so the one-second critical path does
+        # not repeatedly create and tear down an executor and its threads.
+        self._source_executor = ThreadPoolExecutor(
+            max_workers=8,
+            thread_name_prefix="final-primitive-source",
         )
         self._inventory_refresh_future: Future[Inventory] | None = None
         self._cgroup_path_cache: tuple[
             tuple[str, ...], dict[str, Path]
         ] | None = None
         self._snapshot_deadline_misses_total = 0
+        self._last_snapshot_stage_durations_ns: dict[str, int] = {}
         self.dns_policy: DnsAggregationPolicy | None = None
         if self.config.experimental_dns_enabled:
             policy_payload = yaml.safe_load(Path(
@@ -473,6 +503,15 @@ class FinalPrimitiveExporter:
         )
         self.core = client.CoreV1Api()
         self._node_cgroup_root = self._resolve_kind_node_cgroup()
+        try:
+            initial_inventory = self._inventory_refresh_executor.submit(
+                _inventory_worker
+            ).result(timeout=float(self.config.source_timeout_sec))
+        except FutureTimeoutError as error:
+            raise RawCollectionError(
+                "inventory worker did not initialize before its deadline"
+            ) from error
+        self._inventory_cache = initial_inventory
 
     def _resolve_kind_node_cgroup(self) -> Path:
         result = subprocess.run(
@@ -1051,8 +1090,17 @@ class FinalPrimitiveExporter:
         inventory: Inventory,
         *,
         edge: bool,
+        sample_index: dict[
+            str, tuple[PrometheusSample, ...]
+        ] | None = None,
+        histogram_index: dict[
+            tuple[str, tuple[tuple[str, str], ...]],
+            tuple[PrometheusSample, ...],
+        ] | None = None,
     ) -> tuple[_RequestRow, ...]:
-        index = _sample_index(samples)
+        index = sample_index if sample_index is not None else _sample_index(
+            samples
+        )
         definitions = (
             (
                 "http", "http_client_request_duration_seconds_count",
@@ -1080,9 +1128,10 @@ class FinalPrimitiveExporter:
                 "db_client_operation_duration_seconds_bucket",
             ),
         )
-        histogram_index = _histogram_index(
-            index, (item[2] for item in definitions)
-        )
+        if histogram_index is None:
+            histogram_index = _histogram_index(
+                index, (item[2] for item in definitions)
+            )
         candidates: list[_RequestRow] = []
         for protocol, count_name, bucket_name in definitions:
             for count in index.get(count_name, ()):
@@ -2006,51 +2055,102 @@ class FinalPrimitiveExporter:
             if self._inventory_refresh_future is not None:
                 return
             self._inventory_refresh_future = (
-                self._inventory_refresh_executor.submit(self._inventory)
+                self._inventory_refresh_executor.submit(_inventory_worker)
             )
 
     def collect_snapshot(
         self, timestamp_ns: int | None = None,
     ) -> str:
+        collect_started_ns = time.perf_counter_ns()
+        stage_durations_ns: dict[str, int] = {}
         timestamp_ns = timestamp_ns or self.wall_clock_ns()
         if timestamp_ns % 1_000_000_000 != 0:
             raise RawCollectionError(
                 "final primitive snapshot must align to an epoch second"
             )
+        inventory_started_ns = time.perf_counter_ns()
         self._accept_inventory_refresh()
         inventory, cgroup_paths = self._inventory_and_cgroup_paths()
         cgroup_identity = self._cgroup_identity(
             inventory, cgroup_paths
         )
         self._start_inventory_refresh()
-        worker_count = (
-            3 + len(inventory.coredns_pods)
+        stage_durations_ns["inventory"] = (
+            time.perf_counter_ns() - inventory_started_ns
         )
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            coredns_futures = {
-                pod.container_id: executor.submit(self._coredns, pod)
-                for pod in inventory.coredns_pods
-            }
-            beyla_future = executor.submit(self._beyla, inventory)
-            host_future = executor.submit(
-                self._fetch_url, self.config.node_exporter_url
+        source_started_ns = time.perf_counter_ns()
+        executor = self._source_executor
+        coredns_futures = {
+            pod.container_id: executor.submit(
+                _timed_call, self._coredns, pod
             )
-            bpf_future = executor.submit(
-                self._bpf_snapshot, cgroup_identity
-            )
-            coredns = {
-                container_id: future.result()
-                for container_id, future in coredns_futures.items()
-            }
-            bpf = bpf_future.result()
-            beyla = beyla_future.result()
-            host = host_future.result()
+            for pod in inventory.coredns_pods
+        }
+        beyla_future = executor.submit(
+            _timed_call, self._beyla, inventory
+        )
+        host_future = executor.submit(
+            _timed_call, self._fetch_url,
+            self.config.node_exporter_url,
+        )
+        bpf_future = executor.submit(
+            _timed_call, self._bpf_snapshot, cgroup_identity
+        )
+        source_futures = (
+            *coredns_futures.values(),
+            beyla_future,
+            host_future,
+            bpf_future,
+        )
+        # A failed source read must not leave an old task running into the
+        # next one-second snapshot on the persistent worker pool.
+        wait(source_futures)
+        coredns_results = {
+            container_id: future.result()
+            for container_id, future in coredns_futures.items()
+        }
+        bpf, stage_durations_ns["bpf"] = bpf_future.result()
+        beyla, stage_durations_ns["beyla"] = beyla_future.result()
+        host, stage_durations_ns["node_exporter"] = host_future.result()
+        coredns = {
+            container_id: result[0]
+            for container_id, result in coredns_results.items()
+        }
+        stage_durations_ns["coredns_max"] = max(
+            (result[1] for result in coredns_results.values()),
+            default=0,
+        )
+        stage_durations_ns["sources_wall"] = (
+            time.perf_counter_ns() - source_started_ns
+        )
+
+        request_index_started_ns = time.perf_counter_ns()
+        request_index = _sample_index(beyla)
+        request_histogram_index = _histogram_index(
+            request_index, _BEYLA_REQUEST_BUCKET_METRICS
+        )
+        stage_durations_ns["request_index"] = (
+            time.perf_counter_ns() - request_index_started_ns
+        )
+        service_rows_started_ns = time.perf_counter_ns()
         service_rows = self._request_rows(
-            beyla, inventory, edge=False
+            beyla, inventory, edge=False,
+            sample_index=request_index,
+            histogram_index=request_histogram_index,
         )
+        stage_durations_ns["service_rows"] = (
+            time.perf_counter_ns() - service_rows_started_ns
+        )
+        edge_rows_started_ns = time.perf_counter_ns()
         edge_rows = self._request_rows(
-            beyla, inventory, edge=True
+            beyla, inventory, edge=True,
+            sample_index=request_index,
+            histogram_index=request_histogram_index,
         )
+        stage_durations_ns["edge_rows"] = (
+            time.perf_counter_ns() - edge_rows_started_ns
+        )
+        service_processing_started_ns = time.perf_counter_ns()
         service_samples = list(self._render_request_rows(
             service_rows, edge=False
         ))
@@ -2063,12 +2163,19 @@ class FinalPrimitiveExporter:
             ),
             edge=False,
         ))
+        stage_durations_ns["service_processing"] = (
+            time.perf_counter_ns() - service_processing_started_ns
+        )
+        edge_processing_started_ns = time.perf_counter_ns()
         edge_samples = self._stable_request_samples(
             self._persistent_edge_samples(
                 self._render_request_rows(edge_rows, edge=True)
             ),
             edge=True,
             diagnostic_mapping=self._stable_edge_source_series,
+        )
+        stage_durations_ns["edge_processing"] = (
+            time.perf_counter_ns() - edge_processing_started_ns
         )
         covered_services = {
             (item.label_dict["namespace"],
@@ -2092,14 +2199,24 @@ class FinalPrimitiveExporter:
             if self.config.experimental_dns_enabled
             else ()
         )
+        resources_started_ns = time.perf_counter_ns()
+        resource_samples = self._resource_samples(
+            inventory, cgroup_paths, bpf, timestamp_ns
+        )
+        stage_durations_ns["resources"] = (
+            time.perf_counter_ns() - resources_started_ns
+        )
+        host_started_ns = time.perf_counter_ns()
+        host_samples = self._host_samples(inventory, host)
+        stage_durations_ns["host_processing"] = (
+            time.perf_counter_ns() - host_started_ns
+        )
         samples = [
             *service_samples,
             *edge_samples,
             *dns_samples,
-            *self._resource_samples(
-                inventory, cgroup_paths, bpf, timestamp_ns
-            ),
-            *self._host_samples(inventory, host),
+            *resource_samples,
+            *host_samples,
             PrometheusSample.create(
                 "proberca_final_primitive_exporter_ready",
                 {"cluster_id": self.config.cluster_id}, 1.0,
@@ -2114,9 +2231,18 @@ class FinalPrimitiveExporter:
             item.name == "proberca_dns_edge_query_total" for item in samples
         ):
             raise RawCollectionError("BPF returned no directed DNS edges")
-        return render_prometheus_text(
+        render_started_ns = time.perf_counter_ns()
+        rendered = render_prometheus_text(
             samples, timestamp_ms=timestamp_ns // 1_000_000
         )
+        stage_durations_ns["render"] = (
+            time.perf_counter_ns() - render_started_ns
+        )
+        stage_durations_ns["collect_total"] = (
+            time.perf_counter_ns() - collect_started_ns
+        )
+        self._last_snapshot_stage_durations_ns = stage_durations_ns
+        return rendered
 
     def _warm_source_parsers(self) -> None:
         """Populate exact-label parse caches before publishing snapshots."""
@@ -2173,9 +2299,18 @@ class FinalPrimitiveExporter:
                 )
             else:
                 duration_ns = time.perf_counter_ns() - started_ns
+                slow_stages = ""
+                if duration_ns >= 800_000_000:
+                    stages = getattr(
+                        self, "_last_snapshot_stage_durations_ns", {}
+                    )
+                    slow_stages = " stages_ns=" + json.dumps(
+                        stages, sort_keys=True, separators=(",", ":")
+                    )
                 print(
                     "final primitive snapshot completed: "
-                    f"target_ns={target} duration_ns={duration_ns}",
+                    f"target_ns={target} duration_ns={duration_ns}"
+                    f"{slow_stages}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -2266,6 +2401,36 @@ class FinalPrimitiveExporter:
             self._inventory_refresh_executor.shutdown(
                 wait=True, cancel_futures=True
             )
+            source_executor = getattr(self, "_source_executor", None)
+            if source_executor is not None:
+                source_executor.shutdown(
+                    wait=True, cancel_futures=True
+                )
+
+
+_INVENTORY_WORKER_EXPORTER: FinalPrimitiveExporter | None = None
+
+
+def _initialize_inventory_worker(
+    config: FinalPrimitiveExporterConfig,
+) -> None:
+    """Initialize the isolated Kubernetes inventory process once."""
+    global _INVENTORY_WORKER_EXPORTER
+    kubernetes_config.load_kube_config(
+        config_file=config.kubeconfig_path,
+        context=config.kubernetes_context,
+    )
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.config = config
+    exporter.core = client.CoreV1Api()
+    _INVENTORY_WORKER_EXPORTER = exporter
+
+
+def _inventory_worker() -> Inventory:
+    """Refresh runtime identity without contending on the snapshot GIL."""
+    if _INVENTORY_WORKER_EXPORTER is None:
+        raise RawCollectionError("inventory worker is not initialized")
+    return _INVENTORY_WORKER_EXPORTER._inventory()
 
 
 def load_final_primitive_exporter_config(

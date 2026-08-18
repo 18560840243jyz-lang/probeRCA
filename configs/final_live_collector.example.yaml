@@ -34,6 +34,7 @@ prometheus:
   timeout_sec: 10.0
   maximum_sample_age_sec: 2.0
   range_query_chunk_windows: 120
+  range_query_max_workers: 4
   reject_warnings: true
   queries:
     # Service request symptoms. The exporter must expose raw counters and

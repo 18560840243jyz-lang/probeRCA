@@ -149,11 +149,15 @@ class PrometheusSourceConfig:
     reject_warnings: bool
     queries: tuple[PrometheusPrimitiveQuery, ...]
     range_query_chunk_windows: int = 120
+    range_query_max_workers: int = 4
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PrometheusSourceConfig":
+        normalized = dict(payload)
+        normalized.setdefault("range_query_max_workers", 4)
         values = _strict_mapping(
-            payload, set(cls.__dataclass_fields__), "Prometheus source config"
+            normalized, set(cls.__dataclass_fields__),
+            "Prometheus source config",
         )
         if not isinstance(values["queries"], list):
             raise RawCollectionError("Prometheus queries must be a list")
@@ -198,6 +202,12 @@ class PrometheusSourceConfig:
             raise RawCollectionError(
                 "range_query_chunk_windows must be a positive integer"
             )
+        if isinstance(self.range_query_max_workers, bool) \
+                or not isinstance(self.range_query_max_workers, int) \
+                or not 1 <= self.range_query_max_workers <= 30:
+            raise RawCollectionError(
+                "range_query_max_workers must be in [1, 30]"
+            )
         if not self.queries:
             raise RawCollectionError("Prometheus source requires queries")
         query_ids = [item.query_id for item in self.queries]
@@ -218,6 +228,7 @@ class PrometheusSourceConfig:
             "maximum_sample_age_sec": self.maximum_sample_age_sec,
             "reject_warnings": self.reject_warnings,
             "range_query_chunk_windows": self.range_query_chunk_windows,
+            "range_query_max_workers": self.range_query_max_workers,
             "queries": [item.to_dict() for item in self.queries],
         })
 
@@ -733,7 +744,10 @@ class PrometheusPrimitiveSource:
                 requests_to_run.append((query, expected))
             chunk_started = time.perf_counter()
             with ThreadPoolExecutor(
-                max_workers=min(30, len(requests_to_run))
+                max_workers=min(
+                    self.config.range_query_max_workers,
+                    len(requests_to_run),
+                )
             ) as executor:
                 responses = tuple(executor.map(
                     lambda item: self._range(
