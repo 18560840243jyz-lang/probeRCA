@@ -59,6 +59,7 @@ _HEALTH_ROUTES = frozenset({
     "/grpc.health.v1.Health/Check",
 })
 _TIMEOUT_TEXT = re.compile(r"(?i)(timeout|timed.?out|deadline)")
+_RPC_METHOD_ROUTE = re.compile(r"^/[^/\s]+/[^/\s]+$")
 _BEYLA_REQUEST_METRICS = frozenset({
     "http_client_request_duration_seconds_count",
     "http_client_request_duration_seconds_bucket",
@@ -467,7 +468,15 @@ def _business_route(protocol: str, labels: dict[str, str]) -> bool:
     if protocol == "http":
         return labels.get("http_route", "") not in _HEALTH_ROUTES
     if protocol == "rpc":
-        return labels.get("rpc_method", "") not in _HEALTH_ROUTES
+        method = labels.get("rpc_method", "")
+        if method in _HEALTH_ROUTES:
+            return False
+        # Beyla can expose a generic wildcard when the runtime cannot recover
+        # the gRPC method. It can also briefly expose trace-context values as
+        # rpc_method; those are not request identities and would create one
+        # cumulative series per request. Keep only a wildcard fallback or a
+        # canonical gRPC full method name.
+        return method == "*" or bool(_RPC_METHOD_ROUTE.fullmatch(method))
     if protocol == "redis":
         return labels.get("db_operation_name", "").upper() not in {
             "INFO", "PING",
@@ -1377,11 +1386,9 @@ class FinalPrimitiveExporter:
             ).append(row)
         selected = list(non_rpc)
         for rows in rpc_by_instance.values():
-            wildcard = [
-                row for row in rows
-                if row.count.label_dict.get("rpc_method") == "*"
-            ]
-            selected.extend(wildcard if wildcard else rows)
+            # Concrete methods and wildcard values are disjoint attribution
+            # buckets, so stable service aggregation must retain both.
+            selected.extend(rows)
         return tuple(selected)
 
     @staticmethod

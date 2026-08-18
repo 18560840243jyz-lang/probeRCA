@@ -556,6 +556,71 @@ def test_request_rows_reuses_precomputed_beyla_indexes(monkeypatch):
     assert rows == ()
 
 
+def test_service_rpc_rows_merge_concrete_and_wildcard_business_buckets():
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    inventory = SimpleNamespace(services=frozenset({
+        ("online-boutique", "cartservice"),
+        ("online-boutique", "recommendationservice"),
+    }))
+
+    def family(service, pod, method, count):
+        labels = {
+            "k8s_namespace_name": "online-boutique",
+            "service_name": service,
+            "k8s_pod_name": pod,
+            "k8s_container_name": "server",
+            "rpc_method": method,
+            "rpc_grpc_status_code": "0",
+        }
+        samples = [PrometheusSample.create(
+            "rpc_server_duration_seconds_count", labels, count,
+        )]
+        samples.extend(
+            PrometheusSample.create(
+                "rpc_server_duration_seconds_bucket",
+                {**labels, "le": bound}, count,
+            )
+            for bound in ("0.01", "+Inf")
+        )
+        return samples
+
+    samples = tuple([
+        *family("cartservice", "cart-pod", "*", 2),
+        *family(
+            "cartservice", "cart-pod",
+            "/hipstershop.CartService/AddItem", 20,
+        ),
+        *family(
+            "cartservice", "cart-pod",
+            "/hipstershop.CartService/GetCart", 30,
+        ),
+        *family(
+            "cartservice", "cart-pod",
+            "/grpc.health.v1.Health/Check", 100,
+        ),
+        *family(
+            "cartservice", "cart-pod",
+            "00-0123456789abcdef-0123456789abcdef-01", 1,
+        ),
+        *family("recommendationservice", "recommendation-pod", "*", 12),
+    ])
+    rows = exporter._request_rows(samples, inventory, edge=False)
+
+    assert {
+        (
+            row.service,
+            row.count.label_dict["rpc_method"],
+            row.count.value,
+        )
+        for row in rows
+    } == {
+        ("cartservice", "*", 2),
+        ("cartservice", "/hipstershop.CartService/AddItem", 20),
+        ("cartservice", "/hipstershop.CartService/GetCart", 30),
+        ("recommendationservice", "*", 12),
+    }
+
+
 def test_exporter_uses_persistent_source_workers_and_slow_stage_logging():
     source = Path(
         "proberca/dataplane/primitive_exporter.py"
