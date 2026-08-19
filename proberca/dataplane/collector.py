@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from dataclasses import asdict, dataclass
 from itertools import combinations
-from typing import Any, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 from proberca.config import KubernetesConfig
 from proberca.data.schema import (
@@ -693,7 +693,11 @@ class FinalLiveCollectionRunner:
                 )
         return window
 
-    def iter_collect_aligned(self, window_count: int):
+    def iter_collect_aligned(
+        self,
+        window_count: int,
+        capture_complete_callback: Callable[[int], None] | None = None,
+    ):
         """Yield fully validated Normal/Burst pairs one sequence at a time."""
 
         if isinstance(window_count, bool) or not isinstance(window_count, int) \
@@ -748,6 +752,8 @@ class FinalLiveCollectionRunner:
                 )
             )
         self._wait_for_primitive_target(bounds[-1][1])
+        if capture_complete_callback is not None:
+            capture_complete_callback(bounds[-1][1])
         after = self.discovery.discover_once(
             self.wall_clock_ns()
         ).freeze(self.wall_clock_ns())

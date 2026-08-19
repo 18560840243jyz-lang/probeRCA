@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -44,7 +45,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--burst-config", type=Path, required=True)
     parser.add_argument("--burst-output", type=Path, required=True)
     parser.add_argument("--windows", type=int, required=True)
+    parser.add_argument(
+        "--capture-complete-marker", type=Path,
+        help="atomically record completion of exact boundary capture",
+    )
+
     return parser
+
+
+def _write_capture_complete_marker(
+    marker: Path, final_target_ns: int,
+) -> None:
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker.with_name(
+        f".{marker.name}.{os.getpid()}.tmp"
+    )
+    temporary.write_text(canonical_json({
+        "final_target_ns": final_target_ns,
+        "phase": "capture_complete",
+        "timestamp_ns": time.time_ns(),
+    }) + "\n", encoding="utf-8")
+    os.replace(temporary, marker)
 
 
 def _write_aligned_windows(
@@ -53,12 +74,20 @@ def _write_aligned_windows(
     normal_writer: CollectionArchiveWriter,
     burst_writer: BurstArchiveWriter,
     window_count: int,
+    capture_complete_marker: Path | None = None,
 ) -> None:
     try:
         if normal_writer.dataset_id != burst_writer.dataset_id:
             raise ValueError("Normal and Burst Dataset IDs differ")
+        iterator_kwargs = {}
+        if capture_complete_marker is not None:
+            iterator_kwargs["capture_complete_callback"] = (
+                lambda final_target_ns: _write_capture_complete_marker(
+                    capture_complete_marker, final_target_ns,
+                )
+            )
         for normal_window, burst_window in runner.iter_collect_aligned(
-            window_count
+            window_count, **iterator_kwargs,
         ):
             normal_writer.append(normal_window)
             burst_writer.append(burst_window)
@@ -152,6 +181,7 @@ def main(argv=None) -> int:
         normal_writer=writer,
         burst_writer=burst_writer,
         window_count=args.windows,
+        capture_complete_marker=args.capture_complete_marker,
     )
     archive = writer.seal()
     burst_archive = burst_writer.seal()

@@ -57,6 +57,7 @@ STATE_SERVICES = (
 )
 WINDOW_WALL_BUDGET_SEC = 10
 DATA_PLANE_READY_TIMEOUT_SEC = 90
+FAULT_ACTOR_FAILSAFE_GRACE_SEC = 30
 HOST_MEMORY_PILOT_BYTES = 4 * 1024 * 1024 * 1024
 
 
@@ -475,6 +476,7 @@ def collect_phase(
     experiment_root: Path,
     phase: str,
     windows: int,
+    on_capture_complete: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     phase_root = experiment_root / f"phase-{phase}"
     phase_root.mkdir(parents=True, exist_ok=False)
@@ -490,14 +492,49 @@ def collect_phase(
             "--burst-output", str(burst_root),
             "--windows", str(windows),
         ]
+        marker_path = (
+            phase_root / f"capture-complete-attempt-{attempt}.json"
+        )
+        if on_capture_complete is not None:
+            command.extend([
+                "--capture-complete-marker", str(marker_path),
+            ])
+
         log_path = phase_root / f"collection-attempt-{attempt}.log"
         log_event(
             root, "phase_collection_started",
             attempt=attempt, phase=phase,
             experiment=experiment_root.name,
         )
+        capture_payload: dict[str, Any] | None = None
+        timed_out = False
+
+        def consume_capture_marker() -> None:
+            nonlocal capture_payload
+            if capture_payload is not None or not marker_path.is_file():
+                return
+            payload = json.loads(marker_path.read_text(encoding="utf-8"))
+            if (
+                payload.get("phase") != "capture_complete"
+                or not isinstance(payload.get("final_target_ns"), int)
+                or payload["final_target_ns"] <= 0
+            ):
+                raise ExperimentError("invalid capture-complete marker")
+            if on_capture_complete is not None:
+                on_capture_complete(payload)
+            capture_payload = payload
+            log_event(
+                root, "phase_capture_completed",
+                attempt=attempt, phase=phase,
+                experiment=experiment_root.name,
+                final_target_ns=payload["final_target_ns"],
+            )
+
+        deadline = time.monotonic() + (
+            windows * WINDOW_WALL_BUDGET_SEC + 180
+        )
         with log_path.open("w", encoding="utf-8") as log:
-            process = subprocess.run(
+            process = subprocess.Popen(
                 command,
                 cwd=REPOSITORY,
                 env={
@@ -509,11 +546,36 @@ def collect_phase(
                 text=True,
                 stdout=log,
                 stderr=subprocess.STDOUT,
-                timeout=(
-                    windows * WINDOW_WALL_BUDGET_SEC + 180
-                ),
             )
+            try:
+                while process.poll() is None:
+                    consume_capture_marker()
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=3)
+                        break
+                    time.sleep(0.1)
+                consume_capture_marker()
+            except Exception:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=3)
+                raise
         if process.returncode == 0:
+            if on_capture_complete is not None \
+                    and capture_payload is None:
+                raise ExperimentError(
+                    "collector sealed without capture-complete marker"
+                )
             result = validate_archives(
                 normal_root, burst_root, windows
             )
@@ -523,6 +585,8 @@ def collect_phase(
                 "normal_archive": str(normal_root),
                 "burst_archive": str(burst_root),
             })
+            if capture_payload is not None:
+                result["capture_complete"] = capture_payload
             atomic_json(phase_root / "phase-manifest.json", result)
             log_event(
                 root, "phase_collection_completed",
@@ -535,7 +599,13 @@ def collect_phase(
             attempt=attempt, phase=phase,
             experiment=experiment_root.name,
             returncode=process.returncode,
+            timed_out=timed_out,
         )
+        if capture_payload is not None:
+            raise ExperimentError(
+                f"{experiment_root.name}/{phase} failed after capture "
+                "completion; retry is forbidden"
+            )
         for archive_root in (normal_root, burst_root):
             if archive_root.exists():
                 resolved = archive_root.resolve()
@@ -556,6 +626,7 @@ class FaultContext:
         self.logs: list[Any] = []
         self.cleanups: list[Callable[[], None]] = []
         self.metadata: dict[str, Any] = {}
+        self._cleaned = False
 
     def add_cleanup(self, callback: Callable[[], None]) -> None:
         self.cleanups.append(callback)
@@ -626,6 +697,9 @@ class FaultContext:
             raise ExperimentError("CPU actor exited early")
 
     def cleanup(self) -> None:
+        if self._cleaned:
+            return
+        self._cleaned = True
         errors = []
         for callback in reversed(self.cleanups):
             try:
@@ -662,9 +736,7 @@ def actor_fault(
             mode,
             service=service,
             network_namespace=network_namespace,
-            duration=(
-                windows * WINDOW_WALL_BUDGET_SEC + 300
-            ),
+            duration=windows + FAULT_ACTOR_FAILSAFE_GRACE_SEC,
             arguments=arguments,
             name=name,
         )
@@ -684,7 +756,7 @@ def service_memory(context: FaultContext, windows: int) -> None:
     context.start_actor(
         "memory",
         service=target_service,
-        duration=windows * WINDOW_WALL_BUDGET_SEC + 300,
+        duration=windows + FAULT_ACTOR_FAILSAFE_GRACE_SEC,
         arguments=["--bytes", str(byte_count)],
     )
 
@@ -1115,6 +1187,7 @@ def main() -> int:
         atomic_json(root / "dataset-manifest.json", manifest)
         log_event(root, "experiment_started", fault_type=fault_type)
         context = FaultContext(root, experiment_root)
+        fault_deactivated = False
         try:
             if spec.get("probe"):
                 start_probe(
@@ -1133,11 +1206,27 @@ def main() -> int:
             spec["activate"](context, arguments.abnormal_windows)
             record["injector"] = context.metadata
             log_event(root, "fault_activated", fault_type=fault_type)
+            def deactivate_after_capture(
+                payload: dict[str, Any],
+            ) -> None:
+                nonlocal fault_deactivated
+                record_injector_stats(context, fault_type)
+                record["fault_capture_complete"] = payload
+                fault_deactivated = True
+                context.cleanup()
+                record["fault_deactivated_at_ns"] = time.time_ns()
+                log_event(
+                    root, "fault_deactivated",
+                    fault_type=fault_type,
+                    reason="capture_complete",
+                    final_target_ns=payload["final_target_ns"],
+                )
+
             record["abnormal"] = collect_phase(
                 root, experiment_root, "abnormal",
                 arguments.abnormal_windows,
+                on_capture_complete=deactivate_after_capture,
             )
-            record_injector_stats(context, fault_type)
             record["status"] = "collected"
         except Exception as error:
             record["status"] = "failed"
@@ -1165,7 +1254,11 @@ def main() -> int:
                 cleanup_errors.append(
                     f"{type(error).__name__}: {error}"
                 )
-            log_event(root, "fault_deactivated", fault_type=fault_type)
+            if not fault_deactivated:
+                log_event(
+                    root, "fault_deactivated", fault_type=fault_type,
+                    reason="final_cleanup",
+                )
             time.sleep(10)
             try:
                 wait_data_plane(root)

@@ -2906,3 +2906,158 @@ def test_legacy_dns_archive_is_readable_but_dns_is_excluded(tmp_path):
         for node_id, item in control.resolver.last_validity.items()
         if "::dns::" in node_id
     } == {"excluded_from_formal_rca"}
+
+
+def test_fault_context_cleanup_is_idempotent(tmp_path):
+    import scripts.run_final_fault_matrix as runner
+
+    calls = []
+    context = runner.FaultContext(tmp_path, tmp_path)
+    context.add_cleanup(lambda: calls.append("cleanup"))
+
+    context.cleanup()
+    context.cleanup()
+
+    assert calls == ["cleanup"]
+
+
+def test_fault_actor_failsafe_tracks_capture_windows_not_wall_budget():
+    import scripts.run_final_fault_matrix as runner
+
+    observed = []
+
+    class Context:
+        metadata = {}
+
+        @staticmethod
+        def start_actor(*args, **kwargs):
+            observed.append((args, kwargs))
+
+    runner.actor_fault(
+        "memory", service=None,
+    )(Context(), 60)
+    runner.service_memory(Context(), 60)
+
+    assert [item[1]["duration"] for item in observed] == [90, 90]
+    assert all(
+        item[1]["duration"]
+        == 60 + runner.FAULT_ACTOR_FAILSAFE_GRACE_SEC
+        for item in observed
+    )
+
+
+def test_fault_phase_callback_runs_before_archive_validation(
+    tmp_path, monkeypatch,
+):
+    import scripts.run_final_fault_matrix as runner
+
+    experiment_root = tmp_path / "experiment"
+    experiment_root.mkdir()
+    events = []
+
+    class Process:
+        def __init__(self, command, **_kwargs):
+            self.returncode = None
+            self.poll_count = 0
+            marker = Path(
+                command[command.index("--capture-complete-marker") + 1]
+            )
+            marker.write_text(json.dumps({
+                "phase": "capture_complete",
+                "final_target_ns": 123_000_000_000,
+                "timestamp_ns": 124_000_000_000,
+            }), encoding="utf-8")
+
+        def poll(self):
+            self.poll_count += 1
+            if self.poll_count == 1:
+                return None
+            self.returncode = 0
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def wait(self, timeout=None):
+            del timeout
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    def validate(*_args):
+        assert events == ["callback"]
+        return {"dataset_id": "dataset"}
+
+    monkeypatch.setattr(runner.subprocess, "Popen", Process)
+    monkeypatch.setattr(runner, "validate_archives", validate)
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+
+    result = runner.collect_phase(
+        tmp_path, experiment_root, "abnormal", 5,
+        on_capture_complete=lambda _payload: events.append("callback"),
+    )
+
+    assert events == ["callback"]
+    assert result["capture_complete"]["final_target_ns"] == 123_000_000_000
+
+
+def test_fault_phase_does_not_retry_after_capture_completion(
+    tmp_path, monkeypatch,
+):
+    import scripts.run_final_fault_matrix as runner
+
+    experiment_root = tmp_path / "experiment"
+    experiment_root.mkdir()
+    processes = []
+    callbacks = []
+
+    class Process:
+        def __init__(self, command, **_kwargs):
+            processes.append(self)
+            self.returncode = None
+            self.poll_count = 0
+            marker = Path(
+                command[command.index("--capture-complete-marker") + 1]
+            )
+            marker.write_text(json.dumps({
+                "phase": "capture_complete",
+                "final_target_ns": 123_000_000_000,
+                "timestamp_ns": 124_000_000_000,
+            }), encoding="utf-8")
+
+        def poll(self):
+            self.poll_count += 1
+            if self.poll_count == 1:
+                return None
+            self.returncode = 7
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def wait(self, timeout=None):
+            del timeout
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(runner.subprocess, "Popen", Process)
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        runner, "wait_data_plane",
+        lambda *_args, **_kwargs: pytest.fail("post-capture retry"),
+    )
+
+    with pytest.raises(
+        runner.ExperimentError, match="retry is forbidden",
+    ):
+        runner.collect_phase(
+            tmp_path, experiment_root, "abnormal", 5,
+            on_capture_complete=lambda payload: callbacks.append(payload),
+        )
+
+    assert len(processes) == 1
+    assert len(callbacks) == 1
+    assert callbacks[0]["final_target_ns"] == 123_000_000_000

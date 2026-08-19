@@ -31,6 +31,7 @@ from proberca.dataplane.burst_live import (
 )
 from proberca.dataplane.collector import FinalDataPlaneCollector
 from proberca.dataplane.collector import FinalLiveCollectorConfig
+from proberca.dataplane.collector import FinalLiveCollectionRunner
 from proberca.dataplane.contracts import canonical_json, fingerprint
 from proberca.data.schema import (
     METRIC_INVALID_REASONS,
@@ -1923,3 +1924,130 @@ def test_dataplane_does_not_import_control_or_algorithm_modules():
             name.startswith(prefix)
             for name in imports for prefix in forbidden
         ), (path, imports)
+
+
+def test_live_runner_reports_capture_complete_before_history_query():
+    events = []
+    samples = []
+    _gauge(
+        samples, "memory_working_set_bytes", 1.0, series="series",
+        namespace=NAMESPACE, service_name="checkoutservice",
+        pod_uid="pod", container_id="container", node_name="node",
+    )
+    samples = tuple(samples)
+
+
+
+    class Revision:
+        def freeze(self, _timestamp_ns):
+            return self
+
+    class Discovery:
+        calls = 0
+
+        def discover_once(self, _timestamp_ns):
+            self.calls += 1
+            events.append(f"discover-{self.calls}")
+            return Revision()
+
+    class Primitive:
+        @staticmethod
+        def wait_for_target_timestamp(**_kwargs):
+            events.append("primitive-target-ready")
+
+        @staticmethod
+        def iter_collect_window_chunks(**_kwargs):
+            events.append("history-query")
+            return ((samples,),)
+
+    class Burst:
+        @staticmethod
+        def begin_capture(_revision):
+            events.append("burst-begin")
+
+        @staticmethod
+        def capture_boundary(_timestamp_ns, _revision):
+            events.append("burst-boundary")
+
+        @staticmethod
+        def collect_window(
+            *, sequence, window_start_ns, window_end_ns, **_kwargs,
+        ):
+            return SimpleNamespace(
+                sequence=sequence,
+                window_start_ns=window_start_ns,
+                window_end_ns=window_end_ns,
+                cluster_id=CLUSTER,
+                samples=(),
+            )
+
+    class Assembler:
+        @staticmethod
+        def assemble(*, raw_window, **_kwargs):
+            return SimpleNamespace(
+                sequence=raw_window.sequence,
+                window_start_ns=raw_window.window_start_ns,
+                window_end_ns=raw_window.window_end_ns,
+                cluster_id=raw_window.cluster_id,
+                residual_source_record_ids=(),
+            )
+
+    runner = FinalLiveCollectionRunner.__new__(
+        FinalLiveCollectionRunner
+    )
+    runner.config = SimpleNamespace(
+        cluster_id=CLUSTER, window_lead_sec=0,
+        window_sec=1, collection_delay_sec=0,
+    )
+    runner.discovery = Discovery()
+    runner.primitive_source = Primitive()
+    runner.raw_burst_source = Burst()
+    runner.assembler = Assembler()
+    runner.wall_clock_ns = lambda: START
+    runner.sleep = lambda _seconds: None
+
+    pairs = list(runner.iter_collect_aligned(
+        1,
+        capture_complete_callback=lambda target: events.append(
+            f"capture-complete-{target}"
+        ),
+    ))
+
+    assert len(pairs) == 1
+    capture_index = events.index(f"capture-complete-{END}")
+    assert events[capture_index - 1] == "primitive-target-ready"
+    assert events[capture_index + 1] == "discover-2"
+    assert capture_index < events.index("history-query")
+
+
+def test_aligned_writer_atomically_records_capture_completion(
+    contract, tmp_path,
+):
+    pair = _aligned_test_pair(contract, 1)
+    normal_writer, burst_writer = _aligned_test_writers(
+        contract, tmp_path, pair[0].collection_metadata,
+    )
+    marker = tmp_path / "lifecycle" / "capture-complete.json"
+
+    class Runner:
+        @staticmethod
+        def iter_collect_aligned(
+            _window_count, capture_complete_callback=None,
+        ):
+            assert capture_complete_callback is not None
+            capture_complete_callback(END)
+            yield pair
+
+    _write_aligned_windows(
+        runner=Runner(),
+        normal_writer=normal_writer,
+        burst_writer=burst_writer,
+        window_count=1,
+        capture_complete_marker=marker,
+    )
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["phase"] == "capture_complete"
+    assert payload["final_target_ns"] == END
+    assert isinstance(payload["timestamp_ns"], int)
+    assert not tuple(marker.parent.glob(f".{marker.name}.*.tmp"))
