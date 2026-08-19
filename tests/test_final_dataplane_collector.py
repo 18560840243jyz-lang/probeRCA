@@ -11,8 +11,10 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+import proberca.dataplane.burst_collection as burst_collection_module
 from proberca.dataplane.archive import CollectionArchive, CollectionArchiveWriter
 from proberca.dataplane.burst_archive import (
+    BurstArchive,
     BurstArchiveWriter,
     RawBurstWindow,
 )
@@ -28,6 +30,12 @@ from proberca.dataplane.burst_live import (
     RARE_CHANNELS,
     SERVICE_CHANNELS,
     TCP_CHANNELS,
+)
+from proberca.dataplane.burst_replay import (
+    BurstCalibrationArtifact,
+    BurstCalibrationPolicy,
+    BurstJoinedCollectionArchive,
+    calibrate_healthy_burst,
 )
 from proberca.dataplane.collector import FinalDataPlaneCollector
 from proberca.dataplane.collector import FinalLiveCollectorConfig
@@ -250,10 +258,12 @@ def _edge_samples(
         "protocol": protocol,
     }
     if protocol == "tcp":
+        latency_delta = 50 if count_delta is None else count_delta
         components = (
             ("edge_request_total", 50 if count_delta is None else count_delta),
             ("edge_error_total", 2 if error_delta is None else error_delta),
             ("edge_timeout_total", 1 if timeout_delta is None else timeout_delta),
+            ("edge_latency_observation_total", latency_delta),
         )
         histogram = "edge_latency_histogram"
     else:
@@ -420,6 +430,45 @@ def test_real_shape_9_4_3_3_and_exact_math(contract):
     assert hosts["node-a"]["nic_drop_error_rate"] == 10.0
     assert edges["tcp"]["edge_failure_rate"] == pytest.approx(3 / 50)
     assert edges["dns"]["dns_failure_rate"] == pytest.approx(2 / 21)
+
+
+def test_tcp_preconnect_failures_extend_count_and_failure_not_latency(contract):
+    raw = _raw_window(include_dns=False)
+    samples = list(raw.samples)
+    identity = {
+        "namespace": NAMESPACE,
+        "src_service": "frontend",
+        "dst_service": "payment",
+        "dst_namespace": NAMESPACE,
+        "src_pod_uid": "pod-frontend",
+        "dst_pod_uid": "pod-payment",
+        "src_node": "node-a",
+        "dst_node": "node-b",
+        "protocol": "tcp",
+    }
+    for component, delta in (
+        ("edge_request_total", 3),
+        ("edge_error_total", 3),
+        ("edge_timeout_total", 0),
+    ):
+        _counter(
+            samples, component, 0, delta,
+            entity="edge", series="tcp-preconnect", **identity,
+        )
+    result = FinalWindowAggregator(contract).aggregate(
+        RawCollectionWindow.create(
+            sequence=1,
+            window_start_ns=START,
+            window_end_ns=END,
+            cluster_id=CLUSTER,
+            samples=samples,
+        )
+    )
+    metrics = {item.metric_name: item for item in result.edge_metrics}
+    assert metrics["edge_request_count"].value == 53
+    assert metrics["edge_failure_rate"].value == pytest.approx(6 / 53)
+    assert metrics["edge_latency_p95"].value == 10
+    assert metrics["edge_latency_p95"].sample_count == 50
 
 
 def test_ratio_is_recomputed_after_cross_pod_sum(contract):
@@ -1569,6 +1618,299 @@ def test_burst_is_normalized_from_independent_sources(contract):
         )
 
 
+def test_continuous_burst_reference_is_fitted_once_per_collector(
+    contract, monkeypatch,
+):
+    calls = []
+    original = burst_collection_module.fit_continuous_burst_reference
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        burst_collection_module,
+        "fit_continuous_burst_reference",
+        counted,
+    )
+    builder = BurstEvidenceCollector(
+        collection_contract=contract,
+        collector_build_id=fingerprint({"build": "cached-reference"}),
+        calibrations=_calibrations(contract),
+    )
+    fitted_count = len(calls)
+    formal_channels = {
+        role["channel_id"] for role in contract["burst_channel_roles"]
+    }
+    assert fitted_count == sum(
+        BURST_CHANNEL_MODES[channel_id] == "continuous"
+        for channel_id in formal_channels
+    )
+    sample = RawBurstSample.create(
+        source_object_id="object:" + fingerprint({"probe": "tcp-rtt-cache"}),
+        timestamp_ns=END - 1,
+        cluster_id=CLUSTER,
+        namespace=NAMESPACE,
+        entity_type="edge",
+        entity_id=f"{CLUSTER}::{NAMESPACE}::frontend->payment::tcp",
+        channel_id="tcp.rtt_p95",
+        value=10,
+        exposure=None,
+        coverage=1.0,
+        event_loss_rate=0.0,
+        mapping_quality=1.0,
+    )
+
+    first = builder.collect(
+        samples=(sample,),
+        window_start_ns=START,
+        window_end_ns=END,
+        residual_source_record_ids=(),
+    )
+    second = builder.collect(
+        samples=(sample,),
+        window_start_ns=START,
+        window_end_ns=END,
+        residual_source_record_ids=(),
+    )
+
+    assert len(calls) == fitted_count
+    assert first[0].normalized_strength == second[0].normalized_strength
+
+
+def _burst_sample_for_role(role, *, suffix):
+    channel_id = role["channel_id"]
+    entity_type = role["entity_types"][0]
+    entity_id = {
+        "service": f"{CLUSTER}::{NAMESPACE}::frontend",
+        "host": f"{CLUSTER}::host::node-a",
+        "edge": _edge_id(),
+    }[entity_type]
+    mode = BURST_CHANNEL_MODES[channel_id]
+    return RawBurstSample.create(
+        source_object_id="object:" + fingerprint({
+            "channel": channel_id, "suffix": suffix,
+        }),
+        timestamp_ns=END - 1,
+        cluster_id=CLUSTER,
+        namespace=NAMESPACE if entity_type != "host" else "_host",
+        entity_type=entity_type,
+        entity_id=entity_id,
+        channel_id=channel_id,
+        value=0.0,
+        exposure=1.0 if mode == "rare" else None,
+        coverage=1.0,
+        event_loss_rate=0.0,
+        mapping_quality=1.0,
+    )
+
+
+def _sealed_raw_burst(tmp_path, contract, samples, *, dataset_id):
+    writer = BurstArchiveWriter(
+        tmp_path,
+        dataset_id=dataset_id,
+        cluster_id=CLUSTER,
+        event_source_fingerprint=fingerprint({"source": str(tmp_path)}),
+        burst_config_fingerprint=contract["burst_config_fingerprint"],
+    )
+    writer.append(RawBurstWindow.create(
+        sequence=1,
+        window_start_ns=START,
+        window_end_ns=END,
+        cluster_id=CLUSTER,
+        samples=samples,
+        event_source_fingerprint=writer.event_source_fingerprint,
+        burst_config_fingerprint=contract["burst_config_fingerprint"],
+        event_loss_rate=0.0,
+    ))
+    return writer.seal()
+
+
+def test_healthy_burst_calibration_is_frozen_and_round_trips(
+    contract, tmp_path,
+):
+    samples = tuple(
+        _burst_sample_for_role(role, suffix="healthy")
+        for role in contract["burst_channel_roles"]
+    )
+    archive = _sealed_raw_burst(
+        tmp_path / "healthy-burst",
+        contract,
+        samples,
+        dataset_id=fingerprint({"dataset": "healthy-burst"}),
+    )
+    rare = {
+        role["channel_id"]: 0.1
+        for role in contract["burst_channel_roles"]
+        if BURST_CHANNEL_MODES[role["channel_id"]] == "rare"
+    }
+    policy = BurstCalibrationPolicy.create(
+        rare_event_thresholds=rare,
+        continuous_transform="identity",
+        continuous_polarity=1,
+        continuous_z_cap=5.0,
+        continuous_minimum_healthy_samples=1,
+        continuous_minimum_scale=1.0e-6,
+    )
+    artifact = calibrate_healthy_burst(
+        archive=archive,
+        collection_contract=contract,
+        policy=policy,
+    )
+    assert {item.channel_id for item in artifact.calibrations} == {
+        role["channel_id"] for role in contract["burst_channel_roles"]
+    }
+    assert artifact.source_dataset_id == archive.dataset_id
+    path = tmp_path / "burst-calibration.json"
+    artifact.save(path)
+    assert BurstCalibrationArtifact.load(path) == artifact
+    path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(RawCollectionError, match="already exists"):
+        artifact.save(path)
+
+    missing = dict(rare)
+    missing.pop(next(iter(missing)))
+    bad_policy = BurstCalibrationPolicy.create(
+        rare_event_thresholds=missing,
+        continuous_transform="identity",
+        continuous_polarity=1,
+        continuous_z_cap=5.0,
+        continuous_minimum_healthy_samples=1,
+        continuous_minimum_scale=1.0e-6,
+    )
+    with pytest.raises(RawCollectionError, match="cover every formal"):
+        calibrate_healthy_burst(
+            archive=archive,
+            collection_contract=contract,
+            policy=bad_policy,
+        )
+
+
+def test_read_only_burst_join_aligns_evidence_without_mutating_archives(
+    contract, tmp_path,
+):
+    build_id = fingerprint({"build": "burst-join"})
+    collector = FinalDataPlaneCollector(
+        collection_contract=contract,
+        collector_build_id=build_id,
+    )
+    normal_window = collector.assemble(
+        raw_window=_raw_window(include_dns=False),
+        inventory_at_start=_revision(),
+        inventory_at_end=_revision(),
+    )
+    dataset_id = fingerprint({"dataset": "burst-join"})
+    normal_writer = CollectionArchiveWriter(
+        tmp_path / "normal",
+        dataset_id=dataset_id,
+        collection_contract=contract,
+        source_description=contract["source_description"],
+        collection_metadata={
+            "collector_build_fingerprint": build_id,
+            "aggregation_config_fingerprint": contract[
+                "aggregation_config_fingerprint"
+            ],
+            "burst_config_fingerprint": contract[
+                "burst_config_fingerprint"
+            ],
+        },
+    )
+    normal_writer.append(normal_window)
+    normal = normal_writer.seal()
+    raw_sample = RawBurstSample.create(
+        source_object_id="object:" + fingerprint({"probe": "joined-rto"}),
+        timestamp_ns=END - 1,
+        cluster_id=CLUSTER,
+        namespace=NAMESPACE,
+        entity_type="edge",
+        entity_id=_edge_id(),
+        channel_id="tcp.rto_rate",
+        value=1.0,
+        exposure=10.0,
+        coverage=1.0,
+        event_loss_rate=0.0,
+        mapping_quality=1.0,
+    )
+    burst = _sealed_raw_burst(
+        tmp_path / "burst",
+        contract,
+        (raw_sample,),
+        dataset_id=dataset_id,
+    )
+    artifact = BurstCalibrationArtifact.create(
+        source_archive=burst,
+        policy_fingerprint=fingerprint({"policy": "test"}),
+        calibrations=_calibrations(contract),
+    )
+    before_normal = normal.windows_sha256
+    before_burst = burst.windows_sha256
+    joined = BurstJoinedCollectionArchive.create(
+        normal_archive=normal,
+        burst_archive=burst,
+        calibration_artifact=artifact,
+    )
+    windows = tuple(joined.iter_windows())
+    assert len(windows) == 1
+    assert len(windows[0].burst_evidence) == 1
+    assert windows[0].burst_evidence[0].channel_id == "tcp.rto_rate"
+    assert windows[0].burst_evidence[0].normalized_strength == pytest.approx(
+        1.0
+    )
+    assert windows[0].burst_evidence[0].source_record_ids == [
+        raw_sample.source_record_id
+    ]
+    assert CollectionArchive.load(normal.root).windows_sha256 == before_normal
+    assert BurstArchive.load(burst.root).windows_sha256 == before_burst
+
+
+def test_read_only_burst_join_rejects_boundary_mismatch(contract, tmp_path):
+    dataset_id = fingerprint({"dataset": "mismatch"})
+    build_id = fingerprint({"build": "mismatch"})
+    normal_window = FinalDataPlaneCollector(
+        collection_contract=contract,
+        collector_build_id=build_id,
+    ).assemble(
+        raw_window=_raw_window(include_dns=False),
+        inventory_at_start=_revision(),
+        inventory_at_end=_revision(),
+    )
+    normal_writer = CollectionArchiveWriter(
+        tmp_path / "normal-mismatch",
+        dataset_id=dataset_id,
+        collection_contract=contract,
+        source_description=contract["source_description"],
+        collection_metadata={
+            "collector_build_fingerprint": build_id,
+            "aggregation_config_fingerprint": contract[
+                "aggregation_config_fingerprint"
+            ],
+            "burst_config_fingerprint": contract[
+                "burst_config_fingerprint"
+            ],
+        },
+    )
+    normal_writer.append(normal_window)
+    normal = normal_writer.seal()
+    burst = _sealed_raw_burst(
+        tmp_path / "burst-mismatch",
+        contract,
+        (),
+        dataset_id=dataset_id,
+    )
+    object.__setattr__(burst, "end_ns", burst.end_ns + 1)
+    artifact = BurstCalibrationArtifact.create(
+        source_archive=burst,
+        policy_fingerprint=fingerprint({"policy": "test"}),
+        calibrations=_calibrations(contract),
+    )
+    with pytest.raises(RawCollectionError, match="identities do not align"):
+        BurstJoinedCollectionArchive.create(
+            normal_archive=normal,
+            burst_archive=burst,
+            calibration_artifact=artifact,
+        )
+
+
 def test_prometheus_source_rejects_preaggregated_queries():
     payload = {
         "query_id": "bad",
@@ -1826,8 +2168,9 @@ def test_query_range_chunks_bound_request_fanout_and_memory(monkeypatch):
     ))
     assert len(chunks) == 40
     assert all(len(chunk) == 30 for chunk in chunks)
-    assert len(requests_seen) == 30 * 40 == 1200
-    assert source.last_range_query_stats["request_count"] == 1200
+    assert len(config.prometheus.queries) == 31
+    assert len(requests_seen) == 31 * 40 == 1240
+    assert source.last_range_query_stats["request_count"] == 1240
     assert source.last_range_query_stats["max_loaded_windows"] == 30
     assert config.prometheus.range_query_max_workers == 1
     assert concurrency["maximum"] == 1

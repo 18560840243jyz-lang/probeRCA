@@ -4,6 +4,7 @@
 #define PROBERCA_FINAL_DNS_BUCKETS 16
 #define PROBERCA_FINAL_DNS_QNAME_MAX 96
 #define PROBERCA_FINAL_MAX_CGROUPS 65536
+#define PROBERCA_FINAL_MAX_TCP_EDGES 65536
 #define PROBERCA_FINAL_MAX_DNS_EDGES 65536
 #define PROBERCA_FINAL_MAX_DNS_PENDING 131072
 
@@ -19,6 +20,17 @@ struct proberca_final_cgroup_counters {
 struct proberca_final_futex_start {
     __u64 started_ns;
     __u64 cgroup_id;
+};
+
+struct proberca_final_tcp_edge_key {
+    __u64 cgroup_id;
+    __be32 destination_ipv4;
+    __u16 destination_port;
+    __u16 reserved;
+};
+
+struct proberca_final_tcp_edge_counters {
+    __u64 preconnect_failure_total;
 };
 
 struct proberca_final_dns_edge_key {

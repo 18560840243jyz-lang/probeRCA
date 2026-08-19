@@ -1,4 +1,5 @@
 #include "vmlinux.h"
+#include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
@@ -11,6 +12,8 @@
 #define EINPROGRESS 115
 #define EALREADY 114
 #define EINTR 4
+#define AF_INET_VALUE 2
+#define IPPROTO_TCP_VALUE 6
 #define IPPROTO_UDP_VALUE 17
 #define DNS_PORT 53
 #define DNS_RCODE_NOERROR 0
@@ -28,6 +31,13 @@ struct {
     __type(key, __u64);
     __type(value, struct proberca_final_cgroup_counters);
 } cgroup_counters SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, PROBERCA_FINAL_MAX_TCP_EDGES);
+    __type(key, struct proberca_final_tcp_edge_key);
+    __type(value, struct proberca_final_tcp_edge_counters);
+} tcp_edge_counters SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -75,6 +85,34 @@ get_cgroup_counters(__u64 cgroup_id)
         return value;
     bpf_map_update_elem(&cgroup_counters, &cgroup_id, &zero, BPF_NOEXIST);
     return bpf_map_lookup_elem(&cgroup_counters, &cgroup_id);
+}
+
+static __always_inline __u64 socket_cgroup_id(const void *address)
+{
+    const struct sock *socket = address;
+    struct cgroup *cgroup;
+    struct kernfs_node *node;
+
+    if (!socket)
+        return 0;
+    cgroup = BPF_CORE_READ(socket, sk_cgrp_data.cgroup);
+    if (!cgroup)
+        return 0;
+    node = BPF_CORE_READ(cgroup, kn);
+    return node ? BPF_CORE_READ(node, id) : 0;
+}
+
+static __always_inline struct proberca_final_tcp_edge_counters *
+get_tcp_edge_counters(const struct proberca_final_tcp_edge_key *key)
+{
+    struct proberca_final_tcp_edge_counters zero = {};
+    struct proberca_final_tcp_edge_counters *value;
+
+    value = bpf_map_lookup_elem(&tcp_edge_counters, key);
+    if (value)
+        return value;
+    bpf_map_update_elem(&tcp_edge_counters, key, &zero, BPF_NOEXIST);
+    return bpf_map_lookup_elem(&tcp_edge_counters, key);
 }
 
 static __always_inline struct proberca_final_dns_edge_counters *
@@ -174,6 +212,40 @@ int final_connect_exit(struct trace_event_raw_sys_exit *context)
     if (result < 0 && result != -EINPROGRESS && result != -EALREADY &&
         result != -EINTR)
         __sync_fetch_and_add(&counters->socket_accept_fail_total, 1);
+    return 0;
+}
+
+/*
+ * Beyla reports completed application transactions.  A TCP connection that
+ * closes while still handshaking never becomes such a transaction, so keep a
+ * separate unsampled cumulative Normal-path counter for that missing terminal
+ * outcome.  The user-space exporter joins the cgroup and destination address
+ * to the frozen service-pair identity; the Burst ring is not read here.
+ */
+SEC("tracepoint/sock/inet_sock_set_state")
+int final_tcp_preconnect_failure(
+    struct trace_event_raw_inet_sock_set_state *context)
+{
+    struct proberca_final_tcp_edge_key key = {};
+    struct proberca_final_tcp_edge_counters *counters;
+
+    if (context->family != AF_INET_VALUE ||
+        context->protocol != IPPROTO_TCP_VALUE ||
+        context->newstate != TCP_CLOSE ||
+        (context->oldstate != TCP_SYN_SENT &&
+         context->oldstate != TCP_SYN_RECV))
+        return 0;
+    key.cgroup_id = socket_cgroup_id(context->skaddr);
+    if (!key.cgroup_id)
+        return 0;
+    bpf_probe_read_kernel(
+        &key.destination_ipv4,
+        sizeof(key.destination_ipv4),
+        context->daddr);
+    key.destination_port = context->dport;
+    counters = get_tcp_edge_counters(&key);
+    if (counters)
+        __sync_fetch_and_add(&counters->preconnect_failure_total, 1);
     return 0;
 }
 

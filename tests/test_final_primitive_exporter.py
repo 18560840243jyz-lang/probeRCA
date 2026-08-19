@@ -109,6 +109,7 @@ def test_formal_live_collector_has_tcp_queries_but_no_dns_queries():
         "edge_request_total",
         "edge_error_total",
         "edge_timeout_total",
+        "edge_latency_observation_total",
         "edge_latency_histogram",
     } <= components
     assert not any(
@@ -188,6 +189,9 @@ def test_final_bpf_normal_path_is_map_aggregated_and_window_safe():
     assert "BPF_MAP_TYPE_PERF_EVENT_ARRAY" not in bpf
     assert "futex_wait_ns_total" in bpf
     assert "dns_edge_counters" in bpf
+    assert "tcp_edge_counters" in bpf
+    assert "final_tcp_preconnect_failure" in bpf
+    assert "preconnect_failure_total" in header
     assert "success_latency_buckets" in loader
     assert "servfail_total" in bpf
     assert "PROBERCA_FINAL_DNS_QNAME_MAX" in bpf
@@ -196,6 +200,8 @@ def test_final_bpf_normal_path_is_map_aggregated_and_window_safe():
     assert "__be16 qtype;" in header
     assert "__u64 qname_hash;" in header
     assert '"futex_starts"' in loader
+    assert '"tcp_edge_counters"' in loader
+    assert "tcp_edge_transport" in loader
     assert "collect_active_futex_waits" in loader
     assert "resolve_stable_futex_entries" in loader
     assert "all_futex_entries_resolved" in loader
@@ -712,6 +718,48 @@ def test_exporter_uses_persistent_source_workers_and_slow_stage_logging():
     assert "wait(futures)" in source
     assert "final primitive snapshot published:" in source
     assert '"beyla_duration_ns"' in source
+
+
+def test_tcp_preconnect_failures_join_frozen_edge_without_latency():
+    inventory = SimpleNamespace(service_cluster_ips={
+        "10.96.53.134": (
+            "online-boutique", "productcatalogservice",
+        ),
+    })
+    identity = SimpleNamespace(
+        namespace="online-boutique", service="frontend",
+    )
+    records = ({
+        "record_type": "tcp_edge_transport",
+        "cgroup_id": 7,
+        "destination_ipv4": "10.96.53.134",
+        "destination_port": 3550,
+        "preconnect_failure_total": 13,
+    },)
+
+    samples = FinalPrimitiveExporter._tcp_transport_failure_samples(
+        inventory, records, {7: identity}
+    )
+
+    assert {item.name for item in samples} == {
+        "proberca_tcp_edge_request_total",
+        "proberca_tcp_edge_error_total",
+        "proberca_tcp_edge_timeout_total",
+    }
+    values = {item.name: item.value for item in samples}
+    assert values == {
+        "proberca_tcp_edge_request_total": 13,
+        "proberca_tcp_edge_error_total": 13,
+        "proberca_tcp_edge_timeout_total": 0,
+    }
+    assert all(
+        item.label_dict["src_service"] == "frontend"
+        and item.label_dict["dst_service"]
+        == "productcatalogservice"
+        and item.label_dict["source_coverage"] == "1"
+        for item in samples
+    )
+    assert not any("latency" in item.name for item in samples)
 
 
 def test_dns_query_counter_is_completed_responses_plus_timeouts():

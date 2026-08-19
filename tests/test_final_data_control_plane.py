@@ -24,6 +24,7 @@ from proberca.controlplane import (
     load_ready_calibration_report,
 )
 from proberca.controlplane.metric_model import fit_metric_propagation
+from proberca.controlplane.evidence import aggregate_burst_evidence
 from proberca.controlplane.model import (
     CandidateEntityGraph,
     MetricNode,
@@ -340,6 +341,29 @@ def _unknown_evidence() -> EvidenceObservationRecord:
     )
 
 
+def test_burst_evidence_outside_candidate_scope_is_ignored():
+    entity_id = "cluster::ns::payment"
+    metric = MetricNode(
+        node_id=f"{entity_id}::cpu_usage_rate",
+        entity_id=entity_id,
+        entity_type="service",
+        metric_name="cpu_usage_rate",
+        role="service_cpu_usage",
+        root_category="CPU",
+        root_eligible=True,
+    )
+    outside = replace(
+        _evidence(),
+        evidence_id=fingerprint({"evidence": "outside-candidate"}),
+        target_id="cluster::ns::other-service",
+    )
+    strengths, identifiers = aggregate_burst_evidence(
+        [outside], {(entity_id, "CPU"): (metric,)},
+    )
+    assert strengths[(entity_id, "CPU")] == 0.0
+    assert identifiers[(entity_id, "CPU")] == ()
+
+
 def _collection_metadata(config: FinalControlConfig | None = None) -> dict[str, str]:
     contract = (config or FinalControlConfig()).collection_contract
     return {
@@ -530,6 +554,47 @@ def test_collection_must_be_complete_and_sealed_before_control(tmp_path):
     assert result.model_metadata["counterfactual_resolve"] is False
     assert _file_hash(archive_dir / "collection-manifest.json") == manifest_hash
     assert _file_hash(archive_dir / "collected-windows.jsonl") == windows_hash
+
+
+def test_control_retains_only_hard_interval_burst_evidence(tmp_path):
+    config = _config()
+    archive_dir = tmp_path / "archive"
+    writer = CollectionArchiveWriter(
+        archive_dir,
+        dataset_id=_DATASET_ID,
+        collection_contract=config.collection_contract,
+        source_description=config.collection_contract["source_description"],
+        collection_metadata=_collection_metadata(config),
+    )
+    early_source_ids = [
+        "source:" + fingerprint({"source": "healthy-burst-record"})
+    ]
+    early = replace(
+        _evidence(),
+        evidence_id=fingerprint({"evidence": "healthy-burst"}),
+        timestamp_ns=_NS // 2,
+        evidence_window_start_ns=0,
+        evidence_window_end_ns=_NS,
+        analysis_cutoff_ns=_NS,
+        source_record_ids=early_source_ids,
+        provenance={
+            **_evidence().provenance,
+            "source_set_fingerprint": fingerprint(sorted(early_source_ids)),
+        },
+    )
+    for sequence in range(1, 13):
+        evidence = (early,) if sequence == 1 else None
+        writer.append(_window(sequence, evidence=evidence))
+    archive = writer.seal()
+    control = FinalControlPlane(config)
+
+    run = control.run(archive)
+
+    assert len(run.results) == 1
+    assert tuple(item.evidence_id for item in control._evidence) == (
+        _evidence().evidence_id,
+    )
+    assert early.evidence_id not in run.results[0].top_k[0].burst_evidence_ids
 
 
 def test_data_plane_rejects_incomplete_final_metric_set(tmp_path):

@@ -13,7 +13,8 @@ from proberca.data.schema import (
 
 from .burst import (
     burst_observation_quality,
-    continuous_burst_strength,
+    continuous_burst_strength_from_reference,
+    fit_continuous_burst_reference,
     rare_event_strength,
 )
 from .contracts import assert_label_safe, fingerprint
@@ -302,6 +303,16 @@ class BurstEvidenceCollector:
                 raise RawCollectionError(
                     f"Burst calibration mode mismatch for {item.channel_id}"
                 )
+        self.continuous_references = {
+            item.channel_id: fit_continuous_burst_reference(
+                item.healthy_values,
+                transform=item.transform,
+                minimum_healthy_samples=item.minimum_healthy_samples,
+                minimum_scale=item.minimum_scale,
+            )
+            for item in self.calibrations.values()
+            if item.mode == "continuous"
+        }
         if not _opaque("source", "source:" + collector_build_id):
             raise RawCollectionError("collector_build_id must be SHA-256")
 
@@ -359,16 +370,12 @@ class BurstEvidenceCollector:
                     raise RawCollectionError(
                         "continuous Burst channel requires one value"
                     )
-                strength = continuous_burst_strength(
+                strength = continuous_burst_strength_from_reference(
                     values[0].value,
-                    calibration.healthy_values,
+                    self.continuous_references[channel_id],
                     polarity=calibration.polarity,
                     transform=calibration.transform,
                     z_cap=calibration.z_cap,
-                    minimum_healthy_samples=(
-                        calibration.minimum_healthy_samples
-                    ),
-                    minimum_scale=calibration.minimum_scale,
                 )
             quality = burst_observation_quality(
                 coverage=min(item.coverage for item in values),

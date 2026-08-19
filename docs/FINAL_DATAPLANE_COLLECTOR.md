@@ -98,9 +98,20 @@ configuration is `configs/final_primitive_exporter.example.yaml`. It:
 - reads only required cAdvisor, node_exporter, Beyla, and final BPF cumulative
   primitives;
 - reads cgroup v2 CPU/memory/PSI/task/thread primitives;
-- snapshots the always-on `bpf/final_normal` cgroup, futex, and socket maps;
+- snapshots the always-on `bpf/final_normal` cgroup, futex, socket, and
+  TCP pre-connection-failure maps;
 - exports cumulative counters, cumulative buckets, and gauges with one
   explicit epoch-second timestamp.
+
+For a directed TCP edge, Beyla supplies completed application transactions and
+their latency histogram. The Normal BPF map independently counts connections
+that close during `SYN_SENT`/`SYN_RECV`, before an application transaction can
+exist. The exporter joins that counter by frozen cgroup and destination
+identity, adds it to both total attempts and terminal failures, and emits no
+latency observation for it. An internal
+`edge_latency_observation_total` keeps the completed-transaction histogram
+check independent from the larger attempt denominator; it is a raw component,
+not an additional formal metric. The sealed archive remains exactly `9/4/3`.
 
 DNS map collection is `experimental / optional` and is disabled by default.
 It may be enabled only by an explicit experimental exporter configuration;
@@ -173,6 +184,44 @@ flush/fsync before the next sequence is processed. A logical failure leaves
 both partial JSONL files at the same last committed sequence and publishes no
 manifest. Manifests are created only after the complete pair has matching
 counts, boundaries, and Dataset ID.
+
+## Offline Burst calibration and read-only join
+
+Burst normalization is an explicit stage after immutable collection and
+before the RCA state machine. First create a label-free calibration artifact
+from a sealed Healthy Burst archive and a policy frozen before any fault run:
+
+```bash
+proberca-calibrate-burst \
+  --burst-archive /path/to/healthy/burst \
+  --collection-contract configs/final_collection_contract.yaml \
+  --policy /path/to/frozen-burst-calibration-policy.yaml \
+  --output /path/to/frozen-burst-calibration.json
+```
+
+The artifact records the Healthy Dataset ID, Healthy Burst manifest,
+calibration-policy fingerprint, channel calibrations, and its own fingerprint.
+Rare-event thresholds must come from the pre-fault policy; the command never
+derives them from an incident or expected root. Continuous reference values
+come only from the supplied Healthy archive.
+
+Analyze a paired Normal/Burst archive through the read-only aligned view:
+
+```bash
+proberca-analyze-collection \
+  --archive /path/to/normal \
+  --burst-archive /path/to/burst \
+  --burst-calibration /path/to/frozen-burst-calibration.json \
+  --config configs/final_control.yaml \
+  --output /path/to/control-output
+```
+
+The view requires equal Dataset ID, window count, time range, sequence and
+half-open boundaries. It revalidates source independence and the full formal
+target contract, but never rewrites or reseals either input archive. During a
+Hard incident, only evidence belonging to the frozen candidate graph may
+adjust a matching group penalty; valid low-duty-cycle evidence for formal
+entities outside that graph is ignored.
 
 ## Healthy-only collection
 

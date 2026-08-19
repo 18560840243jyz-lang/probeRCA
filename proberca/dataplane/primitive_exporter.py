@@ -924,7 +924,9 @@ class FinalPrimitiveExporter:
                 raise RawCollectionError(
                     "BPF snapshot output is not JSONL"
                 ) from error
-            if record.get("record_type") not in {"cgroup", "dns"}:
+            if record.get("record_type") not in {
+                "cgroup", "dns", "tcp_edge_transport",
+            }:
                 raise RawCollectionError(
                     "BPF snapshot contains an unknown record"
                 )
@@ -1436,6 +1438,7 @@ class FinalPrimitiveExporter:
                     "proberca_tcp_edge_request_total",
                     "proberca_tcp_edge_error_total",
                     "proberca_tcp_edge_timeout_total",
+                    "proberca_tcp_edge_latency_observation_total",
                     "proberca_tcp_edge_latency_milliseconds_bucket",
                 )
             else:
@@ -1460,6 +1463,15 @@ class FinalPrimitiveExporter:
                     names[2], common, row.count.value if timeout else 0.0
                 ),
             ))
+            if edge:
+                # Transport failures that happen before an application
+                # transaction exists are added to the edge denominator by an
+                # independent Normal BPF counter.  Keep Beyla's completed
+                # transaction count separately so latency is checked only
+                # against the observations that can own a histogram.
+                output.append(PrometheusSample.create(
+                    names[3], common, row.count.value
+                ))
             for bucket in row.buckets:
                 bound = bucket.label_dict["le"]
                 histogram_labels = dict(common)
@@ -1468,7 +1480,7 @@ class FinalPrimitiveExporter:
                     else f"{float(bound) * 1000.0:.17g}"
                 )
                 output.append(PrometheusSample.create(
-                    names[3], histogram_labels, bucket.value
+                    names[-1], histogram_labels, bucket.value
                 ))
         return tuple(output)
 
@@ -2081,6 +2093,84 @@ class FinalPrimitiveExporter:
                 ))
         return tuple(output)
 
+    @staticmethod
+    def _tcp_transport_failure_samples(
+        inventory: Inventory,
+        bpf: tuple[dict[str, Any], ...],
+        cgroup_identity: dict[int, ContainerIdentity],
+    ) -> tuple[PrometheusSample, ...]:
+        """Expose pre-transaction TCP failures as Normal edge counters.
+
+        Beyla owns completed application transactions and their latency
+        histograms. A handshake that closes in SYN_SENT/SYN_RECV has no
+        application transaction, so the final Normal BPF map contributes one
+        failed logical attempt to both the denominator and error numerator.
+        It deliberately contributes no latency observation.
+        """
+
+        output = []
+        for record in bpf:
+            if record.get("record_type") != "tcp_edge_transport":
+                continue
+            cgroup_id = record.get("cgroup_id")
+            destination_ipv4 = record.get("destination_ipv4")
+            destination_port = record.get("destination_port")
+            failure_total = record.get("preconnect_failure_total")
+            if (
+                isinstance(cgroup_id, bool)
+                or not isinstance(cgroup_id, int)
+                or cgroup_id <= 0
+                or not isinstance(destination_ipv4, str)
+                or not destination_ipv4
+                or isinstance(destination_port, bool)
+                or not isinstance(destination_port, int)
+                or not 1 <= destination_port <= 65535
+                or isinstance(failure_total, bool)
+                or not isinstance(failure_total, int)
+                or failure_total < 0
+            ):
+                raise RawCollectionError(
+                    "BPF TCP transport identity/counter is invalid"
+                )
+            source = cgroup_identity.get(cgroup_id)
+            destination = inventory.service_cluster_ips.get(
+                destination_ipv4
+            )
+            if source is None or destination is None:
+                continue
+            destination_namespace, destination_service = destination
+            if (source.namespace, source.service) == destination:
+                continue
+            common = {
+                "namespace": source.namespace,
+                "dst_namespace": destination_namespace,
+                "src_service": source.service,
+                "dst_service": destination_service,
+                "protocol": "tcp",
+                "source_series": _series_hash(
+                    "tcp-preconnect-failure",
+                    (
+                        ("cgroup_id", str(cgroup_id)),
+                        ("destination_ipv4", destination_ipv4),
+                        ("destination_port", str(destination_port)),
+                    ),
+                ),
+                "source_coverage": "1",
+            }
+            value = float(failure_total)
+            output.extend((
+                PrometheusSample.create(
+                    "proberca_tcp_edge_request_total", common, value
+                ),
+                PrometheusSample.create(
+                    "proberca_tcp_edge_error_total", common, value
+                ),
+                PrometheusSample.create(
+                    "proberca_tcp_edge_timeout_total", common, 0.0
+                ),
+            ))
+        return tuple(output)
+
     def _read_qdisc_transmit_drops(self) -> tuple[tuple[str, float], ...]:
         """Read one immutable qdisc counter snapshot without rebasing it."""
         result = subprocess.run(
@@ -2445,9 +2535,15 @@ class FinalPrimitiveExporter:
             time.perf_counter_ns() - service_processing_started_ns
         )
         edge_processing_started_ns = time.perf_counter_ns()
+        raw_edge_samples = list(self._render_request_rows(
+            edge_rows, edge=True
+        ))
+        raw_edge_samples.extend(self._tcp_transport_failure_samples(
+            inventory, raw.bpf, cgroup_identity
+        ))
         edge_samples = self._stable_request_samples(
             self._persistent_edge_samples(
-                self._render_request_rows(edge_rows, edge=True)
+                tuple(raw_edge_samples)
             ),
             edge=True,
             diagnostic_mapping=self._stable_edge_source_series,

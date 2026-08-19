@@ -165,6 +165,7 @@ class FinalControlPlane:
         self._hard_counts.clear()
         self._metric_catalog.clear()
         self._metric_specs.clear()
+        self._evidence.clear()
         self._calibration_learning_count = 0
         self._calibration_validation_count = 0
         self._healthy_validation_failed = False
@@ -802,6 +803,9 @@ class FinalControlPlane:
         if self._soft is None:
             raise ControlPlaneError("Hard transition has no frozen context")
         self.state = "hard"
+        # Healthy and Soft evidence is intentionally not part of the formal
+        # incident.  Keep the buffer scoped to the newly frozen Hard interval.
+        self._evidence.clear()
         self._hard = _PendingHardContext(
             sequence=sequence,
             timestamp_ns=timestamp_ns,
@@ -884,6 +888,7 @@ class FinalControlPlane:
                 self._recovery_count = 0
                 self._soft = None
                 self._hard = None
+                self._evidence.clear()
         models_updated = previous == "healthy" and maximum < self.config.soft_threshold
         self._timeline.append({
             "timestamp_ns": timestamp_ns,
@@ -1082,6 +1087,18 @@ class FinalControlPlane:
             },
         )
 
+    def _retain_incident_burst_evidence(self, window) -> None:
+        """Retain only evidence inside the active immutable Hard interval."""
+        if self._hard is None:
+            return
+        self._evidence.extend(
+            item for item in window.burst_evidence
+            if self._hard.timestamp_ns <= item.evidence_window_start_ns
+            and item.evidence_window_end_ns <= self._hard.analysis_cutoff_ns
+            and self._hard.timestamp_ns <= item.timestamp_ns
+            < self._hard.analysis_cutoff_ns
+        )
+
     def run(self, archive: CollectionArchive) -> ControlPlaneRun:
         if self._has_run:
             raise ControlPlaneError("FinalControlPlane instances are single-use")
@@ -1112,7 +1129,6 @@ class FinalControlPlane:
         for window in archive.iter_windows():
             processed += 1
             self._topology.extend(window.topology_events)
-            self._evidence.extend(window.burst_evidence)
             snapshot = self._active_topology(
                 window.window_start_ns, window.window_end_ns,
             )
@@ -1231,6 +1247,7 @@ class FinalControlPlane:
                     ),
                     **self._topology_provenance(graph),
                 })
+            self._retain_incident_burst_evidence(window)
             if self._hard is not None \
                     and window.sequence >= self._hard.analysis_sequence \
                     and self._hard.sequence not in self._diagnosed_hard_sequences:

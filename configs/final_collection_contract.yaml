@@ -15,7 +15,7 @@ normal_metric_roles:
   unit: ratio
   metric_kind: gauge
   aggregation: ratio_from_summed_components
-  aggregation_formula: sum_flow(delta(error_total+timeout_total))/(sum_flow(delta(request_total))+epsilon)
+  aggregation_formula: (sum_flow(delta(completed_error_total+completed_timeout_total))+sum_cgroup_destination(delta(preconnect_failure_total)))/(sum_flow(delta(completed_request_total))+sum_cgroup_destination(delta(preconnect_failure_total))+epsilon)
   source_scope: flow
   quantile: null
 - record_type: edge_metric
@@ -33,7 +33,7 @@ normal_metric_roles:
   unit: milliseconds
   metric_kind: quantile
   aggregation: histogram_merge_quantile
-  aggregation_formula: q0.95(merge_flow(edge_latency_histogram))
+  aggregation_formula: q0.95(merge_flow(completed_edge_latency_histogram)); preconnect failures have no latency observation
   source_scope: flow
   quantile: 0.95
 - record_type: edge_metric
@@ -51,7 +51,7 @@ normal_metric_roles:
   unit: requests
   metric_kind: delta_counter
   aggregation: cross_series_sum_delta
-  aggregation_formula: sum_flow(delta(request_total))
+  aggregation_formula: sum_flow(delta(completed_request_total))+sum_cgroup_destination(delta(preconnect_failure_total))
   source_scope: flow
   quantile: null
 - record_type: node_metric
@@ -276,7 +276,7 @@ normal_metric_roles:
   source_scope: pod
   quantile: null
 aggregation_output_source: final_window_aggregation
-aggregation_config_fingerprint: 814b0dc72f2fe171d579097d9c20c8508875a179541eefca8e039091169387a9
+aggregation_config_fingerprint: ee71396f5fbd91a7668943a3ff79906e1c1b7fa920cff272a6b17d79b17543be
 source_description: final-window-aggregates-v1
 burst_evidence_source_type: burst_event
 burst_evidence_semantics: normalized_strength_times_quality

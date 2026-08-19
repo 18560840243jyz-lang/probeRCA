@@ -244,6 +244,32 @@ series for diagnostics, but the formal `9/4/3` archive projects them out before
 aggregation. An out-of-scope edge cannot alter formal topology identity or
 block a formal window; a missing frozen edge still fails closed.
 
+## Formal TCP Attempt and Pre-transaction Failure Decision
+
+Beyla observes completed application transactions, but a TCP connection that
+closes in `SYN_SENT` or `SYN_RECV` has no completed transaction and therefore
+cannot be represented by Beyla alone. The formal Normal path consequently
+combines two independent, label-free cumulative sources before the `9/4/3`
+window aggregation:
+
+- completed application request, error, timeout, and latency-histogram
+  counters from Beyla;
+- an always-on BPF cumulative pre-connection-failure counter keyed by source
+  cgroup and destination address/port, joined to the frozen service identity.
+
+The formal edge request count is completed transactions plus pre-connection
+failures. The failure numerator is completed errors/timeouts plus those
+pre-connection failures. Latency P95 remains defined only over completed
+application transactions; the exporter therefore exposes an internal latency
+observation count solely to validate the histogram. This internal component is
+not a fourth formal edge metric, root coordinate, alert coordinate, or FISTA
+variable. Burst events are not read to construct any Normal metric.
+
+The BPF counter is unsampled and cumulative. It stores no incident label and no
+per-event Normal archive. An unmappable cgroup or destination remains outside
+the formal aggregation rather than being guessed, and frozen-edge projection
+continues to decide which service pairs enter the archive.
+
 When an in-scope cumulative counter or histogram series exists at only one of
 the two exact window boundaries, its delta is unknowable. The affected metric
 is retained as `value=null`, `valid=false`, with

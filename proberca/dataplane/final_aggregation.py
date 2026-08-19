@@ -129,6 +129,9 @@ COMPONENTS: dict[str, ComponentSpec] = {
     "edge_timeout_total": ComponentSpec(
         "edge", "request", "monotonic_counter", "requests", "flow"
     ),
+    "edge_latency_observation_total": ComponentSpec(
+        "edge", "request", "monotonic_counter", "requests", "flow"
+    ),
     "edge_latency_histogram": ComponentSpec(
         "edge", "request", "histogram_bucket", "milliseconds", "flow"
     ),
@@ -776,18 +779,33 @@ class FinalWindowAggregator:
         """Invalidate only latency when its cumulative +Inf delta disagrees."""
 
         if not count.valid:
-            return histogram
+            return _combine(
+                (histogram, count),
+                None,
+                invalid_reason=count.invalid_reason,
+                sample_count=histogram.sample_count,
+            )
         if math.isclose(
             float(histogram.sample_count),
             float(count.value),
             rel_tol=0.0,
             abs_tol=RATIO_EPSILON,
         ):
-            return histogram
+            return _combine(
+                (histogram, count),
+                histogram.value,
+                invalid_reason=histogram.invalid_reason,
+                sample_count=histogram.sample_count,
+            )
         if histogram.invalid_reason == "zero_coverage":
-            return histogram
+            return _combine(
+                (histogram, count),
+                None,
+                invalid_reason=histogram.invalid_reason,
+                sample_count=histogram.sample_count,
+            )
         return _combine(
-            (histogram,),
+            (histogram, count),
             None,
             invalid_reason="inconsistent_histogram",
             sample_count=histogram.sample_count,
@@ -1154,7 +1172,7 @@ class FinalWindowAggregator:
         elif protocol == "tcp":
             values = self._deltas(
                 window, samples, "edge_request_total", "edge_error_total",
-                "edge_timeout_total",
+                "edge_timeout_total", "edge_latency_observation_total",
             )
             self._series_sets_equal(
                 values,
@@ -1165,17 +1183,39 @@ class FinalWindowAggregator:
                 self._sum(values["edge_error_total"]),
                 self._sum(values["edge_timeout_total"]),
             )
+            latency_exposure = self._sum(
+                values["edge_latency_observation_total"]
+            )
             latency = self._histogram_p95(
                 window, samples, "edge_latency_histogram",
-                set(values["edge_request_total"]), allow_empty=True,
+                set(values["edge_latency_observation_total"]),
+                allow_empty=True,
             )
-            latency = self._require_histogram_count_match(latency, count)
+            latency = self._require_histogram_count_match(
+                latency, latency_exposure
+            )
             if count.valid and count.value == 0:
                 if any(item.valid and item.value != 0 for item in bad) \
                         or latency.sample_count != 0:
                     raise RawCollectionError(
                         "inactive TCP edge has failure/latency observations"
                     )
+            if (
+                count.valid
+                and latency_exposure.valid
+                and latency_exposure.value > count.value
+            ):
+                raise RawCollectionError(
+                    "TCP latency exposure exceeds total logical attempts"
+                )
+            if (
+                count.valid
+                and all(item.valid for item in bad)
+                and sum(float(item.value) for item in bad) > count.value
+            ):
+                raise RawCollectionError(
+                    "TCP terminal failures exceed total logical attempts"
+                )
             failure = self._ratio(
                 self._add(bad),
                 count,

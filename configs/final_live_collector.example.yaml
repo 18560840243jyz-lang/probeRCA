@@ -362,6 +362,16 @@ prometheus:
       histogram_le_label: null
       value_scale: 1.0
       histogram_bound_scale: 1.0
+    - query_id: tcp-edge-latency-observation-total
+      component: edge_latency_observation_total
+      promql: 'proberca_tcp_edge_latency_observation_total{source_coverage=~"0|1"}'
+      label_mapping: *tcp_edge_labels
+      required_labels: *tcp_edge_required
+      optional_labels: *edge_optional
+      series_labels: *tcp_edge_series
+      histogram_le_label: null
+      value_scale: 1.0
+      histogram_bound_scale: 1.0
     - query_id: tcp-edge-error-total
       component: edge_error_total
       promql: 'proberca_tcp_edge_error_total{source_coverage=~"0|1"}'

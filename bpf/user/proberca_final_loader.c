@@ -191,6 +191,7 @@ static int pin_required_maps(
 {
     static const char *const names[] = {
         "cgroup_counters",
+        "tcp_edge_counters",
         "futex_starts",
         "dns_pending",
         "dns_edge_counters",
@@ -694,9 +695,43 @@ static int print_dns(
     return errno == ENOENT ? 0 : -errno;
 }
 
+static int print_tcp_edges(int map_fd, const struct options *options)
+{
+    struct proberca_final_tcp_edge_counters value;
+    struct proberca_final_tcp_edge_key key;
+    struct proberca_final_tcp_edge_key next;
+    bool have_key = false;
+    char address[INET_ADDRSTRLEN];
+
+    while (bpf_map_get_next_key(
+               map_fd, have_key ? &key : NULL, &next) == 0) {
+        key = next;
+        have_key = true;
+        if (!cgroup_selected(options, key.cgroup_id))
+            continue;
+        if (bpf_map_lookup_elem(map_fd, &key, &value) != 0)
+            continue;
+        if (!inet_ntop(
+                AF_INET, &key.destination_ipv4,
+                address, sizeof(address)))
+            return -errno;
+        printf(
+            "{\"record_type\":\"tcp_edge_transport\","
+            "\"cgroup_id\":%llu,\"destination_ipv4\":\"%s\","
+            "\"destination_port\":%u,"
+            "\"preconnect_failure_total\":%llu}\n",
+            (unsigned long long)key.cgroup_id,
+            address,
+            key.destination_port,
+            (unsigned long long)value.preconnect_failure_total);
+    }
+    return errno == ENOENT ? 0 : -errno;
+}
+
 static int run_snapshot(const struct options *options)
 {
     int cgroups_fd = -1;
+    int tcp_edges_fd = -1;
     int futex_fd = -1;
     int pending_fd = -1;
     int dns_fd = -1;
@@ -705,13 +740,15 @@ static int run_snapshot(const struct options *options)
 
     cgroups_fd = open_pinned(
         options->snapshot_dir, "cgroup_counters");
+    tcp_edges_fd = open_pinned(
+        options->snapshot_dir, "tcp_edge_counters");
     futex_fd = open_pinned(options->snapshot_dir, "futex_starts");
     pending_fd = open_pinned(options->snapshot_dir, "dns_pending");
     dns_fd = open_pinned(
         options->snapshot_dir, "dns_edge_counters");
     timeout_fd = open_pinned(
         options->snapshot_dir, "dns_timeout_counters");
-    if (cgroups_fd < 0 || futex_fd < 0 || pending_fd < 0 ||
+    if (cgroups_fd < 0 || tcp_edges_fd < 0 || futex_fd < 0 || pending_fd < 0 ||
         dns_fd < 0 || timeout_fd < 0) {
         fprintf(stderr, "final BPF maps are unavailable\n");
         goto cleanup;
@@ -723,6 +760,7 @@ static int run_snapshot(const struct options *options)
         goto cleanup;
     }
     if (print_cgroups(cgroups_fd, futex_fd, options) != 0 ||
+        print_tcp_edges(tcp_edges_fd, options) != 0 ||
         print_dns(dns_fd, timeout_fd, options) != 0) {
         fprintf(stderr, "cannot read final BPF maps\n");
         goto cleanup;
@@ -732,6 +770,8 @@ static int run_snapshot(const struct options *options)
 cleanup:
     if (cgroups_fd >= 0)
         close(cgroups_fd);
+    if (tcp_edges_fd >= 0)
+        close(tcp_edges_fd);
     if (futex_fd >= 0)
         close(futex_fd);
     if (pending_fd >= 0)

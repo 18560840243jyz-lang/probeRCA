@@ -24,6 +24,12 @@ from .burst_archive import (
     BurstArchiveWriter,
     RawBurstWindow,
 )
+from .burst_replay import (
+    BurstCalibrationArtifact,
+    BurstCalibrationPolicy,
+    BurstJoinedCollectionArchive,
+    calibrate_healthy_burst,
+)
 from .burst_live import (
     FinalLiveBurstConfig,
     FinalLiveBurstSource,
@@ -57,6 +63,9 @@ __all__ = [
     "BurstArchiveWriter",
     "RawBurstWindow",
     "RawBurstSample",
+    "BurstCalibrationArtifact",
+    "BurstCalibrationPolicy",
+    "BurstJoinedCollectionArchive",
     "FinalLiveBurstConfig",
     "FinalLiveBurstSource",
     "load_final_live_burst_config",
@@ -86,4 +95,5 @@ __all__ = [
     "burst_observation_quality",
     "continuous_burst_strength",
     "rare_event_strength",
+    "calibrate_healthy_burst",
 ]

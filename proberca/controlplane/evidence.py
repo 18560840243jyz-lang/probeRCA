@@ -62,6 +62,12 @@ def aggregate_burst_evidence(
                 strengths[key].get(item.channel_id, 0.0), min(psi, 1.0),
             )
             identifiers[key].add(item.evidence_id)
+        # Raw low-duty-cycle Burst collection covers the whole frozen formal
+        # scope.  After Hard, only evidence whose entity/category is present in
+        # the candidate graph may adjust a group penalty; other formal targets
+        # are intentionally ignored rather than treated as malformed.
+        if not matches:
+            continue
         if len(matches) != 1:
             raise ValueError("Burst target must match exactly one candidate group")
     combined = {}
