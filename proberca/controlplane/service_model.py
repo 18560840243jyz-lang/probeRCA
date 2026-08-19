@@ -273,6 +273,36 @@ def formal_service_graph(
             placement.service_name,
         ) in formal_services
     })
+    if snapshot.service_runtime_identity_fingerprints:
+        missing_runtime_services = formal_services - set(
+            snapshot.service_runtime_identity_fingerprints
+        )
+        if missing_runtime_services:
+            raise ValueError(
+                "formal services lack service-keyed runtime identities: "
+                f"{sorted(missing_runtime_services)}"
+            )
+        formal_runtime_identities = {
+            service_id: tuple(sorted(
+                snapshot.service_runtime_identity_fingerprints[service_id]
+            ))
+            for service_id in sorted(formal_services)
+        }
+        runtime_payload = {
+            "formal_pod_uids": formal_pod_uids,
+            "formal_service_runtime_identity_fingerprints": (
+                formal_runtime_identities
+            ),
+        }
+    else:
+        # Legacy snapshots did not retain the service association for each
+        # identity. Preserve their conservative all-identity comparison.
+        runtime_payload = {
+            "formal_pod_uids": formal_pod_uids,
+            "legacy_runtime_identity_fingerprints": sorted(
+                snapshot.runtime_identity_fingerprints
+            ),
+        }
     return AllowedServiceGraph(
         services=services,
         relations=relations,
@@ -280,12 +310,7 @@ def formal_service_graph(
         placements=placements,
         snapshot_id=graph.snapshot_id,
         topology_fingerprint=topology_fingerprint,
-        runtime_identity_fingerprint=fingerprint({
-            "formal_pod_uids": formal_pod_uids,
-            "runtime_identity_fingerprints": sorted(
-                snapshot.runtime_identity_fingerprints
-            ),
-        }),
+        runtime_identity_fingerprint=fingerprint(runtime_payload),
         topology_epoch=graph.topology_epoch,
     )
 

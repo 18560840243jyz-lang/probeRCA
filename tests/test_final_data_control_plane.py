@@ -2466,6 +2466,13 @@ def _formal_service_scope_topology(
         )
         for index, service in enumerate(services)
     ]
+    runtime_by_service = {
+        entity_id: [fingerprint({"runtime": entity_id})]
+        for entity_id in (
+            *sorted(config.formal_service_entity_ids),
+            "kind-proberca-ob::kube-system::kube-dns",
+        )
+    }
     return TopologySnapshot(
         schema_version="1.0",
         snapshot_id="formal-scope-snapshot",
@@ -2477,6 +2484,12 @@ def _formal_service_scope_topology(
         host_edges=[],
         resource_edges=[],
         service_nodes=placements,
+        runtime_identity_fingerprints=sorted({
+            identity
+            for identities in runtime_by_service.values()
+            for identity in identities
+        }),
+        service_runtime_identity_fingerprints=runtime_by_service,
         structure_fingerprint=fingerprint({
             "services": services,
             "placements": [
@@ -2502,6 +2515,45 @@ def test_frozen_scope_excludes_infrastructure_from_models_and_alerts():
     assert infrastructure in full_graph.services
     assert infrastructure not in graph.services
     assert len(graph.services) == 11
+
+    snapshot = _formal_service_scope_topology(config)
+    excluded_id = "kind-proberca-ob::kube-system::kube-dns"
+    excluded_changed = dict(snapshot.service_runtime_identity_fingerprints)
+    excluded_changed[excluded_id] = [fingerprint({"runtime": "replacement"})]
+    excluded_snapshot = replace(
+        snapshot,
+        runtime_identity_fingerprints=sorted({
+            identity
+            for identities in excluded_changed.values()
+            for identity in identities
+        }),
+        service_runtime_identity_fingerprints=excluded_changed,
+    )
+    assert (
+        formal_service_graph(snapshot, config).runtime_identity_fingerprint
+        == formal_service_graph(
+            excluded_snapshot, config
+        ).runtime_identity_fingerprint
+    )
+
+    formal_id = sorted(config.formal_service_entity_ids)[0]
+    formal_changed = dict(snapshot.service_runtime_identity_fingerprints)
+    formal_changed[formal_id] = [fingerprint({"runtime": "replacement"})]
+    formal_snapshot = replace(
+        snapshot,
+        runtime_identity_fingerprints=sorted({
+            identity
+            for identities in formal_changed.values()
+            for identity in identities
+        }),
+        service_runtime_identity_fingerprints=formal_changed,
+    )
+    assert (
+        formal_service_graph(snapshot, config).runtime_identity_fingerprint
+        != formal_service_graph(
+            formal_snapshot, config
+        ).runtime_identity_fingerprint
+    )
 
     observations = {
         "infrastructure-latency": NormalizedObservation(

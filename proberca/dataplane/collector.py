@@ -312,8 +312,13 @@ def _resource_bindings(
     ))
 
 
-def _runtime_fingerprints(revision, monitored: set[str]) -> tuple[str, ...]:
+def _runtime_fingerprints(
+    revision, monitored: set[str],
+) -> tuple[tuple[str, ...], dict[str, list[str]]]:
     selected = []
+    selected_by_service: dict[str, set[str]] = {
+        service_id: set() for service_id in monitored
+    }
     services_with_runtime = set()
     for item in runtime_identities(revision):
         matches = monitored & set(item.service_ids)
@@ -325,12 +330,20 @@ def _runtime_fingerprints(revision, monitored: set[str]) -> tuple[str, ...]:
                 "monitored container runtime identity is incomplete or unready"
             )
         selected.append(item.identity_fingerprint)
+        for service_id in matches:
+            selected_by_service[service_id].add(item.identity_fingerprint)
         services_with_runtime.update(matches)
     if services_with_runtime != monitored:
         raise RawCollectionError(
             "monitored services lack exact ready runtime identities"
         )
-    return tuple(sorted(set(selected)))
+    return (
+        tuple(sorted(set(selected))),
+        {
+            service_id: sorted(identities)
+            for service_id, identities in sorted(selected_by_service.items())
+        },
+    )
 
 
 def build_topology_snapshot(
@@ -450,7 +463,7 @@ def build_topology_snapshot(
         "bindings": [item.to_dict() for item in bindings],
     }
     structure_fingerprint = fingerprint(structure)
-    runtime_fingerprints = _runtime_fingerprints(
+    runtime_fingerprints, runtime_fingerprints_by_service = _runtime_fingerprints(
         inventory_revision, monitored
     )
     resource_versions = {
@@ -484,6 +497,9 @@ def build_topology_snapshot(
         inventory_revision_id=inventory_revision.revision_id,
         resource_version_vector=resource_versions,
         runtime_identity_fingerprints=list(runtime_fingerprints),
+        service_runtime_identity_fingerprints=(
+            runtime_fingerprints_by_service
+        ),
         call_edge_provider_fingerprint=fingerprint({
             "edges": [item.to_dict() for item in call_edges],
             "raw_source_ids": list(

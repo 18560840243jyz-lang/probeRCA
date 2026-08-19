@@ -119,6 +119,14 @@ class LiveTopologyBuilder:
         }
         structure_fingerprint = canonical_hash(structure)
         identities = runtime_identities(revision)
+        identities_by_service: dict[str, set[str]] = {
+            service_id: set() for service_id in known_ids
+        }
+        for identity in identities:
+            for service_id in set(identity.service_ids) & known_ids:
+                identities_by_service[service_id].add(
+                    identity.identity_fingerprint
+                )
         snapshot_identity = {
             "structure": structure_fingerprint, "start": window_start_ns,
             "end": window_end_ns, "revision": revision.revision_id,
@@ -138,8 +146,18 @@ class LiveTopologyBuilder:
             inventory_revision_id=revision.revision_id,
             resource_version_vector={
                 item.resource_kind: item.resource_version for item in revision.resource_versions},
-            runtime_identity_fingerprints=sorted(
-                item.identity_fingerprint for item in identities),
+            runtime_identity_fingerprints=sorted({
+                identity_fingerprint
+                for identity_fingerprints in identities_by_service.values()
+                for identity_fingerprint in identity_fingerprints
+            }),
+            service_runtime_identity_fingerprints={
+                service_id: sorted(identity_fingerprints)
+                for service_id, identity_fingerprints in sorted(
+                    identities_by_service.items()
+                )
+                if identity_fingerprints
+            },
             call_edge_provider_fingerprint=(
                 canonical_hash(provider_fingerprints) if provider_fingerprints else None),
             topology_build_issues=list(revision.issues),

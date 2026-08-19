@@ -794,6 +794,9 @@ class TopologySnapshot(StrictRecord):
     inventory_revision_id: str | None = None
     resource_version_vector: dict[str, str] = field(default_factory=dict)
     runtime_identity_fingerprints: list[str] = field(default_factory=list)
+    service_runtime_identity_fingerprints: dict[str, list[str]] = field(
+        default_factory=dict
+    )
     call_edge_provider_fingerprint: str | None = None
     topology_build_issues: list[dict[str, Any]] = field(default_factory=list)
     record_type: str = field(default="topology_snapshot", init=False)
@@ -805,6 +808,15 @@ class TopologySnapshot(StrictRecord):
         "service_nodes": ServiceNodePlacement,
         "service_resources": ServiceResourceBinding,
     }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]):
+        """Read snapshots written before runtime identities were service-keyed."""
+        if not isinstance(payload, dict):
+            raise TypeError("TopologySnapshot payload must be a dictionary")
+        values = dict(payload)
+        values.setdefault("service_runtime_identity_fingerprints", {})
+        return super().from_dict(values)
 
     def __post_init__(self) -> None:
         _fixed_record_type(self.record_type, "topology_snapshot")
@@ -827,6 +839,37 @@ class TopologySnapshot(StrictRecord):
         _string_list("runtime_identity_fingerprints", self.runtime_identity_fingerprints)
         if len(self.runtime_identity_fingerprints) != len(set(self.runtime_identity_fingerprints)):
             raise ValueError("runtime_identity_fingerprints contains duplicates")
+        if not isinstance(self.service_runtime_identity_fingerprints, dict):
+            raise TypeError(
+                "service_runtime_identity_fingerprints must be a dictionary"
+            )
+        keyed_runtime_identities: set[str] = set()
+        for service_id, identities in (
+            self.service_runtime_identity_fingerprints.items()
+        ):
+            parts = service_id.split("::")
+            if len(parts) != 3 or parts[0] != self.cluster_id or any(
+                not part for part in parts
+            ):
+                raise ValueError(
+                    "service runtime identity key must be cluster::namespace::service"
+                )
+            _string_list(
+                f"service_runtime_identity_fingerprints[{service_id}]",
+                identities,
+            )
+            if not identities or len(identities) != len(set(identities)):
+                raise ValueError(
+                    "service runtime identity lists must be non-empty and unique"
+                )
+            keyed_runtime_identities.update(identities)
+        if (
+            self.service_runtime_identity_fingerprints
+            and keyed_runtime_identities != set(self.runtime_identity_fingerprints)
+        ):
+            raise ValueError(
+                "service-keyed runtime identities must cover the snapshot identities"
+            )
         if not isinstance(self.topology_build_issues, list) or any(
                 not isinstance(item, dict) or not item.get("reason_code")
                 for item in self.topology_build_issues):

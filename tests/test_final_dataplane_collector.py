@@ -814,6 +814,13 @@ def test_collector_builds_versioned_topology_and_seals(contract, tmp_path):
         "window_end_ns": END,
     })
     assert snapshot.snapshot_id != snapshot.structure_fingerprint
+    assert set(snapshot.service_runtime_identity_fingerprints) == {
+        f"{CLUSTER}::{NAMESPACE}::frontend",
+        f"{CLUSTER}::{NAMESPACE}::payment",
+    }
+    assert set().union(*map(
+        set, snapshot.service_runtime_identity_fingerprints.values()
+    )) == set(snapshot.runtime_identity_fingerprints)
     assert {
         item.metric_name for item in window.edge_metrics
     } == FORMAL_TCP_METRICS
@@ -1155,9 +1162,6 @@ def test_global_resource_watermark_change_does_not_fake_layout_change(
     )
     before = _revision("rv-1")
     after = _revision("rv-2")
-    for objects in after.objects_by_kind.values():
-        for raw in objects.values():
-            raw["metadata"]["resourceVersion"] = "rv-1"
     window = collector.assemble(
         raw_window=_raw_window(),
         inventory_at_start=before,

@@ -149,7 +149,9 @@ class RuntimeIdentityRecord:
             raise ValueError("invalid container_type")
         expected = canonical_hash({
             key: value for key, value in asdict(self).items()
-            if key not in {"identity_fingerprint", "observed_at_ns"}
+            if key not in {
+                "identity_fingerprint", "observed_at_ns", "resource_version",
+            }
         })
         if self.identity_fingerprint and self.identity_fingerprint != expected:
             raise ValueError("runtime identity fingerprint mismatch")
