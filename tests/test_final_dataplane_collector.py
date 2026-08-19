@@ -1766,7 +1766,8 @@ def test_prometheus_source_preserves_raw_boundary_series_identity():
     assert len(windows[1]) == 2
     assert session.ranges == [(1.0, 3.0, "1")]
     assert all(
-        "time() - timestamp(proberca_service_request_total)" in item
+        "timestamp(proberca_service_request_total) == time()" in item
+        and "time() - timestamp(proberca_service_request_total)" in item
         and "<= 2.000000000" in item
         for item in session.queries
     )

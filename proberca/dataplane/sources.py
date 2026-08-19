@@ -415,6 +415,7 @@ class PrometheusPrimitiveSource:
         maximum_age = float(self.config.maximum_sample_age_sec)
         fresh_promql = (
             f"({query.promql}) and "
+            f"(timestamp({query.promql}) == time()) and "
             f"((time() - timestamp({query.promql})) <= {maximum_age:.9f})"
         )
         started = time.perf_counter()
