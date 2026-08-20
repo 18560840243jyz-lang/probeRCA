@@ -1797,7 +1797,7 @@ def test_healthy_probe_cadence_is_explicit_and_reproducible():
         "probe_profiles", "deployments",
     }
     assert configuration["schema_version"] \
-        == "proberca-healthy-probe-cadence-v4"
+        == "proberca-healthy-probe-cadence-v5"
     assert configuration["namespace"] == "online-boutique"
     assert configuration["readiness_period_seconds"] == 1
     assert configuration["probe_profiles"] == {
@@ -1837,23 +1837,23 @@ def test_healthy_probe_cadence_is_explicit_and_reproducible():
             "limits": {"cpu": "500m", "memory": "128Mi"},
         },
         "checkoutservice": {
-            "requests": {"cpu": "100m", "memory": "64Mi"},
-            "limits": {"cpu": "300m", "memory": "128Mi"},
-        },
-        "currencyservice": {
-            "requests": {"cpu": "100m", "memory": "64Mi"},
-            "limits": {"cpu": "300m", "memory": "128Mi"},
-        },
-        "frontend": {
-            "requests": {"cpu": "100m", "memory": "64Mi"},
+            "requests": {"cpu": "150m", "memory": "64Mi"},
             "limits": {"cpu": "500m", "memory": "128Mi"},
         },
+        "currencyservice": {
+            "requests": {"cpu": "150m", "memory": "64Mi"},
+            "limits": {"cpu": "500m", "memory": "128Mi"},
+        },
+        "frontend": {
+            "requests": {"cpu": "300m", "memory": "64Mi"},
+            "limits": {"cpu": "1000m", "memory": "128Mi"},
+        },
         "productcatalogservice": {
-            "requests": {"cpu": "100m", "memory": "64Mi"},
-            "limits": {"cpu": "400m", "memory": "128Mi"},
+            "requests": {"cpu": "200m", "memory": "64Mi"},
+            "limits": {"cpu": "600m", "memory": "128Mi"},
         },
         "recommendationservice": {
-            "requests": {"cpu": "100m", "memory": "220Mi"},
+            "requests": {"cpu": "200m", "memory": "220Mi"},
             "limits": {"cpu": "500m", "memory": "450Mi"},
         },
     }

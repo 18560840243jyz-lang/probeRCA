@@ -143,7 +143,7 @@ def _configure_healthy_probe_cadence(repository: Path) -> None:
     }:
         raise SystemExit("healthy probe cadence fields are not frozen")
     if configuration["schema_version"] \
-            != "proberca-healthy-probe-cadence-v4":
+            != "proberca-healthy-probe-cadence-v5":
         raise SystemExit("healthy probe cadence schema is unsupported")
     namespace = configuration["namespace"]
     readiness_period_seconds = configuration[

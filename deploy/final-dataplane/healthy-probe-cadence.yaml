@@ -1,4 +1,4 @@
-schema_version: proberca-healthy-probe-cadence-v4
+schema_version: proberca-healthy-probe-cadence-v5
 namespace: online-boutique
 readiness_period_seconds: 1
 probe_profiles:
@@ -31,10 +31,10 @@ deployments:
     probe_profile: default
     capacity_resources:
       requests:
-        cpu: 100m
+        cpu: 150m
         memory: 64Mi
       limits:
-        cpu: 300m
+        cpu: 500m
         memory: 128Mi
   currencyservice:
     container: server
@@ -42,10 +42,10 @@ deployments:
     probe_profile: default
     capacity_resources:
       requests:
-        cpu: 100m
+        cpu: 150m
         memory: 64Mi
       limits:
-        cpu: 300m
+        cpu: 500m
         memory: 128Mi
   emailservice:
     service_contract:
@@ -89,10 +89,10 @@ deployments:
     probe_profile: default
     capacity_resources:
       requests:
-        cpu: 100m
+        cpu: 300m
         memory: 64Mi
       limits:
-        cpu: 500m
+        cpu: 1000m
         memory: 128Mi
   paymentservice:
     container: server
@@ -104,10 +104,10 @@ deployments:
     probe_profile: default
     capacity_resources:
       requests:
-        cpu: 100m
+        cpu: 200m
         memory: 64Mi
       limits:
-        cpu: 400m
+        cpu: 600m
         memory: 128Mi
   recommendationservice:
     container: server
@@ -115,7 +115,7 @@ deployments:
     probe_profile: default
     capacity_resources:
       requests:
-        cpu: 100m
+        cpu: 200m
         memory: 220Mi
       limits:
         cpu: 500m
