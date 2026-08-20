@@ -349,6 +349,8 @@ def assert_current_readiness_handshake(
         "scale_config_fingerprint": (
             config.scale_config_fingerprint
         ),
+        "load_profile_id": config.load_profile_id,
+        "load_profile_fingerprint": config.load_profile_fingerprint,
     }
     mismatched = [
         name for name, value in expected.items()
@@ -1114,6 +1116,8 @@ def main() -> int:
                 "calibration_fingerprint",
                 "topology_fingerprint",
                 "runtime_identity_fingerprint",
+                "load_profile_id",
+                "load_profile_fingerprint",
             )
         },
         "topology_snapshot_id": readiness["topology_snapshot_id"],

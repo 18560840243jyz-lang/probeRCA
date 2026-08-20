@@ -23,18 +23,23 @@ experimental_dns:
   archived_diagnostics_compatible: true
 exclusion_policy: exclusions_are_fixed_before_fault_selection
 missing_value_policy: zero_coverage_remains_null_and_is_never_imputed
-load_profile: single-vm-healthy-v7
+load_profile: single-vm-qualified-55
+load_profile_fingerprint: d3f0bffc6c26cb4d3f837d66eb62b5e377bae78b97522c5cefa75f3f0c2ee848
+load_profile_config: configs/final_healthy_load_profiles.yaml
 load_manifest: deploy/final-dataplane/healthy-calibration-load.yaml
 checkout_load_replicas: 3
 checkout_interval_pattern_seconds:
-- 0.07
-- 0.08
-- 0.09
-- 0.075
-- 0.085
+- 0.127273
+- 0.145455
+- 0.163636
+- 0.136364
+- 0.154545
 direct_rpc_load_replicas: 1
-direct_rpc_period_seconds: 0.12
+direct_rpc_period_seconds: 0.218182
 direct_rpc_workers_per_service: 3
+online_boutique_loadgenerator_replicas: 1
+online_boutique_loadgenerator_users: 28
+online_boutique_loadgenerator_rate: 1
 direct_rpc_services:
 - adservice
 - cartservice
@@ -45,14 +50,12 @@ direct_rpc_services:
 - recommendationservice
 - shippingservice
 load_adjustment_reason: >-
-  Three independent sequential checkout clients preserve the real business
-  path. A separate fixed-rate label-free RPC workload keeps the service P95
-  sample count above the quantile-derived alert eligibility floor without
-  changing any validity or alert threshold. Checkout replicas are dephased by
-  immutable Pod identity, and direct RPC workers are evenly phase-distributed
-  across the unchanged period. Missed RPC deadlines are not replayed as a
-  catch-up burst. The RPC workload is not a formal service or edge and is
-  excluded from root-cause scope.
+  The 55-percent profile is the highest of the independently measured 25,
+  40, and 55 percent candidates that passed complete Normal/Burst collection,
+  stable topology/runtime identity, zero Pod restarts, zero Confirmed Hard
+  episodes, and per-coordinate projection to the frozen 600-window Baseline
+  and A_v requirements. The three workload components retain the same
+  structure, while their rates are controlled only by the frozen profile.
 primitive_exporter_schema: probeRCA-final-primitive-exporter-v5
 live_collector_schema: probeRCA-final-live-collector-v2
 container_resource_source: direct_cgroup_v2

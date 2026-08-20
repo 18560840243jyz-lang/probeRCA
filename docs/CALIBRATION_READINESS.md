@@ -2,8 +2,11 @@
 
 本文档只描述最终数据面/控制面路径中的校准有效性规则。它不改变正式告警规则：
 
-- Soft：同一实体的症状分数连续 3 个 1 秒窗口不低于 3。
-- Hard：同一实体的症状分数连续 2 个 1 秒窗口不低于 5。
+- Soft：同一实体的症状分数连续 3 个 1 秒窗口不低于 3，只作为健康质量诊断。
+- Hard Candidate：同一实体的症状分数连续 2 个 1 秒窗口不低于 5，只记录诊断。
+- Confirmed Hard：同一实体的症状分数连续 3 个 1 秒窗口不低于 5；只有它进入
+  Hard、触发正式RCA，并使Healthy Validation失败。单条正式TCP边可以独立确认，
+  不要求多实体佐证。
 
 ## 有效观测
 
@@ -91,7 +94,8 @@ STARTING -> CALIBRATING -> READY -> Healthy/Soft/Hard/Recovery
 3. `A_s` Ready；
 4. 计划范围内所有根因坐标的 `A_v` Ready；
 5. 拓扑和实体映射完整；
-6. 连续健康验证窗口没有伪 Soft/Hard。
+6. 至少300个独立Healthy Validation窗口中没有Confirmed Hard；Soft和Hard
+   Candidate分别汇总episode、持续时间与最高分，但不单独使READY失败。
 
 控制面输出目录包含：
 

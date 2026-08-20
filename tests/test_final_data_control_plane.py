@@ -148,9 +148,14 @@ def _config() -> FinalControlConfig:
         calibration_required_root_coordinates=(
             _required_root_coordinates()
         ),
+        load_profile_id="test-healthy-profile",
+        load_profile_fingerprint=fingerprint({
+            "profile": "test-healthy-profile",
+        }),
         soft_threshold=2.0,
         soft_consecutive_windows=1,
         hard_threshold=4.0,
+        hard_candidate_windows=1,
         hard_consecutive_windows=2,
         recovery_threshold=0.5,
         recovery_windows=2,
@@ -836,7 +841,7 @@ def test_service_quantile_reliability_filters_alerts_without_hiding_exposure():
         assert service_scores == {}
         assert edge_scores == {}
         for _ in range(config.soft_consecutive_windows):
-            soft, hard = control._advance_alert_counters(
+            soft, _candidate, hard = control._advance_alert_counters(
                 service_scores, edge_scores,
             )
             assert soft == set()
@@ -858,12 +863,12 @@ def test_service_quantile_reliability_filters_alerts_without_hiding_exposure():
     service_scores, edge_scores = control._scores(high_observations, graph)
     assert service_scores[service] >= config.soft_threshold
     for _ in range(config.soft_consecutive_windows - 1):
-        soft, hard = control._advance_alert_counters(
+        soft, _candidate, hard = control._advance_alert_counters(
             service_scores, edge_scores,
         )
         assert ("service", service) not in soft
         assert ("service", service) not in hard
-    soft, hard = control._advance_alert_counters(
+    soft, _candidate, hard = control._advance_alert_counters(
         service_scores, edge_scores,
     )
     assert ("service", service) in soft
@@ -980,7 +985,9 @@ def test_edge_quantile_reliability_uses_the_same_rule_as_service_latency():
         _, edge_scores = control._scores(low_observations, graph)
         assert edge_scores == {edge: 0.0}
         for _ in range(config.soft_consecutive_windows):
-            soft, hard = control._advance_alert_counters({}, edge_scores)
+            soft, _candidate, hard = control._advance_alert_counters(
+                {}, edge_scores,
+            )
             assert soft == set()
             assert hard == set()
 
@@ -1004,10 +1011,19 @@ def test_edge_quantile_reliability_uses_the_same_rule_as_service_latency():
     failure_control = FinalControlPlane(config)
     _, failure_scores = failure_control._scores(failure_observations, graph)
     assert failure_scores[edge] >= config.hard_threshold
-    soft, hard = failure_control._advance_alert_counters({}, failure_scores)
+    soft, _candidate, hard = failure_control._advance_alert_counters(
+        {}, failure_scores,
+    )
     assert soft == set()
     assert hard == set()
-    _, hard = failure_control._advance_alert_counters({}, failure_scores)
+    _, candidate, hard = failure_control._advance_alert_counters(
+        {}, failure_scores,
+    )
+    assert ("edge", edge) in candidate
+    assert hard == set()
+    _, candidate, hard = failure_control._advance_alert_counters(
+        {}, failure_scores,
+    )
     assert ("edge", edge) in hard
 
     high_latency = replace(latency, sample_count=20)
@@ -1027,10 +1043,12 @@ def test_edge_quantile_reliability_uses_the_same_rule_as_service_latency():
     _, edge_scores = control._scores(high_observations, graph)
     assert edge_scores[edge] >= config.soft_threshold
     for _ in range(config.soft_consecutive_windows - 1):
-        soft, hard = control._advance_alert_counters({}, edge_scores)
+        soft, _candidate, hard = control._advance_alert_counters(
+            {}, edge_scores,
+        )
         assert ("edge", edge) not in soft
         assert ("edge", edge) not in hard
-    soft, hard = control._advance_alert_counters({}, edge_scores)
+    soft, _candidate, hard = control._advance_alert_counters({}, edge_scores)
     assert ("edge", edge) in soft
     assert ("edge", edge) not in hard
 
@@ -1544,6 +1562,9 @@ def test_calibration_and_healthy_validation_are_independent_and_frozen(
     assert report["healthy_validation_result"] == "passed"
     assert report["healthy_validation_windows"] == 1
     assert report["healthy_validation_alerts"] == []
+    assert report["healthy_validation_soft_episodes"] == []
+    assert report["healthy_validation_hard_candidate_episodes"] == []
+    assert report["healthy_validation_confirmed_hard_episodes"] == []
     assert report["calibration_learning_complete"] is True
     assert report["baseline_ready_count"] \
         == report["baseline_required_count"]
@@ -1579,7 +1600,12 @@ def test_calibration_and_healthy_validation_are_independent_and_frozen(
 def test_sustained_alert_during_healthy_validation_blocks_ready(
     tmp_path,
 ):
-    config = replace(_config(), calibration_validation_windows=5)
+    config = replace(
+        _config(),
+        calibration_validation_windows=6,
+        hard_candidate_windows=2,
+        hard_consecutive_windows=3,
+    )
     writer = CollectionArchiveWriter(
         tmp_path / "validation-false-alarm",
         dataset_id=fingerprint({"dataset": "validation-false-alarm"}),
@@ -1587,7 +1613,7 @@ def test_sustained_alert_during_healthy_validation_blocks_ready(
         source_description=config.collection_contract["source_description"],
         collection_metadata=_collection_metadata(config),
     )
-    for sequence in range(1, 13):
+    for sequence in range(1, 14):
         writer.append(_window(sequence))
 
     control = FinalControlPlane(config)
@@ -1599,7 +1625,91 @@ def test_sustained_alert_during_healthy_validation_blocks_ready(
     assert report["state"] == "healthy_validating"
     assert report["healthy_validation_result"] == "failed"
     assert report["healthy_validation_alerts"]
+    assert report["healthy_validation_hard_candidate_episodes"]
+    assert report["healthy_validation_confirmed_hard_episodes"]
     assert set(map(len, control.baseline.snapshot().values())) == {6}
+
+
+def test_hard_candidate_is_diagnostic_during_healthy_validation(tmp_path):
+    config = replace(
+        _config(),
+        calibration_validation_windows=5,
+        hard_candidate_windows=2,
+        hard_consecutive_windows=3,
+    )
+    writer = CollectionArchiveWriter(
+        tmp_path / "validation-hard-candidate",
+        dataset_id=fingerprint({"dataset": "validation-hard-candidate"}),
+        collection_contract=config.collection_contract,
+        source_description=config.collection_contract["source_description"],
+        collection_metadata=_collection_metadata(config),
+    )
+    for sequence in range(1, 13):
+        writer.append(_window(sequence))
+
+    report = FinalControlPlane(config).run(writer.seal()).calibration_readiness
+
+    assert report["ready"] is True
+    assert report["healthy_validation_result"] == "passed"
+    assert report["healthy_validation_hard_candidate_episodes"]
+    assert report["healthy_validation_confirmed_hard_episodes"] == []
+
+
+def test_hard_candidate_does_not_confirm_until_third_window():
+    control = FinalControlPlane(FinalControlConfig())
+    edge_id = "cluster::ns::caller->callee::tcp"
+
+    _soft, candidates, confirmed = control._advance_alert_counters(
+        {}, {edge_id: 5.1},
+    )
+    assert candidates == set()
+    assert confirmed == set()
+
+    _soft, candidates, confirmed = control._advance_alert_counters(
+        {}, {edge_id: 5.2},
+    )
+    assert candidates == {("edge", edge_id)}
+    assert confirmed == set()
+    assert control.state == "starting"
+
+    _soft, candidates, confirmed = control._advance_alert_counters(
+        {}, {edge_id: 5.3},
+    )
+    assert candidates == {("edge", edge_id)}
+    assert confirmed == {("edge", edge_id)}
+
+
+def test_soft_episode_is_diagnostic_during_healthy_validation(tmp_path):
+    config = replace(
+        _config(),
+        calibration_validation_windows=5,
+        hard_threshold=100.0,
+        hard_candidate_windows=2,
+        hard_consecutive_windows=3,
+    )
+    writer = CollectionArchiveWriter(
+        tmp_path / "validation-soft-diagnostic",
+        dataset_id=fingerprint({"dataset": "validation-soft-diagnostic"}),
+        collection_contract=config.collection_contract,
+        source_description=config.collection_contract["source_description"],
+        collection_metadata=_collection_metadata(config),
+    )
+    for sequence in range(1, 13):
+        writer.append(_window(sequence))
+
+    control = FinalControlPlane(config)
+    report = control.run(writer.seal()).calibration_readiness
+
+    assert report["ready"] is True
+    assert report["healthy_validation_result"] == "passed"
+    assert report["healthy_validation_alerts"] == []
+    assert report["healthy_validation_confirmed_hard_episodes"] == []
+    assert report["healthy_validation_soft_episode_count"] >= 1
+    episode = report["healthy_validation_soft_episodes"][0]
+    assert episode["entity_type"] == "service"
+    assert episode["episode_number"] == 1
+    assert episode["duration_windows"] >= 1
+    assert episode["maximum_score"] >= config.soft_threshold
 
 
 def test_fault_runner_requires_current_readiness_fingerprint_handshake(
@@ -1630,6 +1740,8 @@ def test_fault_runner_requires_current_readiness_fingerprint_handshake(
         "scale_config_fingerprint": (
             config.scale_config_fingerprint
         ),
+        "load_profile_id": config.load_profile_id,
+        "load_profile_fingerprint": config.load_profile_fingerprint,
         "topology_fingerprint": graph.topology_fingerprint,
         "runtime_identity_fingerprint": (
             graph.runtime_identity_fingerprint
@@ -1865,7 +1977,11 @@ def test_call_identity_stays_directed_but_service_mask_is_bidirectional():
 def test_formal_alert_defaults_and_per_entity_consecutive_state():
     config = FinalControlConfig()
     assert (config.soft_threshold, config.soft_consecutive_windows) == (3.0, 3)
-    assert (config.hard_threshold, config.hard_consecutive_windows) == (5.0, 2)
+    assert (
+        config.hard_threshold,
+        config.hard_candidate_windows,
+        config.hard_consecutive_windows,
+    ) == (5.0, 2, 3)
     assert config.calibration_required_root_coordinates == ()
     assert all(
         value is None
@@ -1875,19 +1991,35 @@ def test_formal_alert_defaults_and_per_entity_consecutive_state():
     service_a = "cluster::ns::a"
     service_b = "cluster::ns::b"
 
-    soft, hard = control._advance_alert_counters({service_a: 4.0}, {})
+    soft, _candidate, hard = control._advance_alert_counters(
+        {service_a: 4.0}, {},
+    )
     assert not soft and not hard
-    soft, hard = control._advance_alert_counters({service_b: 4.0}, {})
+    soft, _candidate, hard = control._advance_alert_counters(
+        {service_b: 4.0}, {},
+    )
     assert not soft and not hard
-    soft, hard = control._advance_alert_counters({service_a: 4.0}, {})
+    soft, _candidate, hard = control._advance_alert_counters(
+        {service_a: 4.0}, {},
+    )
     assert not soft and not hard
 
     control = FinalControlPlane(config)
-    soft, hard = control._advance_alert_counters({}, {"edge-a": 6.0})
+    soft, candidate, hard = control._advance_alert_counters(
+        {}, {"edge-a": 6.0},
+    )
+    assert not candidate
     assert not hard
-    soft, hard = control._advance_alert_counters({}, {"edge-a": 6.0})
+    soft, candidate, hard = control._advance_alert_counters(
+        {}, {"edge-a": 6.0},
+    )
+    assert ("edge", "edge-a") in candidate
+    assert ("edge", "edge-a") not in hard
+    soft, candidate, hard = control._advance_alert_counters(
+        {}, {"edge-a": 6.0},
+    )
     assert ("edge", "edge-a") in hard
-    assert ("edge", "edge-a") not in soft
+    assert ("edge", "edge-a") in soft
 
 
 def test_metric_unit_kind_and_p95_aggregation_semantics_fail_closed(tmp_path):
@@ -2665,14 +2797,16 @@ def test_frozen_scope_excludes_infrastructure_from_models_and_alerts():
     assert service_scores[frontend] == pytest.approx(6.0)
     assert edge_scores == {}
     for _ in range(2):
-        soft, hard = control._advance_alert_counters(
+        soft, candidate, hard = control._advance_alert_counters(
             service_scores, edge_scores,
         )
-    assert ("service", frontend) in hard
-    assert ("service", infrastructure) not in hard
-    soft, hard = control._advance_alert_counters(
+    assert ("service", frontend) in candidate
+    assert ("service", frontend) not in hard
+    soft, candidate, hard = control._advance_alert_counters(
         service_scores, edge_scores,
     )
+    assert ("service", frontend) in hard
+    assert ("service", infrastructure) not in hard
     assert ("service", frontend) in soft
     assert ("service", infrastructure) not in soft
 
@@ -2762,10 +2896,11 @@ def test_dns_anomaly_is_marked_excluded_and_cannot_alert():
     service_scores, edge_scores = control._scores(observations, graph)
     assert service_scores == {}
     assert edge_scores == {}
-    soft, hard = control._advance_alert_counters(
+    soft, candidate, hard = control._advance_alert_counters(
         service_scores, edge_scores,
     )
     assert soft == set()
+    assert candidate == set()
     assert hard == set()
 
 
@@ -2827,19 +2962,33 @@ def test_tcp_edge_still_triggers_soft_and_hard_independently():
     tcp_edge = "cluster::ns::caller->callee::tcp"
 
     for _ in range(2):
-        soft, hard = control._advance_alert_counters(
+        soft, candidate, hard = control._advance_alert_counters(
             {}, {tcp_edge: 3.5},
         )
         assert ("edge", tcp_edge) not in soft
+        assert ("edge", tcp_edge) not in candidate
         assert ("edge", tcp_edge) not in hard
-    soft, hard = control._advance_alert_counters({}, {tcp_edge: 3.5})
+    soft, candidate, hard = control._advance_alert_counters(
+        {}, {tcp_edge: 3.5},
+    )
     assert ("edge", tcp_edge) in soft
+    assert ("edge", tcp_edge) not in candidate
     assert ("edge", tcp_edge) not in hard
 
     control = FinalControlPlane(FinalControlConfig())
-    soft, hard = control._advance_alert_counters({}, {tcp_edge: 6.0})
+    soft, candidate, hard = control._advance_alert_counters(
+        {}, {tcp_edge: 6.0},
+    )
+    assert ("edge", tcp_edge) not in candidate
     assert ("edge", tcp_edge) not in hard
-    soft, hard = control._advance_alert_counters({}, {tcp_edge: 6.0})
+    soft, candidate, hard = control._advance_alert_counters(
+        {}, {tcp_edge: 6.0},
+    )
+    assert ("edge", tcp_edge) in candidate
+    assert ("edge", tcp_edge) not in hard
+    soft, candidate, hard = control._advance_alert_counters(
+        {}, {tcp_edge: 6.0},
+    )
     assert ("edge", tcp_edge) in hard
 
 

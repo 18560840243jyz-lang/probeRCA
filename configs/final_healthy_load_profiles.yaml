@@ -1,0 +1,81 @@
+schema_version: probeRCA-healthy-load-profiles-v1
+status: frozen
+namespace: online-boutique
+selected_profile_id: single-vm-qualified-55
+selected_profile_fingerprint: d3f0bffc6c26cb4d3f837d66eb62b5e377bae78b97522c5cefa75f3f0c2ee848
+qualification:
+  duration_windows: 300
+  provisional_baseline_windows: 120
+profiles:
+- profile_id: single-vm-qualified-25
+  scale_percent: 25
+  workloads:
+  - workload_id: checkout
+    deployment: proberca-healthy-checkout-load
+    container: checkout-load
+    replicas: 3
+    environment:
+      INTERVAL_PATTERN_SECONDS: 0.28,0.32,0.36,0.30,0.34
+      PHASE_SECONDS: '20'
+  - workload_id: direct-rpc
+    deployment: proberca-healthy-rpc-load
+    container: rpc-load
+    replicas: 1
+    environment:
+      PERIOD_SECONDS: '0.48'
+      WORKERS_PER_SERVICE: '3'
+  - workload_id: online-boutique
+    deployment: loadgenerator
+    container: main
+    replicas: 1
+    environment:
+      RATE: '1'
+      USERS: '13'
+- profile_id: single-vm-qualified-40
+  scale_percent: 40
+  workloads:
+  - workload_id: checkout
+    deployment: proberca-healthy-checkout-load
+    container: checkout-load
+    replicas: 3
+    environment:
+      INTERVAL_PATTERN_SECONDS: 0.175,0.20,0.225,0.1875,0.2125
+      PHASE_SECONDS: '20'
+  - workload_id: direct-rpc
+    deployment: proberca-healthy-rpc-load
+    container: rpc-load
+    replicas: 1
+    environment:
+      PERIOD_SECONDS: '0.30'
+      WORKERS_PER_SERVICE: '3'
+  - workload_id: online-boutique
+    deployment: loadgenerator
+    container: main
+    replicas: 1
+    environment:
+      RATE: '1'
+      USERS: '20'
+- profile_id: single-vm-qualified-55
+  scale_percent: 55
+  workloads:
+  - workload_id: checkout
+    deployment: proberca-healthy-checkout-load
+    container: checkout-load
+    replicas: 3
+    environment:
+      INTERVAL_PATTERN_SECONDS: 0.127273,0.145455,0.163636,0.136364,0.154545
+      PHASE_SECONDS: '20'
+  - workload_id: direct-rpc
+    deployment: proberca-healthy-rpc-load
+    container: rpc-load
+    replicas: 1
+    environment:
+      PERIOD_SECONDS: '0.218182'
+      WORKERS_PER_SERVICE: '3'
+  - workload_id: online-boutique
+    deployment: loadgenerator
+    container: main
+    replicas: 1
+    environment:
+      RATE: '1'
+      USERS: '28'

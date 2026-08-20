@@ -29,7 +29,7 @@ def load_ready_calibration_report(path: str | Path) -> dict[str, Any]:
         raise CalibrationNotReadyError(
             "calibration readiness report must contain an object"
         )
-    if report.get("schema_version") != "probeRCA-calibration-readiness-v1":
+    if report.get("schema_version") != "probeRCA-calibration-readiness-v4":
         raise CalibrationNotReadyError(
             "unsupported calibration readiness schema"
         )
@@ -85,9 +85,24 @@ def load_ready_calibration_report(path: str | Path) -> dict[str, Any]:
             "healthy validation window requirement is not satisfied"
         )
     if report.get("healthy_validation_result") != "passed" \
-            or report.get("healthy_validation_alerts") != []:
+            or report.get("healthy_validation_confirmed_hard_episodes") != []:
         raise CalibrationNotReadyError(
             "independent healthy validation did not pass"
+        )
+    load_profile_id = report.get("load_profile_id")
+    load_profile_fingerprint = report.get("load_profile_fingerprint")
+    if not isinstance(load_profile_id, str) \
+            or not load_profile_id \
+            or load_profile_id == "unconfigured" \
+            or not isinstance(load_profile_fingerprint, str) \
+            or len(load_profile_fingerprint) != 64 \
+            or load_profile_fingerprint == "0" * 64 \
+            or any(
+                character not in "0123456789abcdef"
+                for character in load_profile_fingerprint
+            ):
+        raise CalibrationNotReadyError(
+            "calibration load profile provenance is incomplete"
         )
     topology_epoch = report.get("topology_epoch")
     if not report.get("snapshot_id") \

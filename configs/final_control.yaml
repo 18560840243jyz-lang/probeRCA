@@ -24,6 +24,8 @@ metric_rank_tolerance: 1.0e-10
 metric_max_condition_number: 100000000.0
 calibration_learning_windows: 600
 calibration_validation_windows: 300
+load_profile_id: single-vm-qualified-55
+load_profile_fingerprint: d3f0bffc6c26cb4d3f837d66eb62b5e377bae78b97522c5cefa75f3f0c2ee848
 calibration_required_entity_types:
 - edge
 - host
@@ -134,7 +136,8 @@ alpha_failure: 0.5
 soft_threshold: 3.0
 soft_consecutive_windows: 3
 hard_threshold: 5.0
-hard_consecutive_windows: 2
+hard_candidate_windows: 2
+hard_consecutive_windows: 3
 recovery_threshold: 1.0
 recovery_windows: 2
 candidate_hops: 2

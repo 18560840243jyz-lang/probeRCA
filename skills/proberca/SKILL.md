@@ -80,7 +80,7 @@ Burst直接证据：
         ↓
 9. 用事故前健康数据学习指标级传播矩阵 Av
         ↓
-10. Hard Alert后开启候选范围内的Burst探针
+10. Confirmed Hard Alert后开启候选范围内的Burst探针
         ↓
 11. 只减去健康跨指标传播，得到联合残差
         ↓
@@ -896,19 +896,21 @@ Soft阶段执行：
 使用Soft之前的健康缓存学习指标级 (A_v)。
 
 
-8.3 Hard Alert
+8.3 Hard Candidate与Confirmed Hard Alert
 服务或有向TCP边满足：
 [
 \boxed{
 \mathrm{score}_e(t)\ge\tau_{\mathrm{hard}}=5
 }
 ]
-并且同一实体连续2个1秒窗口达到阈值后进入Hard Alert。
+同一实体连续2个1秒窗口达到阈值时只形成Hard Candidate并记录诊断；同一实体
+连续3个1秒窗口达到阈值时才形成Confirmed Hard并进入Hard Alert。单个正式服务、
+主机或有向TCP边都可以独立确认，不要求其它实体同时异常。
 其中：
 [
 \tau_{\mathrm{hard}}>\tau_{\mathrm{soft}}
 ]
-Hard阶段执行：
+只有Confirmed Hard阶段执行：
 
 冻结 (A_v)；
 
@@ -2242,7 +2244,8 @@ CALIBRATING阶段：
 3. (A_s) Ready；
 4. 计划故障范围内的(A_v)根因坐标全部Ready；
 5. 拓扑和身份映射完整；
-6. 连续健康验证窗口没有伪Soft或Hard。
+6. 至少300个连续健康验证窗口没有Confirmed Hard；Soft和Hard Candidate只记录
+   episode数量、持续时间和最高分，不单独使READY失败。
 
 若Hard后候选模型意外不Ready，必须输出：
 
@@ -2292,9 +2295,19 @@ TCP边独立告警
   -> (src_service -> dst_service, TCP)
 ```
 
-## 健康负载工程约束
+## 健康负载资格验证与冻结约束
 
-- 冻结健康负载的请求路径、副本数、周期和标称速率不得为消除告警而降低。
+- 健康负载不得在资格验证前冻结。必须先使用同一流量构成的25%、40%、55%三个
+  配置profile各运行300个健康窗口，即使低档失败也必须独立完成其余档位。
+- 每个正式坐标按其300窗实际有效样本率或`A_v`有效训练行率投影到600窗，并与
+  该坐标的精确Baseline/`A_v`最低要求的2倍比较；禁止使用统一固定覆盖窗数。
+- Confirmed Hard、拓扑/运行身份变化、Pod新增重启或正式坐标投影不足会使profile
+  失败；Soft和Hard Candidate只作为诊断。
+- 从通过的profile中选择负载最高者，冻结全部请求参数与fingerprint。当前正式
+  单机profile是`single-vm-qualified-55`，fingerprint为
+  `d3f0bffc6c26cb4d3f837d66eb62b5e377bae78b97522c5cefa75f3f0c2ee848`。
+- 冻结后的请求路径、副本数、周期和标称速率必须在最终Healthy Pilot和正式单机
+  故障实验中保持一致；任何变更都产生新fingerprint并重新运行独立Healthy Pilot。
 - 独立负载worker必须在固定周期内均匀错相，不能在同一相位同步制造人为突发。
 - 单次请求延迟超过周期时不得补发错过的请求形成追赶风暴；下一次请求从新的正常周期继续。
 - 错相只允许使用运行身份生成初始相位，不得携带故障标签，也不得进入RCA特征。

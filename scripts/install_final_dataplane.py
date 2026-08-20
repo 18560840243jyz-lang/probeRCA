@@ -19,6 +19,11 @@ from typing import Any
 
 import yaml
 
+from proberca.load_profiles import (
+    HealthyLoadProfiles,
+    kubectl_profile_commands,
+)
+
 
 REQUIRED_REPOSITORY = Path("/home/jyz/probeRCA")
 PROMETHEUS_CONFIG = Path("/etc/prometheus/prometheus.yml")
@@ -32,6 +37,17 @@ def _run(arguments: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
 def _require_root() -> None:
     if os.geteuid() != 0:
         raise SystemExit("install_final_dataplane.py must run as root")
+
+
+def _apply_frozen_healthy_load_profile(repository: Path) -> None:
+    profiles = HealthyLoadProfiles.load(
+        repository / "configs/final_healthy_load_profiles.yaml"
+    )
+    if profiles.status != "frozen":
+        raise SystemExit("formal installer requires a frozen load profile")
+    selected = profiles.selected()
+    for command in kubectl_profile_commands(profiles, selected):
+        _run(list(command))
 
 
 def _find_bpftool() -> str:
@@ -479,6 +495,7 @@ def install(repository: Path) -> None:
         "deployment/proberca-healthy-rpc-load",
         "--timeout=120s",
     ])
+    _apply_frozen_healthy_load_profile(repository)
     _run([
         "kubectl",
         "--kubeconfig", "/home/jyz/.kube/config",

@@ -202,9 +202,13 @@ root-eligible, or required for Readiness.
 The final normal metric contract is `9/4/3`: nine metrics per service, four
 metrics per host, and three metrics per directed TCP edge
 (`count`, `latency_p95`, and `failure_rate`). TCP edge alert state is
-independent from its endpoint services. Default edge alert rules remain Soft
-at score `>=3` for three consecutive one-second windows and Hard at score
-`>=5` for two consecutive one-second windows.
+independent from its endpoint services. Soft remains score `>=3` for three
+consecutive one-second windows. Score `>=5` for two consecutive one-second
+windows is a **Hard Candidate** diagnostic only. A **Confirmed Hard** requires
+score `>=5` for three consecutive one-second windows; only Confirmed Hard enters
+the Hard state, starts formal RCA, or fails Healthy Validation. A single formal
+TCP edge may independently produce either state; multi-entity corroboration is
+not required.
 
 The directed TCP edge path remains:
 
@@ -277,14 +281,27 @@ is retained as `value=null`, `valid=false`, with
 is imputed. The next window recovers only after both boundaries are present.
 Negative deltas remain hard lifecycle violations.
 
-## Healthy Load Phase Distribution Decision
+## Healthy Load Qualification and Freeze Decision
 
-The frozen single-VM healthy load preserves its request paths, replica counts,
-periods, and nominal rates, but it must not synchronize independent clients into
-artificial bursts. Checkout replicas use immutable Pod identity only to derive an
-initial phase offset. Direct RPC workers are evenly phase-distributed across the
-existing period, and a delayed call does not replay missed deadlines as a
-catch-up burst. This changes neither RCA inputs nor alert thresholds; it removes
-an experiment-driver artifact that produced real queueing and TCP retransmission
-during otherwise fault-free validation. Any future timing change must bump the
-load-profile identifier and be validated by a new independent Healthy Pilot.
+The single-VM healthy workload is not frozen before it has been qualified. Three
+configuration-defined profiles preserving the same traffic composition are run
+independently for 300 healthy one-second windows at approximately 25%, 40%, and
+55% of the previous aggregate load. All profiles are evaluated even when a lower
+profile fails. Qualification uses the production Baseline and per-target `A_v`
+Readiness implementations: each coordinate's observed valid-sample or valid-row
+rate is projected from 300 to 600 calibration windows and compared with twice
+that coordinate's exact minimum. There is no flat global coverage count.
+
+A profile fails on any Confirmed Hard episode, topology/runtime change, Pod
+restart, or projected required coordinate that cannot meet its formal minimum.
+Soft and Hard Candidate episodes are diagnostic. From all passing profiles, the
+highest load is selected and its complete parameters and fingerprint are frozen.
+The selected single-VM profile is `single-vm-qualified-55`, fingerprint
+`d3f0bffc6c26cb4d3f837d66eb62b5e377bae78b97522c5cefa75f3f0c2ee848`.
+
+The frozen profile preserves request paths and phase-distributes independent
+clients. Delayed calls do not replay missed deadlines as a catch-up burst. The
+same fingerprint is required for the final Healthy Pilot and subsequent formal
+single-VM fault experiments. Any future workload change creates a new profile
+fingerprint and requires a new independent Healthy Pilot; it does not authorize
+changes to RCA mathematics, Soft/Hard scores, or P95 validity rules.

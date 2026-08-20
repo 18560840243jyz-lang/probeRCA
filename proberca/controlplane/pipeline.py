@@ -99,6 +99,18 @@ class FinalControlPlane:
         self._calibration_validation_count = 0
         self._healthy_validation_failed = False
         self._healthy_validation_alerts = []
+        self._healthy_validation_soft_episodes = []
+        self._healthy_validation_hard_candidate_episodes = []
+        self._healthy_validation_hard_episodes = []
+        self._validation_soft_active = {}
+        self._validation_hard_candidate_active = {}
+        self._validation_hard_active = {}
+        self._validation_soft_run_max = {}
+        self._validation_hard_candidate_run_max = {}
+        self._validation_hard_run_max = {}
+        self._validation_soft_run_role_max = {}
+        self._validation_hard_candidate_run_role_max = {}
+        self._validation_hard_run_role_max = {}
         self._latest_calibration_model = None
         self._frozen_calibration_model = None
         self._calibration_report = {}
@@ -170,6 +182,18 @@ class FinalControlPlane:
         self._calibration_validation_count = 0
         self._healthy_validation_failed = False
         self._healthy_validation_alerts = []
+        self._healthy_validation_soft_episodes = []
+        self._healthy_validation_hard_candidate_episodes = []
+        self._healthy_validation_hard_episodes = []
+        self._validation_soft_active = {}
+        self._validation_hard_candidate_active = {}
+        self._validation_hard_active = {}
+        self._validation_soft_run_max = {}
+        self._validation_hard_candidate_run_max = {}
+        self._validation_hard_run_max = {}
+        self._validation_soft_run_role_max = {}
+        self._validation_hard_candidate_run_role_max = {}
+        self._validation_hard_run_role_max = {}
         self._latest_calibration_model = None
         self._frozen_calibration_model = None
         self._calibration_report = {}
@@ -407,6 +431,10 @@ class FinalControlPlane:
             ),
             "control_config_fingerprint": self.config.config_fingerprint,
             "required_scope_fingerprint": required_scope_fingerprint,
+            "load_profile_id": self.config.load_profile_id,
+            "load_profile_fingerprint": (
+                self.config.load_profile_fingerprint
+            ),
             "scale_config_fingerprint": scale_config_fingerprint,
             "As_fingerprint": service_model_fingerprint,
             "Av_fingerprint": metric_model_fingerprint,
@@ -434,7 +462,7 @@ class FinalControlPlane:
             else "not_started"
         )
         payload = {
-            "schema_version": "probeRCA-calibration-readiness-v1",
+            "schema_version": "probeRCA-calibration-readiness-v4",
             "timestamp_ns": timestamp_ns,
             "state": self.state,
             "ready": False,
@@ -461,6 +489,24 @@ class FinalControlPlane:
             "healthy_validation_result": validation_result,
             "healthy_validation_alerts": list(
                 self._healthy_validation_alerts
+            ),
+            "healthy_validation_soft_episodes": list(
+                self._healthy_validation_soft_episodes
+            ),
+            "healthy_validation_hard_candidate_episodes": list(
+                self._healthy_validation_hard_candidate_episodes
+            ),
+            "healthy_validation_confirmed_hard_episodes": list(
+                self._healthy_validation_hard_episodes
+            ),
+            "healthy_validation_soft_episode_count": len(
+                self._healthy_validation_soft_episodes
+            ),
+            "healthy_validation_hard_candidate_episode_count": len(
+                self._healthy_validation_hard_candidate_episodes
+            ),
+            "healthy_validation_confirmed_hard_episode_count": len(
+                self._healthy_validation_hard_episodes
             ),
             "maximum_symptom_score": maximum,
             "required_entity_types": sorted(required_types),
@@ -502,6 +548,10 @@ class FinalControlPlane:
                 self._last_calibration_reset_reason
             ),
             "control_config_fingerprint": self.config.config_fingerprint,
+            "load_profile_id": self.config.load_profile_id,
+            "load_profile_fingerprint": (
+                self.config.load_profile_fingerprint
+            ),
             "baseline_status": baseline_status,
             "all_baseline_status": all_baseline_status,
             "service_model_status": service_status,
@@ -545,6 +595,18 @@ class FinalControlPlane:
             self._calibration_validation_count = 0
             self._healthy_validation_failed = False
             self._healthy_validation_alerts = []
+            self._healthy_validation_soft_episodes = []
+            self._healthy_validation_hard_candidate_episodes = []
+            self._healthy_validation_hard_episodes = []
+            self._validation_soft_active = {}
+            self._validation_hard_candidate_active = {}
+            self._validation_hard_active = {}
+            self._validation_soft_run_max = {}
+            self._validation_hard_candidate_run_max = {}
+            self._validation_hard_run_max = {}
+            self._validation_soft_run_role_max = {}
+            self._validation_hard_candidate_run_role_max = {}
+            self._validation_hard_run_role_max = {}
             self._soft_counts.clear()
             self._hard_counts.clear()
             self.state = "healthy_validating"
@@ -595,21 +657,77 @@ class FinalControlPlane:
         maximum: float, service_scores, edge_scores, observations,
     ) -> None:
         previous = self.state
-        soft, hard = self._advance_alert_counters(
+        soft, hard_candidates, confirmed_hard = self._advance_alert_counters(
             service_scores, edge_scores,
         )
-        if soft or hard:
+        scores = {
+            **{
+                ("service", key): value
+                for key, value in service_scores.items()
+            },
+            **{
+                ("edge", key): value
+                for key, value in edge_scores.items()
+            },
+        }
+        role_scores: dict[tuple[str, str], dict[str, float]] = {}
+        for observation in observations.values():
+            if not observation.alert_eligible:
+                continue
+            key = (
+                observation.metric.entity_type,
+                observation.metric.entity_id,
+            )
+            role_scores.setdefault(key, {})[
+                observation.metric.role
+            ] = observation.anomaly
+        self._record_validation_episodes(
+            timestamp_ns=timestamp_ns,
+            scores=scores,
+            counts=self._soft_counts,
+            threshold=self.config.soft_threshold,
+            consecutive_windows=self.config.soft_consecutive_windows,
+            episodes=self._healthy_validation_soft_episodes,
+            active=self._validation_soft_active,
+            run_max=self._validation_soft_run_max,
+            run_role_max=self._validation_soft_run_role_max,
+            role_scores=role_scores,
+        )
+        self._record_validation_episodes(
+            timestamp_ns=timestamp_ns,
+            scores=scores,
+            counts=self._hard_counts,
+            threshold=self.config.hard_threshold,
+            consecutive_windows=self.config.hard_candidate_windows,
+            episodes=self._healthy_validation_hard_candidate_episodes,
+            active=self._validation_hard_candidate_active,
+            run_max=self._validation_hard_candidate_run_max,
+            run_role_max=self._validation_hard_candidate_run_role_max,
+            role_scores=role_scores,
+        )
+        self._record_validation_episodes(
+            timestamp_ns=timestamp_ns,
+            scores=scores,
+            counts=self._hard_counts,
+            threshold=self.config.hard_threshold,
+            consecutive_windows=self.config.hard_consecutive_windows,
+            episodes=self._healthy_validation_hard_episodes,
+            active=self._validation_hard_active,
+            run_max=self._validation_hard_run_max,
+            run_role_max=self._validation_hard_run_role_max,
+            role_scores=role_scores,
+        )
+        if confirmed_hard:
             alert = {
                 "timestamp_ns": timestamp_ns,
-                "soft_entities": [
-                    list(item) for item in sorted(soft)
-                ],
-                "hard_entities": [
-                    list(item) for item in sorted(hard)
+                "confirmed_hard_entities": [
+                    list(item) for item in sorted(confirmed_hard)
                 ],
             }
             self._healthy_validation_alerts.append(alert)
-            self._healthy_validation_failed = True
+        self._healthy_validation_failed = bool(
+            self._healthy_validation_hard_episodes
+        )
         self._calibration_validation_count += 1
         report = self._build_calibration_report(
             graph=graph, timestamp_ns=timestamp_ns, maximum=maximum,
@@ -637,6 +755,24 @@ class FinalControlPlane:
         report["healthy_validation_alerts"] = list(
             self._healthy_validation_alerts
         )
+        report["healthy_validation_soft_episodes"] = list(
+            self._healthy_validation_soft_episodes
+        )
+        report["healthy_validation_hard_candidate_episodes"] = list(
+            self._healthy_validation_hard_candidate_episodes
+        )
+        report["healthy_validation_confirmed_hard_episodes"] = list(
+            self._healthy_validation_hard_episodes
+        )
+        report["healthy_validation_soft_episode_count"] = len(
+            self._healthy_validation_soft_episodes
+        )
+        report["healthy_validation_hard_candidate_episode_count"] = len(
+            self._healthy_validation_hard_candidate_episodes
+        )
+        report["healthy_validation_confirmed_hard_episode_count"] = len(
+            self._healthy_validation_hard_episodes
+        )
         report["report_fingerprint"] = ""
         report["report_fingerprint"] = fingerprint(report)
         self._calibration_report = report
@@ -650,8 +786,11 @@ class FinalControlPlane:
             "soft_alert_entities": [
                 list(item) for item in sorted(soft)
             ],
-            "hard_alert_entities": [
-                list(item) for item in sorted(hard)
+            "hard_candidate_entities": [
+                list(item) for item in sorted(hard_candidates)
+            ],
+            "confirmed_hard_entities": [
+                list(item) for item in sorted(confirmed_hard)
             ],
             "scale_sources": {
                 node_id: item.scale_source
@@ -682,6 +821,104 @@ class FinalControlPlane:
                 report["report_fingerprint"]
             ),
         })
+
+    def _record_validation_episodes(
+        self, *, timestamp_ns: int,
+        scores: dict[tuple[str, str], float],
+        counts: dict[tuple[str, str], int],
+        threshold: float,
+        consecutive_windows: int,
+        episodes: list[dict[str, Any]],
+        active: dict[tuple[str, str], int],
+        run_max: dict[tuple[str, str], float],
+        run_role_max: dict[tuple[str, str], dict[str, float]],
+        role_scores: dict[tuple[str, str], dict[str, float]],
+    ) -> None:
+        """Record threshold-qualified episodes without changing alert rules."""
+        keys = set(scores) | set(counts) | set(active) | set(run_max)
+        window_ns = self.config.window_sec * 1_000_000_000
+        for key in sorted(keys):
+            value = float(scores.get(key, 0.0))
+            count = int(counts.get(key, 0))
+            if value >= threshold:
+                run_max[key] = max(run_max.get(key, value), value)
+                role_maximums = run_role_max.setdefault(key, {})
+                for role, score in role_scores.get(key, {}).items():
+                    role_maximums[role] = max(
+                        role_maximums.get(role, float("-inf")), float(score),
+                    )
+            else:
+                run_max.pop(key, None)
+                run_role_max.pop(key, None)
+                active.pop(key, None)
+                continue
+            if count < consecutive_windows:
+                continue
+            index = active.get(key)
+            if index is None:
+                episode_number = 1 + sum(
+                    item["entity_type"] == key[0]
+                    and item["entity_id"] == key[1]
+                    for item in episodes
+                )
+                index = len(episodes)
+                active[key] = index
+                episodes.append({
+                    "entity_type": key[0],
+                    "entity_id": key[1],
+                    "episode_number": episode_number,
+                    "start_timestamp_ns": (
+                        timestamp_ns - (count - 1) * window_ns
+                    ),
+                    "end_timestamp_ns": timestamp_ns,
+                    "duration_windows": count,
+                    "maximum_score": run_max[key],
+                    "latency_maximum_score": max(
+                        (
+                            value for role, value
+                            in run_role_max.get(key, {}).items()
+                            if role.endswith("latency")
+                        ),
+                        default=0.0,
+                    ),
+                    "failure_maximum_score": max(
+                        (
+                            value for role, value
+                            in run_role_max.get(key, {}).items()
+                            if role.endswith("failure")
+                        ),
+                        default=0.0,
+                    ),
+                })
+            else:
+                episodes[index]["end_timestamp_ns"] = timestamp_ns
+                episodes[index]["duration_windows"] = count
+                episodes[index]["maximum_score"] = max(
+                    float(episodes[index]["maximum_score"]),
+                    run_max[key],
+                )
+                episodes[index]["latency_maximum_score"] = max(
+                    float(episodes[index]["latency_maximum_score"]),
+                    max(
+                        (
+                            value for role, value
+                            in run_role_max.get(key, {}).items()
+                            if role.endswith("latency")
+                        ),
+                        default=0.0,
+                    ),
+                )
+                episodes[index]["failure_maximum_score"] = max(
+                    float(episodes[index]["failure_maximum_score"]),
+                    max(
+                        (
+                            value for role, value
+                            in run_role_max.get(key, {}).items()
+                            if role.endswith("failure")
+                        ),
+                        default=0.0,
+                    ),
+                )
 
     def _scores(self, observations, graph: AllowedServiceGraph):
         by_entity: dict[str, dict[str, float]] = {}
@@ -737,7 +974,11 @@ class FinalControlPlane:
 
     def _advance_alert_counters(
         self, service_scores, edge_scores,
-    ) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    ) -> tuple[
+        set[tuple[str, str]],
+        set[tuple[str, str]],
+        set[tuple[str, str]],
+    ]:
         scores = {
             **{("service", key): value for key, value in service_scores.items()},
             **{("edge", key): value for key, value in edge_scores.items()},
@@ -757,11 +998,15 @@ class FinalControlPlane:
             key for key, count in self._soft_counts.items()
             if count >= self.config.soft_consecutive_windows
         }
-        hard = {
+        hard_candidates = {
+            key for key, count in self._hard_counts.items()
+            if count >= self.config.hard_candidate_windows
+        }
+        confirmed_hard = {
             key for key, count in self._hard_counts.items()
             if count >= self.config.hard_consecutive_windows
         }
-        return soft, hard
+        return soft, hard_candidates, confirmed_hard
 
     def _freeze_soft_context(
         self, *, sequence: int, timestamp_ns: int,
@@ -826,14 +1071,17 @@ class FinalControlPlane:
         maximum = max((*service_scores.values(), *edge_scores.values()), default=0.0)
         previous = self.state
         soft_entities: set[tuple[str, str]] = set()
+        hard_candidate_entities: set[tuple[str, str]] = set()
         hard_entities: set[tuple[str, str]] = set()
         if self.state in {"healthy", "soft"}:
-            soft_entities, hard_entities = self._advance_alert_counters(
-                service_scores, edge_scores,
-            )
+            (
+                soft_entities,
+                hard_candidate_entities,
+                hard_entities,
+            ) = self._advance_alert_counters(service_scores, edge_scores)
         if self.state in {"healthy", "soft"} and hard_entities:
             if self._soft is None:
-                # Hard has its own per-entity 5x2 detector. It may freeze the
+                # Confirmed Hard has its own per-entity 5x3 detector. It may freeze the
                 # healthy context before the slower Soft 3x3 detector fires.
                 self._freeze_soft_context(
                     sequence=sequence,
@@ -921,6 +1169,12 @@ class FinalControlPlane:
                 f"{key[0]}|{key[1]}": value
                 for key, value in sorted(self._hard_counts.items())
             },
+            "hard_candidate_entities": [
+                list(item) for item in sorted(hard_candidate_entities)
+            ],
+            "confirmed_hard_entities": [
+                list(item) for item in sorted(hard_entities)
+            ],
             **self._topology_provenance(graph),
             "baseline_frozen": not models_updated,
             "service_model_frozen": not models_updated,

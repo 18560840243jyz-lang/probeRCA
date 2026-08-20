@@ -231,7 +231,8 @@ metadata:
     app.kubernetes.io/name: proberca-healthy-checkout-load
     app.kubernetes.io/part-of: proberca-final-dataplane
   annotations:
-    proberca.io/load-profile: single-vm-healthy-v7
+    proberca.io/load-profile: single-vm-qualified-55
+    proberca.io/load-profile-fingerprint: d3f0bffc6c26cb4d3f837d66eb62b5e377bae78b97522c5cefa75f3f0c2ee848
 spec:
   replicas: 3
   selector:
@@ -243,7 +244,8 @@ spec:
         app.kubernetes.io/name: proberca-healthy-checkout-load
         app.kubernetes.io/part-of: proberca-final-dataplane
       annotations:
-        proberca.io/load-profile: single-vm-healthy-v7
+        proberca.io/load-profile: single-vm-qualified-55
+        proberca.io/load-profile-fingerprint: d3f0bffc6c26cb4d3f837d66eb62b5e377bae78b97522c5cefa75f3f0c2ee848
     spec:
       containers:
         - name: checkout-load
@@ -256,7 +258,7 @@ spec:
             - name: TARGET_URL
               value: http://frontend
             - name: INTERVAL_PATTERN_SECONDS
-              value: "0.07,0.08,0.09,0.075,0.085"
+              value: "0.127273,0.145455,0.163636,0.136364,0.154545"
             - name: PHASE_SECONDS
               value: "20"
             - name: POD_UID
@@ -298,7 +300,8 @@ metadata:
     app.kubernetes.io/name: proberca-healthy-rpc-load
     app.kubernetes.io/part-of: proberca-final-dataplane
   annotations:
-    proberca.io/load-profile: single-vm-healthy-v7
+    proberca.io/load-profile: single-vm-qualified-55
+    proberca.io/load-profile-fingerprint: d3f0bffc6c26cb4d3f837d66eb62b5e377bae78b97522c5cefa75f3f0c2ee848
 spec:
   replicas: 1
   selector:
@@ -310,7 +313,8 @@ spec:
         app.kubernetes.io/name: proberca-healthy-rpc-load
         app.kubernetes.io/part-of: proberca-final-dataplane
       annotations:
-        proberca.io/load-profile: single-vm-healthy-v7
+        proberca.io/load-profile: single-vm-qualified-55
+        proberca.io/load-profile-fingerprint: d3f0bffc6c26cb4d3f837d66eb62b5e377bae78b97522c5cefa75f3f0c2ee848
     spec:
       containers:
         - name: rpc-load
@@ -323,7 +327,7 @@ spec:
             - name: PYTHONPATH
               value: /email_server
             - name: PERIOD_SECONDS
-              value: "0.12"
+              value: "0.218182"
             - name: WORKERS_PER_SERVICE
               value: "3"
           resources:

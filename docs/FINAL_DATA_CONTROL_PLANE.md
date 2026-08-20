@@ -53,12 +53,16 @@ STARTING -> CALIBRATING -> READY -> Healthy / Soft / Hard / Recovery
 
 在`CALIBRATING`期间不触发Soft/Hard、不运行FISTA，也不允许故障注入。进入
 `READY`要求正式支持范围内的Baseline、服务级`A_s`和逐目标`A_v`全部Ready，
-且独立Healthy验证段没有持续误报。
+且独立Healthy验证段没有Confirmed Hard。Soft和Hard Candidate仍保留为健康质量
+诊断，不单独阻断READY。
 
 服务与有向TCP边分别维护连续告警计数，不同实体不能拼成连续异常：
 
 - Soft：异常分数`>=3`，同一实体连续3个1秒窗口；
-- Hard：异常分数`>=5`，同一实体连续2个1秒窗口。
+- Hard Candidate：异常分数`>=5`，同一实体连续2个1秒窗口，只记录诊断；
+- Confirmed Hard：异常分数`>=5`，同一实体连续3个1秒窗口。只有Confirmed Hard
+  进入Hard、触发RCA或阻断Healthy Validation。单条正式TCP边可独立确认，
+  不需要多实体佐证。
 
 ## 有向TCP边完整路径
 

@@ -1469,14 +1469,20 @@ def test_single_vm_scope_freezes_v2_collection_runtime():
         "configs/final_single_vm_scope.yaml"
     ).read_text(encoding="utf-8"))
     assert scope["status"] == "frozen_before_healthy_pilot"
-    assert scope["load_profile"] == "single-vm-healthy-v7"
+    assert scope["load_profile"] == "single-vm-qualified-55"
+    assert scope["load_profile_fingerprint"] == (
+        "d3f0bffc6c26cb4d3f837d66eb62b5e377bae78b97522c5cefa75f3f0c2ee848"
+    )
     assert scope["checkout_load_replicas"] == 3
     assert scope["checkout_interval_pattern_seconds"] == [
-        0.07, 0.08, 0.09, 0.075, 0.085,
+        0.127273, 0.145455, 0.163636, 0.136364, 0.154545,
     ]
     assert scope["direct_rpc_load_replicas"] == 1
-    assert scope["direct_rpc_period_seconds"] == 0.12
+    assert scope["direct_rpc_period_seconds"] == 0.218182
     assert scope["direct_rpc_workers_per_service"] == 3
+    assert scope["online_boutique_loadgenerator_replicas"] == 1
+    assert scope["online_boutique_loadgenerator_users"] == 28
+    assert scope["online_boutique_loadgenerator_rate"] == 1
     assert len(scope["direct_rpc_services"]) == 8
     assert scope["primitive_exporter_schema"] == (
         FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION
@@ -1613,7 +1619,10 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
     assert config_map["metadata"]["namespace"] == "online-boutique"
     assert deployment["metadata"]["annotations"][
         "proberca.io/load-profile"
-    ] == "single-vm-healthy-v7"
+    ] == "single-vm-qualified-55"
+    assert deployment["metadata"]["annotations"][
+        "proberca.io/load-profile-fingerprint"
+    ] == "d3f0bffc6c26cb4d3f837d66eb62b5e377bae78b97522c5cefa75f3f0c2ee848"
     assert deployment["spec"]["replicas"] == 3
     containers = {
         item["name"]: item
@@ -1634,7 +1643,9 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
         "TARGET_URL": (
             "http://frontend"
         ),
-        "INTERVAL_PATTERN_SECONDS": "0.07,0.08,0.09,0.075,0.085",
+        "INTERVAL_PATTERN_SECONDS": (
+            "0.127273,0.145455,0.163636,0.136364,0.154545"
+        ),
         "PHASE_SECONDS": "20",
     }
     pod_uid = next(
@@ -1671,7 +1682,10 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
         == "proberca-healthy-rpc-load"
     assert rpc_deployment["metadata"]["annotations"][
         "proberca.io/load-profile"
-    ] == "single-vm-healthy-v7"
+    ] == "single-vm-qualified-55"
+    assert rpc_deployment["metadata"]["annotations"][
+        "proberca.io/load-profile-fingerprint"
+    ] == "d3f0bffc6c26cb4d3f837d66eb62b5e377bae78b97522c5cefa75f3f0c2ee848"
     assert rpc_deployment["spec"]["replicas"] == 1
     rpc = rpc_deployment["spec"]["template"]["spec"]["containers"][0]
     assert "@sha256:" in rpc["image"]
@@ -1679,7 +1693,7 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
         item["name"]: item["value"] for item in rpc["env"]
     } == {
         "PYTHONPATH": "/email_server",
-        "PERIOD_SECONDS": "0.12",
+        "PERIOD_SECONDS": "0.218182",
         "WORKERS_PER_SERVICE": "3",
     }
     installer = Path(
@@ -1746,6 +1760,16 @@ def test_formal_installer_executes_only_formal_workloads(monkeypatch):
     )
     assert any(
         "patch deployment/coredns" in command
+        for command in rendered
+    )
+    assert any(
+        "set env deployment/loadgenerator" in command
+        and "USERS=28" in command and "RATE=1" in command
+        for command in rendered
+    )
+    assert any(
+        "proberca.io/load-profile=single-vm-qualified-55" in command
+        and "d3f0bffc6c26cb4d3f837d66eb62b5e377bae78b97522c5cefa75f3f0c2ee848" in command
         for command in rendered
     )
     assert any(

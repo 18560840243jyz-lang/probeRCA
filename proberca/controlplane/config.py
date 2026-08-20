@@ -326,12 +326,15 @@ class FinalControlConfig:
         "edge", "host", "service",
     )
     calibration_required_root_coordinates: tuple[str, ...] = ()
+    load_profile_id: str = "unconfigured"
+    load_profile_fingerprint: str = "0" * 64
     alpha_latency: float = 0.5
     alpha_failure: float = 0.5
     soft_threshold: float = 3.0
     soft_consecutive_windows: int = 3
     hard_threshold: float = 5.0
-    hard_consecutive_windows: int = 2
+    hard_candidate_windows: int = 2
+    hard_consecutive_windows: int = 3
     recovery_threshold: float = 1.0
     recovery_windows: int = 2
     candidate_hops: int = 2
@@ -354,13 +357,19 @@ class FinalControlConfig:
             "latency_min_samples", "failure_min_requests",
             "service_min_training_updates", "calibration_learning_windows",
             "calibration_validation_windows",
-            "soft_consecutive_windows", "hard_consecutive_windows",
+            "soft_consecutive_windows", "hard_candidate_windows",
+            "hard_consecutive_windows",
             "recovery_windows", "candidate_hops", "burst_window_count",
             "fista_max_iterations", "top_k",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"control.{name} must be a positive integer")
+        if self.hard_candidate_windows >= self.hard_consecutive_windows:
+            raise ValueError(
+                "control.hard_candidate_windows must be less than "
+                "control.hard_consecutive_windows"
+            )
         for name in ("service_lags", "metric_lags"):
             values = getattr(self, name)
             if not values or tuple(sorted(set(values))) != values \
@@ -429,6 +438,18 @@ class FinalControlConfig:
         ):
             raise ValueError(
                 "calibration root coordinates must be sorted, unique strings"
+            )
+        if not isinstance(self.load_profile_id, str) \
+                or not self.load_profile_id:
+            raise ValueError("control.load_profile_id must be non-empty")
+        if not isinstance(self.load_profile_fingerprint, str) \
+                or len(self.load_profile_fingerprint) != 64 \
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in self.load_profile_fingerprint
+                ):
+            raise ValueError(
+                "control.load_profile_fingerprint must be lowercase SHA-256"
             )
         if set(self.group_penalties) != ROOT_CATEGORIES \
                 or any(not math.isfinite(value) or value < 0
