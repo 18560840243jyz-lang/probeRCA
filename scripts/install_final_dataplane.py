@@ -143,7 +143,7 @@ def _configure_healthy_probe_cadence(repository: Path) -> None:
     }:
         raise SystemExit("healthy probe cadence fields are not frozen")
     if configuration["schema_version"] \
-            != "proberca-healthy-probe-cadence-v2":
+            != "proberca-healthy-probe-cadence-v3":
         raise SystemExit("healthy probe cadence schema is unsupported")
     namespace = configuration["namespace"]
     readiness_period_seconds = configuration[
@@ -159,6 +159,24 @@ def _configure_healthy_probe_cadence(repository: Path) -> None:
         "readiness_failure_threshold",
         "readiness_timeout_seconds",
     }
+    deployment_fields = {
+        "container", "liveness_period_seconds", "probe_profile",
+    }
+
+    def valid_capacity_resources(value: Any) -> bool:
+        return (
+            isinstance(value, dict)
+            and set(value) == {"requests", "limits"}
+            and all(
+                isinstance(value[section], dict)
+                and set(value[section]) == {"cpu", "memory"}
+                and all(
+                    isinstance(item, str) and item.strip()
+                    for item in value[section].values()
+                )
+                for section in ("requests", "limits")
+            )
+        )
     if (
         namespace != "online-boutique"
         or readiness_period_seconds != 1
@@ -189,9 +207,9 @@ def _configure_healthy_probe_cadence(repository: Path) -> None:
                 not isinstance(name, str)
                 or not name
                 or not isinstance(profile, dict)
-                or set(profile) != {
-                    "container", "liveness_period_seconds",
-                    "probe_profile",
+                or frozenset(profile) not in {
+                    frozenset(deployment_fields),
+                    frozenset(deployment_fields | {"capacity_resources"}),
                 }
                 or not isinstance(profile["container"], str)
                 or not profile["container"]
@@ -202,6 +220,12 @@ def _configure_healthy_probe_cadence(repository: Path) -> None:
                 or profile["liveness_period_seconds"] <= 1
                 or not isinstance(profile["probe_profile"], str)
                 or profile["probe_profile"] not in probe_profiles
+                or (
+                    "capacity_resources" in profile
+                    and not valid_capacity_resources(
+                        profile["capacity_resources"]
+                    )
+                )
             )
             for name, profile in deployments.items()
         )
@@ -286,50 +310,55 @@ def _configure_healthy_probe_cadence(repository: Path) -> None:
             raise SystemExit(
                 f"{deployment}/{container_name} lacks frozen health probes"
             )
+        annotations = {
+            "proberca.io/healthy-probe-cadence": (
+                f"liveness-{liveness_period_seconds}s_"
+                f"readiness-{readiness_period_seconds}s_"
+                f"profile-{probe_profile}"
+            ),
+        }
+        container_patch = {
+            "name": container_name,
+            "livenessProbe": {
+                "periodSeconds": liveness_period_seconds,
+                "initialDelaySeconds": settings[
+                    "liveness_initial_delay_seconds"
+                ],
+                "failureThreshold": settings[
+                    "liveness_failure_threshold"
+                ],
+                "timeoutSeconds": settings[
+                    "liveness_timeout_seconds"
+                ],
+            },
+            "readinessProbe": {
+                "periodSeconds": readiness_period_seconds,
+                "initialDelaySeconds": settings[
+                    "readiness_initial_delay_seconds"
+                ],
+                "failureThreshold": settings[
+                    "readiness_failure_threshold"
+                ],
+                "timeoutSeconds": settings[
+                    "readiness_timeout_seconds"
+                ],
+            },
+        }
+        capacity_resources = profile.get("capacity_resources")
+        if capacity_resources is not None:
+            container_patch["resources"] = capacity_resources
+            annotations["proberca.io/healthy-capacity"] = (
+                f"cpu-{capacity_resources['limits']['cpu']}_"
+                f"memory-{capacity_resources['limits']['memory']}"
+            )
         patch = {
             "spec": {
                 "template": {
                     "metadata": {
-                        "annotations": {
-                            "proberca.io/healthy-probe-cadence": (
-                                f"liveness-{liveness_period_seconds}s_"
-                                f"readiness-{readiness_period_seconds}s_"
-                                f"profile-{probe_profile}"
-                            ),
-                        },
+                        "annotations": annotations,
                     },
                     "spec": {
-                        "containers": [{
-                            "name": container_name,
-                            "livenessProbe": {
-                                "periodSeconds": (
-                                    liveness_period_seconds
-                                ),
-                                "initialDelaySeconds": settings[
-                                    "liveness_initial_delay_seconds"
-                                ],
-                                "failureThreshold": settings[
-                                    "liveness_failure_threshold"
-                                ],
-                                "timeoutSeconds": settings[
-                                    "liveness_timeout_seconds"
-                                ],
-                            },
-                            "readinessProbe": {
-                                "periodSeconds": (
-                                    readiness_period_seconds
-                                ),
-                                "initialDelaySeconds": settings[
-                                    "readiness_initial_delay_seconds"
-                                ],
-                                "failureThreshold": settings[
-                                    "readiness_failure_threshold"
-                                ],
-                                "timeoutSeconds": settings[
-                                    "readiness_timeout_seconds"
-                                ],
-                            },
-                        }],
+                        "containers": [container_patch],
                     },
                 },
             },

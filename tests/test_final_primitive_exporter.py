@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import socket
@@ -1796,7 +1797,7 @@ def test_healthy_probe_cadence_is_explicit_and_reproducible():
         "probe_profiles", "deployments",
     }
     assert configuration["schema_version"] \
-        == "proberca-healthy-probe-cadence-v2"
+        == "proberca-healthy-probe-cadence-v3"
     assert configuration["namespace"] == "online-boutique"
     assert configuration["readiness_period_seconds"] == 1
     assert configuration["probe_profiles"] == {
@@ -1830,6 +1831,12 @@ def test_healthy_probe_cadence_is_explicit_and_reproducible():
         for name, profile in configuration["deployments"].items()
         if name != "emailservice"
     } == expected
+    assert configuration["deployments"]["frontend"][
+        "capacity_resources"
+    ] == {
+        "requests": {"cpu": "100m", "memory": "64Mi"},
+        "limits": {"cpu": "500m", "memory": "128Mi"},
+    }
     emailservice = configuration["deployments"]["emailservice"]
     assert emailservice["service_contract"] == {
         "name": "emailservice",
@@ -1893,3 +1900,68 @@ def test_healthy_probe_cadence_is_explicit_and_reproducible():
     assert "deploy/final-dataplane/healthy-probe-cadence.yaml" in installer
     assert '"livenessProbe"' in installer
     assert '"readinessProbe"' in installer
+    assert '"capacity_resources"' in installer
+    assert '"proberca.io/healthy-capacity"' in installer
+
+
+def test_healthy_probe_installer_applies_frozen_frontend_capacity(monkeypatch):
+    configuration = yaml.safe_load(Path(
+        "deploy/final-dataplane/healthy-probe-cadence.yaml"
+    ).read_text(encoding="utf-8"))
+    commands = []
+
+    def capture(arguments, **kwargs):
+        command = tuple(str(item) for item in arguments)
+        commands.append(command)
+        if "get" not in command:
+            return SimpleNamespace(returncode=0, stdout="")
+        target = command[command.index("get") + 1]
+        if target == "service/emailservice":
+            payload = {
+                "metadata": {"name": "emailservice"},
+                "spec": {"ports": [{
+                    "port": 5000,
+                    "targetPort": 8080,
+                    "protocol": "TCP",
+                }]},
+            }
+        else:
+            deployment = target.split("/", 1)[1]
+            profile = configuration["deployments"][deployment]
+            payload = {
+                "spec": {"template": {"spec": {"containers": [{
+                    "name": profile["container"],
+                    "livenessProbe": {},
+                    "readinessProbe": {},
+                }]}}},
+            }
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(payload),
+        )
+
+    monkeypatch.setattr(
+        install_module, "_load_mapping", lambda _path: configuration,
+    )
+    monkeypatch.setattr(install_module, "_run", capture)
+    install_module._configure_healthy_probe_cadence(
+        Path("/home/jyz/probeRCA")
+    )
+
+    frontend = next(
+        command for command in commands
+        if "patch" in command and "deployment/frontend" in command
+    )
+    payload = json.loads(frontend[frontend.index("--patch") + 1])
+    template = payload["spec"]["template"]
+    assert template["metadata"]["annotations"][
+        "proberca.io/healthy-capacity"
+    ] == "cpu-500m_memory-128Mi"
+    container = template["spec"]["containers"][0]
+    assert container["name"] == "server"
+    assert container["resources"] == {
+        "requests": {"cpu": "100m", "memory": "64Mi"},
+        "limits": {"cpu": "500m", "memory": "128Mi"},
+    }
+    assert container["livenessProbe"]["periodSeconds"] == 10
+    assert container["readinessProbe"]["periodSeconds"] == 1
