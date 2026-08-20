@@ -1469,7 +1469,7 @@ def test_single_vm_scope_freezes_v2_collection_runtime():
         "configs/final_single_vm_scope.yaml"
     ).read_text(encoding="utf-8"))
     assert scope["status"] == "frozen_before_healthy_pilot"
-    assert scope["load_profile"] == "single-vm-healthy-v6"
+    assert scope["load_profile"] == "single-vm-healthy-v7"
     assert scope["checkout_load_replicas"] == 3
     assert scope["checkout_interval_pattern_seconds"] == [
         0.07, 0.08, 0.09, 0.075, 0.085,
@@ -1613,7 +1613,7 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
     assert config_map["metadata"]["namespace"] == "online-boutique"
     assert deployment["metadata"]["annotations"][
         "proberca.io/load-profile"
-    ] == "single-vm-healthy-v6"
+    ] == "single-vm-healthy-v7"
     assert deployment["spec"]["replicas"] == 3
     containers = {
         item["name"]: item
@@ -1628,6 +1628,7 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
     environment = {
         item["name"]: item["value"]
         for item in checkout["env"]
+        if "value" in item
     }
     assert environment == {
         "TARGET_URL": (
@@ -1636,16 +1637,33 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
         "INTERVAL_PATTERN_SECONDS": "0.07,0.08,0.09,0.075,0.085",
         "PHASE_SECONDS": "20",
     }
+    pod_uid = next(
+        item for item in checkout["env"] if item["name"] == "POD_UID"
+    )
+    assert pod_uid["valueFrom"]["fieldRef"]["fieldPath"] == "metadata.uid"
     driver = config_map["data"]["checkout_driver.py"]
+    compile(driver, "checkout_driver.py", "exec")
     assert "/cart/checkout" in driver
     assert "INTERVAL_PATTERN_SECONDS" in driver
+    assert "hashlib.sha256(POD_UID.encode" in driver
+    assert "phase_offset_seconds" in driver
     assert "tc " not in driver
     assert "iptables" not in driver
     assert "stress" not in driver
     rpc_driver = config_map["data"]["rpc_driver.py"]
+    compile(rpc_driver, "rpc_driver.py", "exec")
     assert "WORKERS_PER_SERVICE" in rpc_driver
     assert "PERIOD_SECONDS" in rpc_driver
     assert "grpc.channel_ready_future" in rpc_driver
+    assert "worker_slot = service_index * WORKERS_PER_SERVICE + index" in (
+        rpc_driver
+    )
+    assert "worker_slot * PERIOD_SECONDS / worker_count" in rpc_driver
+    assert "if deadline <= completed:" in rpc_driver
+    assert "deadline = completed + PERIOD_SECONDS" in rpc_driver
+    assert (
+        "index * PERIOD_SECONDS / WORKERS_PER_SERVICE" not in rpc_driver
+    )
     assert "tc " not in rpc_driver
     assert "iptables" not in rpc_driver
     assert "stress" not in rpc_driver
@@ -1653,7 +1671,7 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
         == "proberca-healthy-rpc-load"
     assert rpc_deployment["metadata"]["annotations"][
         "proberca.io/load-profile"
-    ] == "single-vm-healthy-v6"
+    ] == "single-vm-healthy-v7"
     assert rpc_deployment["spec"]["replicas"] == 1
     rpc = rpc_deployment["spec"]["template"]["spec"]["containers"][0]
     assert "@sha256:" in rpc["image"]

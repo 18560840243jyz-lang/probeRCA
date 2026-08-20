@@ -23,7 +23,7 @@ experimental_dns:
   archived_diagnostics_compatible: true
 exclusion_policy: exclusions_are_fixed_before_fault_selection
 missing_value_policy: zero_coverage_remains_null_and_is_never_imputed
-load_profile: single-vm-healthy-v6
+load_profile: single-vm-healthy-v7
 load_manifest: deploy/final-dataplane/healthy-calibration-load.yaml
 checkout_load_replicas: 3
 checkout_interval_pattern_seconds:
@@ -48,8 +48,11 @@ load_adjustment_reason: >-
   Three independent sequential checkout clients preserve the real business
   path. A separate fixed-rate label-free RPC workload keeps the service P95
   sample count above the quantile-derived alert eligibility floor without
-  changing any validity or alert threshold. The RPC workload is not a formal
-  service or edge and is excluded from root-cause scope.
+  changing any validity or alert threshold. Checkout replicas are dephased by
+  immutable Pod identity, and direct RPC workers are evenly phase-distributed
+  across the unchanged period. Missed RPC deadlines are not replayed as a
+  catch-up burst. The RPC workload is not a formal service or edge and is
+  excluded from root-cause scope.
 primitive_exporter_schema: probeRCA-final-primitive-exporter-v5
 live_collector_schema: probeRCA-final-live-collector-v2
 container_resource_source: direct_cgroup_v2

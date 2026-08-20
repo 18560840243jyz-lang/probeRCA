@@ -276,3 +276,15 @@ is retained as `value=null`, `valid=false`, with
 `invalid_reason=series_lifecycle_transition`; neither zero nor a previous value
 is imputed. The next window recovers only after both boundaries are present.
 Negative deltas remain hard lifecycle violations.
+
+## Healthy Load Phase Distribution Decision
+
+The frozen single-VM healthy load preserves its request paths, replica counts,
+periods, and nominal rates, but it must not synchronize independent clients into
+artificial bursts. Checkout replicas use immutable Pod identity only to derive an
+initial phase offset. Direct RPC workers are evenly phase-distributed across the
+existing period, and a delayed call does not replay missed deadlines as a
+catch-up burst. This changes neither RCA inputs nor alert thresholds; it removes
+an experiment-driver artifact that produced real queueing and TCP retransmission
+during otherwise fault-free validation. Any future timing change must bump the
+load-profile identifier and be validated by a new independent Healthy Pilot.
