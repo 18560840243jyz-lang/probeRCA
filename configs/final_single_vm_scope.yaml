@@ -23,7 +23,7 @@ experimental_dns:
   archived_diagnostics_compatible: true
 exclusion_policy: exclusions_are_fixed_before_fault_selection
 missing_value_policy: zero_coverage_remains_null_and_is_never_imputed
-load_profile: single-vm-healthy-v5
+load_profile: single-vm-healthy-v6
 load_manifest: deploy/final-dataplane/healthy-calibration-load.yaml
 checkout_load_replicas: 3
 checkout_interval_pattern_seconds:
@@ -32,10 +32,24 @@ checkout_interval_pattern_seconds:
 - 0.09
 - 0.075
 - 0.085
+direct_rpc_load_replicas: 1
+direct_rpc_period_seconds: 0.12
+direct_rpc_workers_per_service: 3
+direct_rpc_services:
+- adservice
+- cartservice
+- currencyservice
+- emailservice
+- paymentservice
+- productcatalogservice
+- recommendationservice
+- shippingservice
 load_adjustment_reason: >-
-  Three independent sequential clients keep checkout-path request_count and
-  histogram sample_count above the frozen five-sample validity floor in
-  consecutive one-second windows without changing any validity threshold.
+  Three independent sequential checkout clients preserve the real business
+  path. A separate fixed-rate label-free RPC workload keeps the service P95
+  sample count above the quantile-derived alert eligibility floor without
+  changing any validity or alert threshold. The RPC workload is not a formal
+  service or edge and is excluded from root-cause scope.
 primitive_exporter_schema: probeRCA-final-primitive-exporter-v5
 live_collector_schema: probeRCA-final-live-collector-v2
 container_resource_source: direct_cgroup_v2

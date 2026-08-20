@@ -3038,6 +3038,90 @@ def test_fault_context_cleanup_is_idempotent(tmp_path):
     assert calls == ["cleanup"]
 
 
+def test_host_nic_fault_targets_node_side_formal_pod_veths(monkeypatch):
+    import scripts.run_final_fault_matrix as runner
+
+    commands = []
+    cleanup_callbacks = []
+
+    class Context:
+        metadata = {}
+
+        @staticmethod
+        def add_cleanup(callback):
+            cleanup_callbacks.append(callback)
+
+    monkeypatch.setattr(
+        runner, "formal_service_names", lambda: ("alpha", "beta")
+    )
+    monkeypatch.setattr(
+        runner,
+        "pod_peer_device",
+        lambda service: {"alpha": "veth-a", "beta": "veth-b"}[service],
+    )
+    monkeypatch.setattr(
+        runner,
+        "node_command",
+        lambda arguments, **kwargs: commands.append(
+            (tuple(arguments), kwargs)
+        ),
+    )
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+
+    runner.host_nic(Context(), 60)
+
+    assert [item[0][4] for item in commands] == ["veth-a", "veth-b"]
+    assert all(item[0][:4] == ("tc", "qdisc", "replace", "dev")
+               for item in commands)
+    assert Context.metadata["devices"] == ["veth-a", "veth-b"]
+    assert len(cleanup_callbacks) == 1
+
+    cleanup_callbacks[0]()
+    assert [item[0][4] for item in commands[-2:]] == ["veth-a", "veth-b"]
+    assert all(item[0][:4] == ("tc", "qdisc", "del", "dev")
+               for item in commands[-2:])
+
+
+def test_formal_service_names_reads_checked_in_control_config():
+    import scripts.run_final_fault_matrix as runner
+
+    payload = yaml.safe_load(
+        runner.CONTROL_CONFIG.read_text(encoding="utf-8")
+    )
+    config = FinalControlConfig.from_dict(payload)
+    expected = tuple(sorted(
+        entity_id.rsplit("::", 1)[1]
+        for entity_id in config.formal_service_entity_ids
+    ))
+
+    assert runner.formal_service_names() == expected
+
+
+def test_pod_peer_device_resolves_link_inside_kind_node(monkeypatch):
+    import scripts.run_final_fault_matrix as runner
+
+    monkeypatch.setattr(
+        runner, "service_info", lambda _service: {"pid": 1234}
+    )
+    monkeypatch.setattr(
+        runner,
+        "run",
+        lambda _arguments: SimpleNamespace(
+            stdout=json.dumps([{"ifname": "eth0", "link_index": 17}])
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "node_command",
+        lambda _arguments: SimpleNamespace(stdout=json.dumps([
+            {"ifindex": 16, "ifname": "unrelated"},
+            {"ifindex": 17, "ifname": "veth-target@if2"},
+        ])),
+    )
+
+    assert runner.pod_peer_device("alpha") == "veth-target"
+
+
 def test_fault_actor_failsafe_tracks_capture_windows_not_wall_budget():
     import scripts.run_final_fault_matrix as runner
 

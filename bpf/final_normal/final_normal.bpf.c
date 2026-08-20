@@ -246,6 +246,21 @@ int final_tcp_preconnect_failure(
     counters = get_tcp_edge_counters(&key);
     if (counters)
         __sync_fetch_and_add(&counters->preconnect_failure_total, 1);
+    /*
+     * A non-blocking connect normally returns EINPROGRESS from the syscall;
+     * its terminal failure is only observable here.  Count that outcome in
+     * the originating cgroup as well as on the directed TCP edge.  The
+     * connect syscall already contributed the matching socket operation, so
+     * do not increment socket_ops_total a second time.
+     */
+    if (context->oldstate == TCP_SYN_SENT) {
+        struct proberca_final_cgroup_counters *local =
+            get_cgroup_counters(key.cgroup_id);
+
+        if (local)
+            __sync_fetch_and_add(
+                &local->socket_accept_fail_total, 1);
+    }
     return 0;
 }
 

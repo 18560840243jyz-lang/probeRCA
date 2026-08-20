@@ -813,6 +813,20 @@ int final_burst_tcp_state(
         if (event)
             event->value = 1;
         submit_event(event);
+        /*
+         * The connect syscall may have returned EINPROGRESS, so its eventual
+         * failure never passed through socket_exit() as an error.  Preserve
+         * the same terminal outcome for the service-scoped LocalNet channel.
+         */
+        if (context->oldstate == TCP_SYN_SENT) {
+            event = reserve_event(
+                PROBERCA_BURST_SOCKET_FAILURE, cgroup_id);
+            if (event) {
+                event->value = 1;
+                event->direction = 2;
+            }
+            submit_event(event);
+        }
     }
     return 0;
 }

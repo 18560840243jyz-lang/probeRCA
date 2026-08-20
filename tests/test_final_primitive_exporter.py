@@ -191,6 +191,7 @@ def test_final_bpf_normal_path_is_map_aggregated_and_window_safe():
     assert "dns_edge_counters" in bpf
     assert "tcp_edge_counters" in bpf
     assert "final_tcp_preconnect_failure" in bpf
+    assert "&local->socket_accept_fail_total" in bpf
     assert "preconnect_failure_total" in header
     assert "success_latency_buckets" in loader
     assert "servfail_total" in bpf
@@ -209,6 +210,15 @@ def test_final_bpf_normal_path_is_map_aggregated_and_window_safe():
     assert "entry->completed_before_ns + entry->active_ns" in loader
     assert "--snapshot" in loader
     assert "--cgroup-id" in loader
+
+    burst_bpf = Path(
+        "bpf/final_burst/final_burst.bpf.c"
+    ).read_text(encoding="utf-8")
+    tcp_failure = burst_bpf.index("PROBERCA_BURST_TCP_CONNECT_FAILURE")
+    local_failure = burst_bpf.index(
+        "PROBERCA_BURST_SOCKET_FAILURE", tcp_failure
+    )
+    assert local_failure > tcp_failure
 
 
 def test_bpf_snapshot_filters_to_sorted_active_cgroups(monkeypatch):
@@ -1431,6 +1441,7 @@ def test_deployment_uses_pinned_beyla_without_unused_service_graph():
     }
     assert "loadgenerator" not in online_deployments
     assert "proberca-healthy-checkout-load" not in online_deployments
+    assert "proberca-healthy-rpc-load" not in online_deployments
 
 
 def test_container_resources_use_direct_cgroup_v2_primitives():
@@ -1457,11 +1468,15 @@ def test_single_vm_scope_freezes_v2_collection_runtime():
         "configs/final_single_vm_scope.yaml"
     ).read_text(encoding="utf-8"))
     assert scope["status"] == "frozen_before_healthy_pilot"
-    assert scope["load_profile"] == "single-vm-healthy-v5"
+    assert scope["load_profile"] == "single-vm-healthy-v6"
     assert scope["checkout_load_replicas"] == 3
     assert scope["checkout_interval_pattern_seconds"] == [
         0.07, 0.08, 0.09, 0.075, 0.085,
     ]
+    assert scope["direct_rpc_load_replicas"] == 1
+    assert scope["direct_rpc_period_seconds"] == 0.12
+    assert scope["direct_rpc_workers_per_service"] == 3
+    assert len(scope["direct_rpc_services"]) == 8
     assert scope["primitive_exporter_schema"] == (
         FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION
     )
@@ -1593,11 +1608,11 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
     documents = tuple(yaml.safe_load_all(Path(
         "deploy/final-dataplane/healthy-calibration-load.yaml"
     ).read_text(encoding="utf-8")))
-    config_map, deployment = documents
+    config_map, deployment, rpc_deployment = documents
     assert config_map["metadata"]["namespace"] == "online-boutique"
     assert deployment["metadata"]["annotations"][
         "proberca.io/load-profile"
-    ] == "single-vm-healthy-v5"
+    ] == "single-vm-healthy-v6"
     assert deployment["spec"]["replicas"] == 3
     containers = {
         item["name"]: item
@@ -1626,6 +1641,28 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
     assert "tc " not in driver
     assert "iptables" not in driver
     assert "stress" not in driver
+    rpc_driver = config_map["data"]["rpc_driver.py"]
+    assert "WORKERS_PER_SERVICE" in rpc_driver
+    assert "PERIOD_SECONDS" in rpc_driver
+    assert "grpc.channel_ready_future" in rpc_driver
+    assert "tc " not in rpc_driver
+    assert "iptables" not in rpc_driver
+    assert "stress" not in rpc_driver
+    assert rpc_deployment["metadata"]["name"] \
+        == "proberca-healthy-rpc-load"
+    assert rpc_deployment["metadata"]["annotations"][
+        "proberca.io/load-profile"
+    ] == "single-vm-healthy-v6"
+    assert rpc_deployment["spec"]["replicas"] == 1
+    rpc = rpc_deployment["spec"]["template"]["spec"]["containers"][0]
+    assert "@sha256:" in rpc["image"]
+    assert {
+        item["name"]: item["value"] for item in rpc["env"]
+    } == {
+        "PYTHONPATH": "/email_server",
+        "PERIOD_SECONDS": "0.12",
+        "WORKERS_PER_SERVICE": "3",
+    }
     installer = Path(
         "scripts/install_final_dataplane.py"
     ).read_text(encoding="utf-8")
@@ -1633,6 +1670,7 @@ def test_healthy_calibration_load_is_frozen_and_fault_free():
     assert (
         '"deployment/proberca-healthy-checkout-load"' in installer
     )
+    assert '"deployment/proberca-healthy-rpc-load"' in installer
 
 
 def test_formal_installer_executes_only_formal_workloads(monkeypatch):

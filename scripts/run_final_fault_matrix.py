@@ -59,6 +59,8 @@ WINDOW_WALL_BUDGET_SEC = 10
 DATA_PLANE_READY_TIMEOUT_SEC = 90
 FAULT_ACTOR_FAILSAFE_GRACE_SEC = 30
 HOST_MEMORY_PILOT_BYTES = 4 * 1024 * 1024 * 1024
+HOST_NIC_DELAY_MS = 20
+HOST_NIC_LOSS_PERCENT = 3.0
 
 
 class ExperimentError(RuntimeError):
@@ -204,6 +206,46 @@ def node_command(arguments: list[str], **kwargs) -> subprocess.CompletedProcess:
     return run([
         "nsenter", "-t", str(node_pid()), "-n", *arguments
     ], **kwargs)
+
+
+def formal_service_names() -> tuple[str, ...]:
+    payload = yaml.safe_load(CONTROL_CONFIG.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ExperimentError("final control config is not a mapping")
+    config = FinalControlConfig.from_dict(payload)
+    names = tuple(sorted(
+        entity_id.rsplit("::", 1)[1]
+        for entity_id in config.formal_service_entity_ids
+    ))
+    if len(names) != len(config.formal_service_entity_ids):
+        raise ExperimentError("formal service identities are ambiguous")
+    return names
+
+
+def pod_peer_device(service: str) -> str:
+    info = service_info(service)
+    pod_links = json.loads(run([
+        "nsenter", "-t", str(info["pid"]), "-n",
+        "ip", "-j", "link", "show", "eth0",
+    ]).stdout)
+    if len(pod_links) != 1 or "link_index" not in pod_links[0]:
+        raise ExperimentError(
+            f"{service} Pod eth0 peer identity is missing or ambiguous"
+        )
+    peer_index = int(pod_links[0]["link_index"])
+    node_links = json.loads(node_command([
+        "ip", "-j", "link", "show",
+    ]).stdout)
+    matches = [
+        str(item["ifname"]).split("@", 1)[0]
+        for item in node_links
+        if int(item.get("ifindex", -1)) == peer_index
+    ]
+    if len(matches) != 1:
+        raise ExperimentError(
+            f"{service} node-side Pod veth is missing or ambiguous"
+        )
+    return matches[0]
 
 
 def wait_data_plane(root: Path, *, restart_on_failure: bool = True) -> None:
@@ -762,35 +804,36 @@ def service_memory(context: FaultContext, windows: int) -> None:
 
 
 def host_nic(context: FaultContext, _windows: int) -> None:
-    peer_index = int(run([
-        "docker", "exec", "proberca-ob-control-plane",
-        "cat", "/sys/class/net/eth0/iflink",
-    ]).stdout.strip())
-    devices = [
-        path.name
-        for path in Path("/sys/class/net").iterdir()
-        if int((path / "ifindex").read_text().strip()) == peer_index
-    ]
-    if len(devices) != 1:
-        raise ExperimentError(
-            "kind node host-veth is missing or ambiguous"
-        )
+    # Online Boutique traffic remains inside the kind-node network namespace;
+    # the outer Docker veth does not carry Pod-to-Pod traffic.  Apply the host
+    # fault to every formal workload's node-side Pod veth so the impairment is
+    # node-wide, visible to the host qdisc counter, and on the real request path.
+    services = formal_service_names()
+    devices = sorted({
+        pod_peer_device(service) for service in services
+    })
+    if len(devices) != len(services):
+        raise ExperimentError("formal Pod veth identities are not one-to-one")
     for device in devices:
-        run([
+        node_command([
             "tc", "qdisc", "replace", "dev", device, "root",
-            "netem", "delay", "2ms", "loss", "1%",
+            "netem", "delay", f"{HOST_NIC_DELAY_MS}ms",
+            "loss", f"{HOST_NIC_LOSS_PERCENT}%",
         ])
 
     def cleanup() -> None:
         for device in devices:
-            run(
+            node_command(
                 ["tc", "qdisc", "del", "dev", device, "root"],
                 check=False,
             )
 
     context.add_cleanup(cleanup)
     context.metadata["devices"] = devices
-    context.metadata["netem"] = {"delay_ms": 2, "loss_percent": 1.0}
+    context.metadata["netem"] = {
+        "delay_ms": HOST_NIC_DELAY_MS,
+        "loss_percent": HOST_NIC_LOSS_PERCENT,
+    }
     time.sleep(2)
 
 
