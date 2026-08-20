@@ -1797,7 +1797,7 @@ def test_healthy_probe_cadence_is_explicit_and_reproducible():
         "probe_profiles", "deployments",
     }
     assert configuration["schema_version"] \
-        == "proberca-healthy-probe-cadence-v3"
+        == "proberca-healthy-probe-cadence-v4"
     assert configuration["namespace"] == "online-boutique"
     assert configuration["readiness_period_seconds"] == 1
     assert configuration["probe_profiles"] == {
@@ -1831,12 +1831,37 @@ def test_healthy_probe_cadence_is_explicit_and_reproducible():
         for name, profile in configuration["deployments"].items()
         if name != "emailservice"
     } == expected
-    assert configuration["deployments"]["frontend"][
-        "capacity_resources"
-    ] == {
-        "requests": {"cpu": "100m", "memory": "64Mi"},
-        "limits": {"cpu": "500m", "memory": "128Mi"},
+    expected_capacity = {
+        "cartservice": {
+            "requests": {"cpu": "200m", "memory": "64Mi"},
+            "limits": {"cpu": "500m", "memory": "128Mi"},
+        },
+        "checkoutservice": {
+            "requests": {"cpu": "100m", "memory": "64Mi"},
+            "limits": {"cpu": "300m", "memory": "128Mi"},
+        },
+        "currencyservice": {
+            "requests": {"cpu": "100m", "memory": "64Mi"},
+            "limits": {"cpu": "300m", "memory": "128Mi"},
+        },
+        "frontend": {
+            "requests": {"cpu": "100m", "memory": "64Mi"},
+            "limits": {"cpu": "500m", "memory": "128Mi"},
+        },
+        "productcatalogservice": {
+            "requests": {"cpu": "100m", "memory": "64Mi"},
+            "limits": {"cpu": "400m", "memory": "128Mi"},
+        },
+        "recommendationservice": {
+            "requests": {"cpu": "100m", "memory": "220Mi"},
+            "limits": {"cpu": "500m", "memory": "450Mi"},
+        },
     }
+    assert {
+        name: profile["capacity_resources"]
+        for name, profile in configuration["deployments"].items()
+        if "capacity_resources" in profile
+    } == expected_capacity
     emailservice = configuration["deployments"]["emailservice"]
     assert emailservice["service_contract"] == {
         "name": "emailservice",
@@ -1904,7 +1929,7 @@ def test_healthy_probe_cadence_is_explicit_and_reproducible():
     assert '"proberca.io/healthy-capacity"' in installer
 
 
-def test_healthy_probe_installer_applies_frozen_frontend_capacity(monkeypatch):
+def test_healthy_probe_installer_applies_frozen_capacity(monkeypatch):
     configuration = yaml.safe_load(Path(
         "deploy/final-dataplane/healthy-probe-cadence.yaml"
     ).read_text(encoding="utf-8"))
@@ -1948,20 +1973,31 @@ def test_healthy_probe_installer_applies_frozen_frontend_capacity(monkeypatch):
         Path("/home/jyz/probeRCA")
     )
 
-    frontend = next(
-        command for command in commands
-        if "patch" in command and "deployment/frontend" in command
-    )
-    payload = json.loads(frontend[frontend.index("--patch") + 1])
-    template = payload["spec"]["template"]
-    assert template["metadata"]["annotations"][
-        "proberca.io/healthy-capacity"
-    ] == "cpu-500m_memory-128Mi"
-    container = template["spec"]["containers"][0]
-    assert container["name"] == "server"
-    assert container["resources"] == {
-        "requests": {"cpu": "100m", "memory": "64Mi"},
-        "limits": {"cpu": "500m", "memory": "128Mi"},
+    expected = {
+        name: profile["capacity_resources"]
+        for name, profile in configuration["deployments"].items()
+        if "capacity_resources" in profile
     }
-    assert container["livenessProbe"]["periodSeconds"] == 10
-    assert container["readinessProbe"]["periodSeconds"] == 1
+    for deployment, resources in expected.items():
+        command = next(
+            item for item in commands
+            if "patch" in item
+            and f"deployment/{deployment}" in item
+        )
+        payload = json.loads(command[command.index("--patch") + 1])
+        template = payload["spec"]["template"]
+        assert template["metadata"]["annotations"][
+            "proberca.io/healthy-capacity"
+        ] == (
+            f"cpu-{resources['limits']['cpu']}_"
+            f"memory-{resources['limits']['memory']}"
+        )
+        container = template["spec"]["containers"][0]
+        assert container["name"] \
+            == configuration["deployments"][deployment]["container"]
+        assert container["resources"] == resources
+        assert container["livenessProbe"]["periodSeconds"] \
+            == configuration["deployments"][deployment][
+                "liveness_period_seconds"
+            ]
+        assert container["readinessProbe"]["periodSeconds"] == 1

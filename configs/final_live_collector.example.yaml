@@ -53,7 +53,7 @@ prometheus:
   # the collector still reconstructs the same exact one-second boundaries.
   range_query_chunk_windows: 30
   # Keep hot-TSDB history reads serialized so they cannot starve the
-  # independent one-second primitive snapshot publisher on the 4-vCPU VM.
+  # independent one-second primitive snapshot publisher on the 8-vCPU VM.
   range_query_max_workers: 1
   final_target_wait_timeout_sec: 15.0
   sentinel_poll_interval_sec: 0.1
