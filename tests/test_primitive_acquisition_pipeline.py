@@ -235,6 +235,39 @@ def test_publication_enforces_visibility_before_overwrite():
     assert exporter._snapshot_ns == 2_000_000_000
 
 
+def test_late_ordered_publication_is_fresh_for_its_visibility_interval(
+    monkeypatch,
+):
+    exporter = _pipeline_exporter()
+    exporter.wall_clock_ns = lambda: 5_000_000_000
+    monotonic = {"ns": 10_000_000_000}
+    monkeypatch.setattr(
+        "proberca.dataplane.primitive_exporter.time.perf_counter_ns",
+        lambda: monotonic["ns"],
+    )
+    raw = SimpleNamespace(
+        context=SimpleNamespace(
+            acquisition_lag_ns=0,
+            started_perf_ns=monotonic["ns"],
+        ),
+        completed_perf_ns=monotonic["ns"],
+    )
+    exporter._publish_ordered(
+        target_ns=1_000_000_000,
+        rendered="late",
+        raw=raw,
+        stage_durations_ns={},
+    )
+
+    snapshot, timestamp_ns, error = exporter._response()
+    assert snapshot == "late"
+    assert timestamp_ns == 1_000_000_000
+    assert error == ""
+
+    monotonic["ns"] = 10_300_000_000
+    assert exporter._response()[2] == "stale"
+
+
 def test_publication_rejects_out_of_order_target():
     exporter = _pipeline_exporter()
     exporter._last_published_target_ns = 2_000_000_000

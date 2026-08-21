@@ -164,7 +164,7 @@ class FinalPrimitiveExporterConfig:
     beyla_acquisition_workers: int = 4
     raw_acquisition_workers: int = 24
     publish_queue_max_pending: int = 4
-    publish_visibility_sec: float = 0.5
+    publish_visibility_sec: float = 0.75
     experimental_dns_enabled: bool = False
 
     @classmethod
@@ -178,7 +178,7 @@ class FinalPrimitiveExporterConfig:
         normalized.setdefault("beyla_acquisition_workers", 4)
         normalized.setdefault("raw_acquisition_workers", 24)
         normalized.setdefault("publish_queue_max_pending", 4)
-        normalized.setdefault("publish_visibility_sec", 0.5)
+        normalized.setdefault("publish_visibility_sec", 0.75)
         values = _strict_mapping(
             normalized, set(cls.__dataclass_fields__),
             "final primitive exporter config",
@@ -2803,9 +2803,13 @@ class FinalPrimitiveExporter:
         with self._lock:
             self._snapshot = rendered
             self._snapshot_ns = target_ns
+            # A target may complete after its epoch second under bounded
+            # source or host pressure.  Record when it actually became
+            # visible so the HTTP gate does not reject a newly published,
+            # ordered snapshot merely because its target timestamp is old.
+            self._last_publish_perf_ns = published_perf_ns
             self._last_error = None
         self._last_published_target_ns = target_ns
-        self._last_publish_perf_ns = published_perf_ns
         publish_lag_ns = max(0, self.wall_clock_ns() - target_ns)
         diagnostic = {
             "target_ns": target_ns,
@@ -2985,10 +2989,29 @@ class FinalPrimitiveExporter:
             snapshot = self._snapshot
             timestamp_ns = self._snapshot_ns
             error = self._last_error
+            published_perf_ns = getattr(
+                self, "_last_publish_perf_ns", 0
+            )
         age_ns = self.wall_clock_ns() - timestamp_ns
+        visibility_ns = int(
+            float(getattr(
+                getattr(self, "config", None),
+                "publish_visibility_sec",
+                0.75,
+            )) * 1_000_000_000
+        )
+        since_publish_ns = (
+            time.perf_counter_ns() - published_perf_ns
+            if published_perf_ns else None
+        )
+        newly_published = (
+            since_publish_ns is not None
+            and 0 <= since_publish_ns <= visibility_ns
+        )
         fresh = (
             bool(snapshot)
-            and 0 <= age_ns <= 3_000_000_000
+            and 0 <= age_ns
+            and (age_ns <= 3_000_000_000 or newly_published)
             and error is None
         )
         return snapshot, timestamp_ns, "" if fresh else (error or "stale")

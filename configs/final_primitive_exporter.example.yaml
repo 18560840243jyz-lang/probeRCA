@@ -40,4 +40,8 @@ acquisition_max_pending: 6
 beyla_acquisition_workers: 6
 raw_acquisition_workers: 36
 publish_queue_max_pending: 4
-publish_visibility_sec: 0.5
+# Three 250 ms Prometheus scrape opportunities per ordered target.  A target
+# that completed late remains HTTP-fresh for this full interval from its
+# actual publication time; the exporter still becomes stale when publication
+# stops.
+publish_visibility_sec: 0.75

@@ -89,7 +89,7 @@ def test_final_exporter_config_is_frozen_and_one_second():
     assert config.beyla_acquisition_workers == 6
     assert config.raw_acquisition_workers == 36
     assert config.publish_queue_max_pending == 4
-    assert config.publish_visibility_sec == 0.5
+    assert config.publish_visibility_sec == 0.75
     assert config.inventory_max_staleness_sec == 30.0
     assert config.experimental_dns_enabled is False
     assert "kube-system/kube-dns" in config.include_services
