@@ -30,8 +30,14 @@ listen_host: 127.0.0.1
 listen_port: 9477
 snapshot_period_sec: 1
 source_timeout_sec: 5.0
-acquisition_max_pending: 4
-beyla_acquisition_workers: 4
-raw_acquisition_workers: 24
+# A slow Kubernetes API refresh must not drop a one-second acquisition target.
+# The last verified immutable inventory may be reused only within this bound;
+# every collected window still performs its independent runtime handshake.
+inventory_max_staleness_sec: 30.0
+# Five-second source deadlines at 1 Hz require six target slots: the five
+# possibly in-flight seconds plus the next target that must start on time.
+acquisition_max_pending: 6
+beyla_acquisition_workers: 6
+raw_acquisition_workers: 36
 publish_queue_max_pending: 4
 publish_visibility_sec: 0.5

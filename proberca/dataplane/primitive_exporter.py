@@ -159,6 +159,7 @@ class FinalPrimitiveExporterConfig:
     listen_port: int
     snapshot_period_sec: int
     source_timeout_sec: float
+    inventory_max_staleness_sec: float = 30.0
     acquisition_max_pending: int = 4
     beyla_acquisition_workers: int = 4
     raw_acquisition_workers: int = 24
@@ -172,6 +173,7 @@ class FinalPrimitiveExporterConfig:
     ) -> "FinalPrimitiveExporterConfig":
         normalized = dict(payload)
         normalized.setdefault("experimental_dns_enabled", False)
+        normalized.setdefault("inventory_max_staleness_sec", 30.0)
         normalized.setdefault("acquisition_max_pending", 4)
         normalized.setdefault("beyla_acquisition_workers", 4)
         normalized.setdefault("raw_acquisition_workers", 24)
@@ -250,6 +252,15 @@ class FinalPrimitiveExporterConfig:
                 or not isinstance(self.source_timeout_sec, (int, float)) \
                 or not 0 < float(self.source_timeout_sec) <= 30:
             raise RawCollectionError("source_timeout_sec is invalid")
+        if isinstance(self.inventory_max_staleness_sec, bool) \
+                or not isinstance(
+                    self.inventory_max_staleness_sec, (int, float)
+                ) \
+                or not float(self.source_timeout_sec) \
+                <= float(self.inventory_max_staleness_sec) <= 300:
+            raise RawCollectionError(
+                "inventory_max_staleness_sec is invalid"
+            )
         for name, minimum, maximum in (
             ("acquisition_max_pending", 2, 32),
             ("beyla_acquisition_workers", 2, 32),
@@ -260,9 +271,21 @@ class FinalPrimitiveExporterConfig:
             if isinstance(value, bool) or not isinstance(value, int) \
                     or not minimum <= value <= maximum:
                 raise RawCollectionError(f"{name} is outside its safe range")
-        if self.beyla_acquisition_workers > self.acquisition_max_pending:
+        minimum_pending = (
+            math.ceil(
+                float(self.source_timeout_sec)
+                / float(self.snapshot_period_sec)
+            ) + 1
+        )
+        if self.acquisition_max_pending < minimum_pending:
             raise RawCollectionError(
-                "Beyla workers cannot exceed acquisition pending capacity"
+                "acquisition pending capacity cannot cover the frozen "
+                "source timeout at one-second cadence"
+            )
+        if self.beyla_acquisition_workers \
+                != self.acquisition_max_pending:
+            raise RawCollectionError(
+                "Beyla workers must cover every pending acquisition target"
             )
         if self.raw_acquisition_workers < self.acquisition_max_pending * 4:
             raise RawCollectionError(
@@ -606,6 +629,8 @@ class FinalPrimitiveExporter:
             thread_name_prefix="final-primitive-raw",
         )
         self._inventory_refresh_future: Future[Inventory] | None = None
+        self._inventory_cache_accepted_perf_ns = 0
+        self._inventory_refresh_last_error: str | None = None
         self._cgroup_path_cache: tuple[
             tuple[str, ...], dict[str, Path]
         ] | None = None
@@ -648,6 +673,7 @@ class FinalPrimitiveExporter:
                 "inventory worker did not initialize before its deadline"
             ) from error
         self._inventory_cache = initial_inventory
+        self._inventory_cache_accepted_perf_ns = time.perf_counter_ns()
         required_raw_workers = self.config.acquisition_max_pending * (
             4 + len(initial_inventory.coredns_pods)
         )
@@ -2327,6 +2353,7 @@ class FinalPrimitiveExporter:
         if inventory is None:
             inventory = self._inventory()
             self._inventory_cache = inventory
+            self._inventory_cache_accepted_perf_ns = time.perf_counter_ns()
         try:
             return inventory, self._active_cgroup_paths(inventory)
         except RawCollectionError as cached_error:
@@ -2346,24 +2373,71 @@ class FinalPrimitiveExporter:
                 raise cached_error
             paths = self._active_cgroup_paths(refreshed)
             self._inventory_cache = refreshed
+            self._inventory_cache_accepted_perf_ns = time.perf_counter_ns()
+            self._inventory_refresh_last_error = None
             return refreshed, paths
 
-    def _accept_inventory_refresh(self) -> None:
+    def _require_fresh_inventory_cache(self, now_perf_ns: int) -> None:
+        accepted_ns = getattr(
+            self, "_inventory_cache_accepted_perf_ns", 0
+        )
+        if accepted_ns <= 0:
+            self._inventory_cache_accepted_perf_ns = now_perf_ns
+            return
+        maximum_ns = int(
+            float(self.config.inventory_max_staleness_sec)
+            * 1_000_000_000
+        )
+        age_ns = max(0, now_perf_ns - accepted_ns)
+        if age_ns > maximum_ns:
+            detail = getattr(self, "_inventory_refresh_last_error", None)
+            suffix = f": {detail}" if detail else ""
+            raise RawCollectionError(
+                "inventory_refresh_stale: no verified Kubernetes inventory "
+                f"for {age_ns / 1_000_000_000:.3f}s{suffix}"
+            )
+
+    def _accept_inventory_refresh(self) -> bool:
+        """Install a completed refresh without blocking a target boundary.
+
+        A target may keep using the last immutable, verified inventory while
+        one bounded background refresh is in flight.  The collector performs
+        its own start/end runtime-identity handshake for every window, while
+        the cache age below prevents a stalled Kubernetes client from masking
+        identity changes indefinitely.
+        """
+
         with self._inventory_refresh_lock:
             future = self._inventory_refresh_future
         if future is None:
-            return
+            return False
+        now_perf_ns = time.perf_counter_ns()
         if not future.done():
-            raise RawCollectionError(
-                "inventory refresh missed the next snapshot deadline"
-            )
+            self._require_fresh_inventory_cache(now_perf_ns)
+            return False
         try:
             refreshed = future.result()
+        except Exception as error:
+            self._inventory_refresh_last_error = (
+                f"{type(error).__name__}: {error}"
+            )
+            self._require_fresh_inventory_cache(now_perf_ns)
+            print(
+                "Kubernetes inventory refresh failed; retaining the last "
+                "verified inventory within its bounded staleness budget: "
+                f"{self._inventory_refresh_last_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
         finally:
             with self._inventory_refresh_lock:
                 if self._inventory_refresh_future is future:
                     self._inventory_refresh_future = None
         self._inventory_cache = refreshed
+        self._inventory_cache_accepted_perf_ns = now_perf_ns
+        self._inventory_refresh_last_error = None
+        return True
 
     def _start_inventory_refresh(self) -> None:
         with self._inventory_refresh_lock:

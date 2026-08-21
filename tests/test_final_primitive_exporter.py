@@ -85,11 +85,12 @@ def test_final_exporter_config_is_frozen_and_one_second():
     config = FinalPrimitiveExporterConfig.from_dict(payload)
     assert config.schema_version == FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION
     assert config.snapshot_period_sec == 1
-    assert config.acquisition_max_pending == 4
-    assert config.beyla_acquisition_workers == 4
-    assert config.raw_acquisition_workers == 24
+    assert config.acquisition_max_pending == 6
+    assert config.beyla_acquisition_workers == 6
+    assert config.raw_acquisition_workers == 36
     assert config.publish_queue_max_pending == 4
     assert config.publish_visibility_sec == 0.5
+    assert config.inventory_max_staleness_sec == 30.0
     assert config.experimental_dns_enabled is False
     assert "kube-system/kube-dns" in config.include_services
     assert len(config.include_services) == 12
@@ -97,6 +98,16 @@ def test_final_exporter_config_is_frozen_and_one_second():
     invalid["snapshot_period_sec"] = 2
     with pytest.raises(RawCollectionError, match="frozen range"):
         FinalPrimitiveExporterConfig.from_dict(invalid)
+    underprovisioned = dict(payload)
+    underprovisioned["acquisition_max_pending"] = 5
+    underprovisioned["beyla_acquisition_workers"] = 5
+    underprovisioned["raw_acquisition_workers"] = 30
+    with pytest.raises(RawCollectionError, match="cannot cover"):
+        FinalPrimitiveExporterConfig.from_dict(underprovisioned)
+    missing_worker = dict(payload)
+    missing_worker["beyla_acquisition_workers"] = 5
+    with pytest.raises(RawCollectionError, match="every pending"):
+        FinalPrimitiveExporterConfig.from_dict(missing_worker)
 
 
 def test_formal_live_collector_has_tcp_queries_but_no_dns_queries():
@@ -120,7 +131,13 @@ def test_formal_live_collector_has_tcp_queries_but_no_dns_queries():
     )
 
 
-def test_inventory_refresh_is_single_inflight_and_installed_atomically():
+def test_inventory_refresh_is_single_inflight_and_installed_atomically(
+    monkeypatch,
+):
+    clock = {"ns": 1_000_000_000}
+    monkeypatch.setattr(
+        primitive_module.time, "perf_counter_ns", lambda: clock["ns"]
+    )
     stale = SimpleNamespace(containers=(
         SimpleNamespace(container_id="a" * 64),
     ))
@@ -130,7 +147,10 @@ def test_inventory_refresh_is_single_inflight_and_installed_atomically():
     future = Future()
     submissions = []
     exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.config = SimpleNamespace(inventory_max_staleness_sec=30.0)
     exporter._inventory_cache = stale
+    exporter._inventory_cache_accepted_perf_ns = clock["ns"]
+    exporter._inventory_refresh_last_error = None
     exporter._inventory_refresh_lock = threading.Lock()
     exporter._inventory_refresh_future = None
     exporter._inventory_refresh_executor = SimpleNamespace(
@@ -140,16 +160,68 @@ def test_inventory_refresh_is_single_inflight_and_installed_atomically():
     exporter._start_inventory_refresh()
     exporter._start_inventory_refresh()
     assert submissions == [primitive_module._inventory_worker]
-    with pytest.raises(
-        RawCollectionError, match="missed the next snapshot deadline"
-    ):
-        exporter._accept_inventory_refresh()
+    clock["ns"] += 2_000_000_000
+    assert exporter._accept_inventory_refresh() is False
     assert exporter._inventory_cache is stale
 
     future.set_result(refreshed)
-    exporter._accept_inventory_refresh()
+    assert exporter._accept_inventory_refresh() is True
     assert exporter._inventory_cache is refreshed
+    assert exporter._inventory_cache_accepted_perf_ns == clock["ns"]
     assert exporter._inventory_refresh_future is None
+
+
+def test_inventory_refresh_staleness_is_bounded(monkeypatch):
+    clock = {"ns": 10_000_000_000}
+    monkeypatch.setattr(
+        primitive_module.time, "perf_counter_ns", lambda: clock["ns"]
+    )
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.config = SimpleNamespace(inventory_max_staleness_sec=5.0)
+    exporter._inventory_cache = object()
+    exporter._inventory_cache_accepted_perf_ns = clock["ns"]
+    exporter._inventory_refresh_last_error = None
+    exporter._inventory_refresh_lock = threading.Lock()
+    exporter._inventory_refresh_future = Future()
+
+    clock["ns"] += 5_000_000_000
+    assert exporter._accept_inventory_refresh() is False
+    clock["ns"] += 1
+    with pytest.raises(RawCollectionError, match="inventory_refresh_stale"):
+        exporter._accept_inventory_refresh()
+
+
+def test_failed_inventory_refresh_retries_with_verified_cache(monkeypatch):
+    clock = {"ns": 20_000_000_000}
+    monkeypatch.setattr(
+        primitive_module.time, "perf_counter_ns", lambda: clock["ns"]
+    )
+    stale = object()
+    failed = Future()
+    failed.set_exception(RuntimeError("temporary Kubernetes API pressure"))
+    replacement = Future()
+    submissions = []
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.config = SimpleNamespace(inventory_max_staleness_sec=30.0)
+    exporter._inventory_cache = stale
+    exporter._inventory_cache_accepted_perf_ns = clock["ns"]
+    exporter._inventory_refresh_last_error = None
+    exporter._inventory_refresh_lock = threading.Lock()
+    exporter._inventory_refresh_future = failed
+    exporter._inventory_refresh_executor = SimpleNamespace(
+        submit=lambda function: submissions.append(function) or replacement
+    )
+
+    clock["ns"] += 2_000_000_000
+    assert exporter._accept_inventory_refresh() is False
+    assert exporter._inventory_cache is stale
+    assert exporter._inventory_refresh_future is None
+    assert "temporary Kubernetes API pressure" in (
+        exporter._inventory_refresh_last_error or ""
+    )
+    exporter._start_inventory_refresh()
+    assert submissions == [primitive_module._inventory_worker]
+    assert exporter._inventory_refresh_future is replacement
 
 
 def test_source_parser_warmup_is_read_only_and_uses_frozen_inventory():
