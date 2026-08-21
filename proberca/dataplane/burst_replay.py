@@ -18,15 +18,16 @@ from .burst_collection import (
     BurstChannelCalibration,
     BurstEvidenceCollector,
 )
+from .burst import burst_event_rate
 from .contracts import CollectedWindow, assert_label_safe, fingerprint
 from .raw import RawCollectionError
 
 
 BURST_CALIBRATION_ARTIFACT_SCHEMA_VERSION = (
-    "probeRCA-final-burst-calibration-v1"
+    "probeRCA-final-burst-calibration-v2"
 )
 BURST_CALIBRATION_POLICY_SCHEMA_VERSION = (
-    "probeRCA-final-burst-calibration-policy-v1"
+    "probeRCA-final-burst-calibration-policy-v2"
 )
 
 
@@ -54,6 +55,7 @@ class BurstCalibrationPolicy:
 
     schema_version: str
     rare_event_thresholds: dict[str, float]
+    rare_event_quantile: float
     continuous_transform: str
     continuous_polarity: int
     continuous_z_cap: float
@@ -63,11 +65,13 @@ class BurstCalibrationPolicy:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "BurstCalibrationPolicy":
-        if not isinstance(payload, dict) or set(payload) != set(
-            cls.__dataclass_fields__
-        ):
+        if not isinstance(payload, dict):
             raise RawCollectionError("Burst calibration policy fields mismatch")
-        result = cls(**payload)
+        values = dict(payload)
+        values.setdefault("rare_event_quantile", 0.999)
+        if set(values) != set(cls.__dataclass_fields__):
+            raise RawCollectionError("Burst calibration policy fields mismatch")
+        result = cls(**values)
         result.validate()
         return result
 
@@ -79,6 +83,7 @@ class BurstCalibrationPolicy:
         payload["rare_event_thresholds"] = dict(
             payload["rare_event_thresholds"]
         )
+        payload.setdefault("rare_event_quantile", 0.999)
         result = cls(
             **payload,
             policy_fingerprint=fingerprint(payload),
@@ -93,6 +98,13 @@ class BurstCalibrationPolicy:
             raise RawCollectionError("Burst calibration transform is invalid")
         if self.continuous_polarity not in {-1, 1}:
             raise RawCollectionError("Burst calibration polarity is invalid")
+        quantile = _positive(
+            "rare_event_quantile", self.rare_event_quantile
+        )
+        if quantile >= 1.0:
+            raise RawCollectionError(
+                "rare_event_quantile must be in (0,1)"
+            )
         _positive("continuous_z_cap", self.continuous_z_cap)
         _positive("continuous_minimum_scale", self.continuous_minimum_scale)
         if (
@@ -123,6 +135,7 @@ class BurstCalibrationPolicy:
             "rare_event_thresholds": dict(sorted(
                 self.rare_event_thresholds.items()
             )),
+            "rare_event_quantile": self.rare_event_quantile,
             "continuous_transform": self.continuous_transform,
             "continuous_polarity": self.continuous_polarity,
             "continuous_z_cap": self.continuous_z_cap,
@@ -155,7 +168,8 @@ class BurstCalibrationArtifact:
         calibrations: Iterable[BurstChannelCalibration],
     ) -> "BurstCalibrationArtifact":
         values = tuple(sorted(
-            calibrations, key=lambda item: item.channel_id
+            calibrations,
+            key=lambda item: (item.channel_id, item.target_id),
         ))
         payload = {
             "schema_version": BURST_CALIBRATION_ARTIFACT_SCHEMA_VERSION,
@@ -260,10 +274,13 @@ class BurstCalibrationArtifact:
             "artifact_fingerprint",
         ):
             _sha256(name, getattr(self, name))
-        channels = [item.channel_id for item in self.calibrations]
-        if not channels or channels != sorted(set(channels)):
+        coordinates = [
+            (item.channel_id, item.target_id)
+            for item in self.calibrations
+        ]
+        if not coordinates or coordinates != sorted(set(coordinates)):
             raise RawCollectionError(
-                "Burst calibrations must be non-empty, sorted, and unique"
+                "Burst target calibrations must be non-empty, sorted, and unique"
             )
         for item in self.calibrations:
             item.validate()
@@ -321,7 +338,8 @@ def calibrate_healthy_burst(
         raise RawCollectionError(
             "rare thresholds must cover every formal rare channel exactly"
         )
-    healthy_values = {channel_id: [] for channel_id in continuous}
+    healthy_values: dict[tuple[str, str], list[float]] = {}
+    healthy_rates: dict[tuple[str, str], list[float]] = {}
     observed = set()
     for window in archive.iter_windows():
         for sample in window.samples:
@@ -330,25 +348,51 @@ def calibrate_healthy_burst(
                     "Healthy Burst archive contains a non-formal channel"
                 )
             observed.add(sample.channel_id)
+            key = (sample.channel_id, sample.entity_id)
             if sample.channel_id in continuous:
-                healthy_values[sample.channel_id].append(sample.value)
+                healthy_values.setdefault(key, []).append(sample.value)
+            else:
+                if sample.exposure is None \
+                        or not float(sample.value).is_integer():
+                    raise RawCollectionError(
+                        "Healthy rare Burst sample is malformed"
+                    )
+                healthy_rates.setdefault(key, []).append(
+                    burst_event_rate(
+                        int(sample.value), float(sample.exposure)
+                    )
+                )
     if observed != expected:
         missing = sorted(expected - observed)
         raise RawCollectionError(
             "Healthy Burst archive lacks formal channels: " + ",".join(missing)
         )
+    coordinates = sorted(set(healthy_values) | set(healthy_rates))
     calibrations = []
-    for channel_id in sorted(expected):
+    for channel_id, target_id in coordinates:
         mode = BURST_CHANNEL_MODES[channel_id]
+        threshold = None
+        if mode == "rare":
+            rates = sorted(healthy_rates[(channel_id, target_id)])
+            index = min(
+                len(rates) - 1,
+                max(
+                    0,
+                    math.ceil(policy.rare_event_quantile * len(rates)) - 1,
+                ),
+            )
+            threshold = max(
+                policy.rare_event_thresholds[channel_id], rates[index]
+            )
         calibrations.append(BurstChannelCalibration.create(
             channel_id=channel_id,
+            target_id=target_id,
             mode=mode,
-            rare_event_threshold=(
-                policy.rare_event_thresholds[channel_id]
-                if mode == "rare" else None
-            ),
+            rare_event_threshold=threshold,
             healthy_values=(
-                () if mode == "rare" else healthy_values[channel_id]
+                () if mode == "rare" else healthy_values[
+                    (channel_id, target_id)
+                ]
             ),
             transform=policy.continuous_transform,
             polarity=policy.continuous_polarity,
@@ -393,7 +437,7 @@ class BurstJoinedCollectionArchive(CollectionArchive):
             "burst_calibration_fingerprint": (
                 calibration_artifact.artifact_fingerprint
             ),
-            "join_semantics": "aligned_read_only_burst_v1",
+            "join_semantics": "aligned_read_only_target_calibrated_burst_v2",
         })
         result = cls(
             **values,

@@ -37,6 +37,7 @@ from proberca.controlplane.observations import (
     RobustBaselineStore,
     quantile_required_samples,
 )
+from proberca.controlplane.pipeline import ControlPlaneError
 from proberca.controlplane.service_model import (
     AllowedServiceGraph,
     ServiceRLS,
@@ -765,6 +766,55 @@ def test_quantile_required_samples_is_derived_from_the_tail_probability():
             quantile_required_samples(invalid)
 
 
+def test_local_socket_ratio_separates_modeling_from_root_exposure():
+    config = replace(
+        FinalControlConfig(),
+        baseline_min_windows=3,
+        failure_min_requests=5,
+        baseline_family_min_scales={
+            "count": 0.5,
+            "latency": 0.5,
+            "psi": 0.0005,
+            "ratio": 0.0005,
+        },
+    )
+    resolver = MetricResolver(config)
+    baseline = RobustBaselineStore(config)
+    local = next(
+        item for item in _node_records(1)
+        if item.metric_name == "local_socket_failure_rate"
+    )
+    metric, spec = resolver.resolve(local)
+    for _ in range(3):
+        baseline.update(metric.node_id, baseline.transform(0.0, spec), spec)
+
+    sparse = replace(local, value=1.0, sample_count=1)
+    observations, raw = resolver.normalize_window(
+        SimpleNamespace(node_metrics=(sparse,), edge_metrics=()), baseline,
+    )
+    assert metric.node_id in observations
+    assert metric.node_id in raw
+    validity = resolver.last_validity[metric.node_id]
+    assert validity["data_plane_invalid_reason"] is None
+    assert validity["control_plane_invalid_reason"] is None
+    assert validity["model_valid"] is True
+    assert validity["alert_eligible"] is False
+    assert validity["root_evidence_eligible"] is False
+    assert observations[metric.node_id].alert_eligible is False
+
+    exposed = replace(local, value=0.2, sample_count=5)
+    observations, raw = resolver.normalize_window(
+        SimpleNamespace(node_metrics=(exposed,), edge_metrics=()), baseline,
+    )
+    assert metric.node_id in observations
+    assert metric.node_id in raw
+    assert resolver.last_validity[metric.node_id]["model_valid"] is True
+    assert resolver.last_validity[metric.node_id]["alert_eligible"] is True
+    assert resolver.last_validity[metric.node_id][
+        "root_evidence_eligible"
+    ] is True
+
+
 def test_service_quantile_reliability_filters_alerts_without_hiding_exposure():
     config = replace(
         FinalControlConfig(),
@@ -1086,6 +1136,7 @@ def test_data_plane_invalid_record_does_not_enter_healthy_baseline():
         "formal_scope": "included",
         "model_valid": False,
         "alert_eligible": False,
+        "root_evidence_eligible": False,
         "root_eligible": False,
         "readiness_required": False,
     }
@@ -1557,7 +1608,10 @@ def test_calibration_and_healthy_validation_are_independent_and_frozen(
     assert run.state_timeline[5]["baseline_frozen"] is True
     assert run.state_timeline[6]["state"] == "ready"
     assert run.state_timeline[6]["baseline_frozen"] is True
-    assert set(map(len, control.baseline.snapshot().values())) == {8}
+    # Once independent Healthy Validation passes, the calibrated model is a
+    # frozen experiment input.  Extra healthy windows may be retained as raw
+    # data but cannot silently change Baseline, A_s, or A_v provenance.
+    assert set(map(len, control.baseline.snapshot().values())) == {6}
     assert report["ready"] is True
     assert report["healthy_validation_result"] == "passed"
     assert report["healthy_validation_windows"] == 1
@@ -1836,6 +1890,7 @@ def test_fault_runner_validates_frozen_formal_burst_channels(
         node_metrics=(
             SimpleNamespace(scope="service", service_name="checkoutservice"),
         ),
+        topology_events=(object(),),
     )
 
     def sample(channel_id):
@@ -1865,6 +1920,13 @@ def test_fault_runner_validates_frozen_formal_burst_channels(
     )
     monkeypatch.setattr(runner.CollectionArchive, "load", lambda _path: normal)
     monkeypatch.setattr(runner.BurstArchive, "load", lambda _path: burst)
+    monkeypatch.setattr(
+        runner, "formal_service_graph",
+        lambda _snapshot, _config: SimpleNamespace(
+            topology_fingerprint="topology",
+            runtime_identity_fingerprint="runtime",
+        ),
+    )
 
     result = runner.validate_archives(normal_root, burst_root, 1)
     assert result["window_count"] == 1
@@ -2252,8 +2314,11 @@ def test_unique_window_snapshots_keep_one_topology_epoch_and_full_history(
     assert control.service_rls.reset_count == 0
     assert control._metric_history_reset_count == 0
     assert control.service_rls.configuration_count == 1
-    assert set(map(len, control.baseline.snapshot().values())) == {119}
-    assert len(control._healthy_history) == 116
+    # The topology identity remains stable, while the formal model freezes at
+    # the completed independent-validation handshake instead of drifting over
+    # later healthy windows.
+    assert set(map(len, control.baseline.snapshot().values())) == {6}
+    assert len(control._healthy_history) == 3
 
 
 def test_real_semantic_topology_change_resets_once_at_window_61(tmp_path):
@@ -2278,7 +2343,10 @@ def test_real_semantic_topology_change_resets_once_at_window_61(tmp_path):
     assert control.service_rls.reset_count == 1
     assert control._metric_history_reset_count == 1
     assert control.service_rls.configuration_count == 2
-    assert set(map(len, control.baseline.snapshot().values())) == {59}
+    # The real topology change creates exactly one fresh calibration epoch;
+    # that epoch then freezes at the same deterministic readiness boundary.
+    assert set(map(len, control.baseline.snapshot().values())) == {6}
+    assert len(control._healthy_history) == 3
     assert control._last_calibration_reset_reason \
         == "topology_fingerprint_changed"
 
@@ -3122,6 +3190,21 @@ def test_tcp_edge_runs_av_residual_burst_penalty_and_fista():
     assert candidate_score.score > 0.0
     assert all(item.root_category != "DNS" for item in result.candidates)
 
+    # Model-valid but exposure-ineligible root observations remain available
+    # to A_v, yet cannot become an incident-time FISTA coordinate.
+    control._hard = SimpleNamespace(
+        sequence=5,
+        timestamp_ns=5 * _NS,
+        analysis_cutoff_ns=6 * _NS,
+        observations={
+            latency_id: replace(observation, alert_eligible=False),
+        },
+    )
+    with pytest.raises(
+        ControlPlaneError, match="candidate graph has no observed root coordinates",
+    ):
+        control._diagnose()
+
 
 def test_legacy_dns_archive_is_readable_but_dns_is_excluded(tmp_path):
     config = _config()
@@ -3283,6 +3366,10 @@ def test_fault_actor_failsafe_tracks_capture_windows_not_wall_budget():
         def start_actor(*args, **kwargs):
             observed.append((args, kwargs))
 
+        @staticmethod
+        def write_cgroup_control(*_args, **_kwargs):
+            return None
+
     runner.actor_fault(
         "memory", service=None,
     )(Context(), 60)
@@ -3294,6 +3381,153 @@ def test_fault_actor_failsafe_tracks_capture_windows_not_wall_budget():
         == 60 + runner.FAULT_ACTOR_FAILSAFE_GRACE_SEC
         for item in observed
     )
+
+
+def test_cgroup_control_replacement_restores_exact_value(tmp_path):
+    import scripts.run_final_fault_matrix as runner
+
+    control = tmp_path / "cpu.max"
+    control.write_text("100000 100000\n", encoding="ascii")
+
+    original, restore = runner.replace_text_file(
+        control, "25000 100000"
+    )
+
+    assert original == "100000 100000"
+    assert control.read_text(encoding="ascii") == "25000 100000\n"
+    restore()
+    restore()
+    assert control.read_text(encoding="ascii") == "100000 100000\n"
+
+
+def test_formal_pod_restart_or_identity_change_fails_experiment():
+    import scripts.run_final_fault_matrix as runner
+
+    before = {
+        "alpha": {
+            "container_id": "container-a",
+            "pod_uid": "pod-a",
+            "ready": True,
+            "restart_count": 2,
+        }
+    }
+    runner.assert_no_formal_pod_change(before, before)
+
+    restarted = {
+        "alpha": {**before["alpha"], "restart_count": 3},
+    }
+    with pytest.raises(runner.ExperimentError, match="identity/restart"):
+        runner.assert_no_formal_pod_change(before, restarted)
+
+    replaced = {
+        "alpha": {**before["alpha"], "pod_uid": "pod-b"},
+    }
+    with pytest.raises(runner.ExperimentError, match="identity/restart"):
+        runner.assert_no_formal_pod_change(before, replaced)
+
+
+def test_formal_faults_act_on_real_paths_not_isolated_synthetic_signals(
+    monkeypatch,
+):
+    import scripts.run_final_fault_matrix as runner
+
+    specs = {item["fault_type"]: item for item in runner.experiment_specs()}
+    controls = []
+    actors = []
+
+    class Context:
+        metadata = {}
+
+        @staticmethod
+        def write_cgroup_control(service, control, value):
+            controls.append((service, control, value))
+
+        @staticmethod
+        def start_actor(*args, **kwargs):
+            actors.append((args, kwargs))
+
+        @staticmethod
+        def start_kubernetes_actor(**kwargs):
+            actors.append(((), kwargs))
+
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+    specs["service_cpu"]["activate"](Context(), 60)
+    specs["service_memory"]["activate"](Context(), 60)
+    specs["service_lock"]["activate"](Context(), 60)
+
+    assert controls[0] == (
+        "frontend", "cpu.max", runner.SERVICE_CPU_QUOTA,
+    )
+    assert controls[1] == (
+        "recommendationservice", "memory.high",
+        str(runner.SERVICE_MEMORY_HIGH_BYTES),
+    )
+    assert actors[0][1]["service"] == "recommendationservice"
+    assert actors[1][1]["workload"] == "proberca-healthy-rpc-load"
+    assert actors[1][1]["container"] == "rpc-load"
+    assert "cartservice:7070" in actors[1][1]["program"]
+
+    # IO actors are explicitly direct/synchronous in the formal spec.  This
+    # checks the closure without duplicating implementation logic in a test.
+    service_io = specs["service_io"]["activate"]
+    service_io(Context(), 60)
+    host_io = specs["host_io"]["activate"]
+    host_io(Context(), 60)
+    assert "--direct" in actors[-2][1]["arguments"]
+    assert "--direct" in actors[-1][1]["arguments"]
+
+
+def test_service_localnet_fault_covers_formal_egress_and_cleans_up(
+    monkeypatch,
+):
+    import scripts.run_final_fault_matrix as runner
+
+    commands = []
+    cleanups = []
+
+    class Context:
+        metadata = {}
+
+        @staticmethod
+        def add_cleanup(callback):
+            cleanups.append(callback)
+
+    identities = {
+        "frontend": {"pod_ip": "10.0.0.1"},
+        "alpha": {"pod_ip": "10.0.0.2"},
+        "beta": {"pod_ip": "10.0.0.3"},
+    }
+    monkeypatch.setattr(
+        runner, "formal_service_names",
+        lambda: ("frontend", "alpha", "beta"),
+    )
+    monkeypatch.setattr(
+        runner, "service_info", lambda service: identities[service],
+    )
+    monkeypatch.setattr(
+        runner, "add_iptables_rule",
+        lambda arguments: commands.append(("add", tuple(arguments))),
+    )
+    monkeypatch.setattr(
+        runner, "node_command",
+        lambda arguments, **_kwargs: commands.append(
+            ("delete", tuple(arguments))
+        ),
+    )
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+
+    runner.service_localnet(Context(), 60)
+
+    additions = [item for operation, item in commands if operation == "add"]
+    assert len(additions) == 2
+    assert all("10.0.0.1" in item for item in additions)
+    assert {item[item.index("-d") + 1] for item in additions} == {
+        "10.0.0.2", "10.0.0.3",
+    }
+    assert all("proberca-final-service-localnet" in item for item in additions)
+    assert len(cleanups) == 1
+    cleanups[0]()
+    assert len([item for operation, item in commands if operation == "delete"]) == 2
 
 
 def test_fault_phase_callback_runs_before_archive_validation(

@@ -84,6 +84,7 @@ def _probability(name: str, value: Any) -> float:
 @dataclass(frozen=True)
 class BurstChannelCalibration:
     channel_id: str
+    target_id: str
     mode: str
     rare_event_threshold: float | None
     healthy_values: tuple[float, ...]
@@ -98,6 +99,7 @@ class BurstChannelCalibration:
     def create(cls, **values) -> "BurstChannelCalibration":
         payload = dict(values)
         payload.pop("calibration_id", None)
+        payload.setdefault("target_id", "*")
         for name in ("healthy_values",):
             payload[name] = tuple(payload[name])
         calibration_id = fingerprint({
@@ -109,10 +111,14 @@ class BurstChannelCalibration:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "BurstChannelCalibration":
-        if not isinstance(payload, dict) \
-                or set(payload) != set(cls.__dataclass_fields__):
+        if not isinstance(payload, dict):
             raise RawCollectionError("Burst calibration fields mismatch")
         values = dict(payload)
+        # Calibration artifacts written before target-scoped Healthy
+        # references used one wildcard calibration per channel.
+        values.setdefault("target_id", "*")
+        if set(values) != set(cls.__dataclass_fields__):
+            raise RawCollectionError("Burst calibration fields mismatch")
         if not isinstance(values["healthy_values"], list):
             raise RawCollectionError("healthy_values must be a list")
         values["healthy_values"] = tuple(values["healthy_values"])
@@ -123,6 +129,8 @@ class BurstChannelCalibration:
     def validate(self) -> None:
         if not isinstance(self.channel_id, str) or not self.channel_id:
             raise RawCollectionError("Burst calibration channel_id is required")
+        if not isinstance(self.target_id, str) or not self.target_id:
+            raise RawCollectionError("Burst calibration target_id is required")
         if self.mode not in {"rare", "continuous"}:
             raise RawCollectionError("Burst calibration mode is invalid")
         if self.mode == "rare":
@@ -288,12 +296,19 @@ class BurstEvidenceCollector:
     ):
         self.contract = dict(collection_contract)
         self.collector_build_id = collector_build_id
+        calibration_values = tuple(calibrations)
         self.calibrations = {
-            item.channel_id: item for item in calibrations
+            (item.channel_id, item.target_id): item
+            for item in calibration_values
         }
+        if len(self.calibrations) != len(calibration_values):
+            raise RawCollectionError("duplicate Burst target calibration")
         roles = self.contract.get("burst_channel_roles") or []
         self.roles = {item["channel_id"]: item for item in roles}
-        if set(self.calibrations) != set(self.roles):
+        calibrated_channels = {
+            channel_id for channel_id, _target_id in self.calibrations
+        }
+        if calibrated_channels != set(self.roles):
             raise RawCollectionError(
                 "Burst calibrations must cover every frozen channel exactly"
             )
@@ -304,7 +319,7 @@ class BurstEvidenceCollector:
                     f"Burst calibration mode mismatch for {item.channel_id}"
                 )
         self.continuous_references = {
-            item.channel_id: fit_continuous_burst_reference(
+            (item.channel_id, item.target_id): fit_continuous_burst_reference(
                 item.healthy_values,
                 transform=item.transform,
                 minimum_healthy_samples=item.minimum_healthy_samples,
@@ -349,7 +364,16 @@ class BurstEvidenceCollector:
         output = []
         for key, values in sorted(grouped.items()):
             namespace, entity_type, entity_id, channel_id = key
-            calibration = self.calibrations[channel_id]
+            calibration = self.calibrations.get((channel_id, entity_id))
+            if calibration is None:
+                # Wildcard calibrations keep synthetic/unit-test fixtures
+                # readable; formal Healthy calibration always emits an exact
+                # target identity.
+                calibration = self.calibrations.get((channel_id, "*"))
+            if calibration is None:
+                raise RawCollectionError(
+                    "Burst calibration is absent for target/channel"
+                )
             if calibration.mode == "rare":
                 if any(item.exposure is None for item in values):
                     raise RawCollectionError(
@@ -372,7 +396,9 @@ class BurstEvidenceCollector:
                     )
                 strength = continuous_burst_strength_from_reference(
                     values[0].value,
-                    self.continuous_references[channel_id],
+                    self.continuous_references[
+                        (calibration.channel_id, calibration.target_id)
+                    ],
                     polarity=calibration.polarity,
                     transform=calibration.transform,
                     z_cap=calibration.z_cap,

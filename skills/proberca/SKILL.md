@@ -1536,7 +1536,8 @@ T_B=30\text{秒}
 TCP边	retrans rate、RTO、RTT p95、connect failure、RST
 
 十八、步骤16：判断Burst数据是否异常
-Burst数据分为两类。
+Burst数据分为两类。所有健康参考和阈值都必须按
+`(entity_id, channel_id)`独立冻结，不得把不同服务、主机或有向TCP边混合校准。
 
 18.1 自然稀有事件
 例如：
@@ -1552,12 +1553,11 @@ connect failure。
 事件率：
 [
 \boxed{
-v_q(t)
-\frac{
-N_q(t)
-}{
-E_q(t)+\epsilon
-}
+v_q(t)=
+\begin{cases}
+N_q(t)/E_q(t), & E_q(t)>0,\\
+N_q(t), & E_q(t)=0.
+\end{cases}
 }
 ]
 其中：
@@ -1586,7 +1586,7 @@ a_q^B(t)
 ]
 其中：
 
-(\tau_q)：该证据达到强异常时的事件率阈值；
+(\tau_q)：该实体/通道的冻结阈值，取配置分辨率下限与Healthy事件率高分位的较大值；
 
 
 (\operatorname{clip}(x,0,1))：将数值限制到0到1；
@@ -2327,6 +2327,16 @@ TCP边独立告警
 - 所有正式范围过滤必须从冻结scope/config推导，禁止按具体服务名硬编码。
 - 正式live collector必须从冻结配置读取15条有向TCP边并在正式9/4/3聚合前完成投影；exporter/Prometheus仍可保留范围外动态边用于诊断，但这些原始序列不得进入正式窗口、拓扑指纹、Dataset特征或因边界不完整而阻断正式归档。冻结边若整体缺失，仍必须失败关闭。
 
+## 正式单机故障试验资格门禁
+
+- 数据归档通过`9/4/3`、哈希与Normal/Burst对齐，只能证明采集完整，不能证明注入已作用于业务。
+- 进入准确率分母前，必须在封存后单独验证：注入作用于真实应用/资源/通信路径；声明的正式根因指标或同一正式机制确实被观测；异常期在冻结`5分连续3窗`规则下出现Confirmed Hard业务症状；拓扑、runtime identity与Pod restart保持稳定；没有人为叠加第二类故障。
+- 独立helper只制造自身CPU、futex、loopback或文件活动，但不影响应用请求的试验，属于`invalid_intervention`，必须重新注入，不能计作RCA漏检。
+- 注入manifest和期望根因只能在推断输出封存后用于试验资格审计与准确率评价，禁止进入告警、候选图、传播学习、残差、Burst标定、FISTA或排序。
+- 失败试验必须同时报告尝试数、通过资格数和失败原因；每类准确率的分母只能是预先声明且通过资格门禁的独立重复试验。
+- 禁止通过降低Soft/Hard、扩大family floor、补零或读取标签使无效注入“通过”。
+- 为工程可复现性，故障注入必须有精确清理动作并恢复原cgroup、iptables或qdisc状态；清理失败或Pod重启时该试验失败关闭。
+
 ## Stable runtime identity handshake
 
 - Runtime identity fingerprints include semantic identity fields such as owner
@@ -2336,3 +2346,20 @@ TCP边独立告警
   must not invalidate Healthy models while semantic identity is unchanged.
 - A real Pod UID, owner UID, full container ID, node, image, or formal service
   association change still invalidates the handshake and fails closed.
+
+## Local-socket validity and formal model freeze
+
+- `local_socket_failure_rate` counts only meaningful completed socket
+  operations. Normal non-blocking `accept` results such as
+  `EAGAIN`/`EWOULDBLOCK` and restartable/interrupted accepts are excluded from
+  both the numerator and denominator.
+- The record `sample_count` is the actual operation denominator. At least one
+  meaningful operation makes the ratio valid for Baseline and `A_v`; the
+  stricter `failure_min_requests` threshold applies to current-window root
+  evidence, residual construction, and FISTA. Never compensate for sparse
+  exposure with zero fill, forward fill, a family-floor change, or a
+  service-specific exception.
+- Once independent Healthy Validation reaches READY, freeze Baseline, `A_s`,
+  and `A_v`. Later healthy raw windows remain available for diagnostics but do
+  not mutate the formal model. Any relevant fingerprint or frozen load-profile
+  change requires a new Healthy Pilot before formal fault experiments.

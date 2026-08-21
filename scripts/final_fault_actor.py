@@ -55,28 +55,39 @@ def memory_actor(byte_count: int, deadline: float) -> None:
     region.close()
 
 
-def io_actor(path: Path, maximum_bytes: int, deadline: float) -> None:
+def io_actor(
+    path: Path, maximum_bytes: int, deadline: float, *, direct: bool,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    block = b"\0" * (1024 * 1024)
-    descriptor = os.open(
-        path, os.O_CREAT | os.O_TRUNC | os.O_RDWR, 0o600
-    )
+    block_size = 1024 * 1024
+    flags = os.O_CREAT | os.O_TRUNC | os.O_RDWR
+    if direct:
+        flags |= os.O_DIRECT | os.O_SYNC
+    descriptor = os.open(path, flags, 0o600)
+    # Anonymous mmap pages are page-aligned, which satisfies O_DIRECT's
+    # userspace-buffer alignment requirement.  A bytes object is not
+    # guaranteed to be aligned and can fail with EINVAL.
+    aligned_block = mmap.mmap(-1, block_size) if direct else None
+    block = aligned_block if aligned_block is not None else b"\0" * block_size
     try:
         offset = 0
         writes_since_sync = 0
         while not STOP.is_set() and time.monotonic() < deadline:
             os.pwrite(descriptor, block, offset)
-            increment("bytes_written", len(block))
-            offset += len(block)
+            increment("bytes_written", block_size)
+            offset += block_size
             writes_since_sync += 1
             if offset >= maximum_bytes:
                 offset = 0
-            if writes_since_sync >= 8:
+            if not direct and writes_since_sync >= 8:
                 os.fdatasync(descriptor)
                 increment("fdatasync")
                 writes_since_sync = 0
-        os.fdatasync(descriptor)
+        if not direct:
+            os.fdatasync(descriptor)
     finally:
+        if aligned_block is not None:
+            aligned_block.close()
         os.close(descriptor)
 
 
@@ -197,6 +208,7 @@ def main() -> int:
     parser.add_argument("--cgroup")
     parser.add_argument("--bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--file", type=Path)
+    parser.add_argument("--direct", action="store_true")
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--hold-ms", type=float, default=50.0)
     parser.add_argument("--host")
@@ -226,7 +238,10 @@ def main() -> int:
         elif arguments.mode == "io":
             if arguments.file is None:
                 raise RuntimeError("io actor requires --file")
-            io_actor(arguments.file, arguments.bytes, deadline)
+            io_actor(
+                arguments.file, arguments.bytes, deadline,
+                direct=arguments.direct,
+            )
         elif arguments.mode == "futex":
             futex_actor(arguments.threads, arguments.hold_ms, deadline)
         elif arguments.mode == "localnet":

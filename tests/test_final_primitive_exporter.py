@@ -265,6 +265,10 @@ def test_final_bpf_normal_path_is_map_aggregated_and_window_safe():
     assert "tcp_edge_counters" in bpf
     assert "final_tcp_preconnect_failure" in bpf
     assert "&local->socket_accept_fail_total" in bpf
+    assert "result == -EAGAIN" in bpf
+    assert "result == -ERESTARTSYS" in bpf
+    assert bpf.index("result == -EAGAIN") \
+        < bpf.index("&counters->socket_ops_total")
     assert "preconnect_failure_total" in header
     assert "success_latency_buckets" in loader
     assert "servfail_total" in bpf
@@ -1450,6 +1454,7 @@ def test_qdisc_drop_counter_survives_qdisc_removal_and_recreation(
 ):
     exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
     exporter.config = SimpleNamespace(source_timeout_sec=1)
+    exporter._kind_node_pid = 4321
     exporter._qdisc_drop_state = {}
     payloads = iter((
         '[{"dev":"veth0","drops":3}]',
@@ -1458,7 +1463,10 @@ def test_qdisc_drop_counter_survives_qdisc_removal_and_recreation(
         '[{"dev":"veth0","drops":2}]',
     ))
 
-    def fake_run(*_args, **_kwargs):
+    commands = []
+
+    def fake_run(arguments, **_kwargs):
+        commands.append(arguments)
         return SimpleNamespace(
             returncode=0, stdout=next(payloads), stderr=""
         )
@@ -1471,6 +1479,54 @@ def test_qdisc_drop_counter_survives_qdisc_removal_and_recreation(
     assert exporter._qdisc_transmit_drop_totals()["veth0"] == 8
     assert exporter._qdisc_transmit_drop_totals()["veth0"] == 8
     assert exporter._qdisc_transmit_drop_totals()["veth0"] == 10
+    assert commands[0][:5] == [
+        "nsenter", "-t", "4321", "-n", "tc",
+    ]
+
+
+def test_kind_node_qdisc_drops_are_emitted_without_host_device_match(
+    monkeypatch,
+):
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.config = SimpleNamespace(source_timeout_sec=1)
+    inventory = SimpleNamespace(node_names=("kind-node",))
+    samples = []
+    for source_name in (
+        "node_pressure_cpu_waiting_seconds_total",
+        "node_pressure_memory_waiting_seconds_total",
+        "node_pressure_io_waiting_seconds_total",
+    ):
+        samples.append(PrometheusSample.create(source_name, {}, 1.0))
+    for source_name in (
+        "node_network_receive_drop_total",
+        "node_network_transmit_drop_total",
+        "node_network_receive_errs_total",
+        "node_network_transmit_errs_total",
+    ):
+        samples.append(PrometheusSample.create(
+            source_name, {"device": "eth0"}, 10.0,
+        ))
+    monkeypatch.setattr(
+        exporter, "_qdisc_transmit_drop_totals",
+        lambda _raw: {"veth-pod": 7.0},
+    )
+
+    output = exporter._host_samples(
+        inventory, tuple(samples), qdisc_raw=(("veth-pod", 7.0),),
+    )
+
+    transmit = {
+        item.label_dict["interface"]: item.value
+        for item in output
+        if item.name == "proberca_node_network_transmit_drop_total"
+    }
+    qdisc = {
+        item.label_dict["interface"]: item.value
+        for item in output
+        if item.name == "proberca_node_qdisc_transmit_drop_total"
+    }
+    assert transmit == {"eth0": 10.0}
+    assert qdisc == {"kind:veth-pod": 7.0}
 
 
 def test_deployment_uses_pinned_beyla_without_unused_service_graph():

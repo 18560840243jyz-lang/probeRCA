@@ -174,6 +174,40 @@ The final ProbeRCA-BPF path must collect and seal all input windows before the R
 
 Final normal metrics are service-level, node-level, or directed service-pair aggregates exactly as declared in `configs/final_collection_contract.yaml`; incomplete entity metric sets fail closed. Ground-truth, target configuration, injection paths, and expected-root fields are forbidden across the boundary. Burst evidence is collected after Hard in a distinct following window, is required to be independent from residual metrics, and may only reduce the matching `(entity, root category)` group penalty. The final path does not subtract Burst evidence from residuals, add a direct evidence ranking term, introduce a composite relation-strength variable, or perform counterfactual repeat solves.
 
+Burst calibration is Healthy-only and target-scoped. References are keyed by
+`(entity_id, channel_id)`; observations from different services, hosts, or TCP
+edges are never pooled into one baseline. For event-count channels, a real
+exposure produces `count/exposure`; zero exposure retains the one-second count
+and never divides by a numerical epsilon. The frozen rare-event threshold is
+the maximum of the configured resolution floor and the configured Healthy
+upper quantile. These rules are label-independent and are frozen before fault
+data is evaluated.
+
+## Formal single-VM fault-trial qualification
+
+Archive integrity and intervention validity are separate gates. A sealed,
+aligned `9/4/3` archive proves that data were recorded correctly; it does not
+prove that the declared fault affected the application or the corresponding
+formal root coordinate. Before an experiment enters an accuracy denominator,
+an after-seal qualification report must prove all of the following:
+
+- the injector acted on the real application/resource/communication path,
+  rather than producing an isolated signal in an unrelated helper;
+- the declared formal root metric or its exact formal mechanism is observed;
+- the abnormal phase contains a Confirmed Hard business symptom under the
+  frozen `5 x 3` rule;
+- topology and runtime identity remain stable and formal Pods do not restart;
+- Normal/Burst archives remain aligned and no second fault category was
+  intentionally introduced.
+
+The injector manifest and expected root may be used only by this post-seal
+qualification and the final evaluator. They remain forbidden inputs to alert
+detection, candidate construction, propagation, residuals, Burst calibration,
+FISTA, and ranking. A trial that fails qualification is reported as an invalid
+intervention and must be recollected; it is neither counted as an RCA miss nor
+made valid by lowering alert thresholds. Per-class accuracy must report both
+the attempted-trial count and the qualified-trial denominator.
+
 Final `A_v` models cross-metric propagation only. Its semantic mask excludes
 the target coordinate itself at every lag; a target with no legal cross-metric
 parents is Ready with an empty coefficient set and an exact zero propagation
@@ -315,3 +349,21 @@ are excluded because status-only controller updates can change them without
 changing the running workload. A semantic identity change still invalidates the
 Healthy handshake and fails closed. A change to this fingerprint definition
 requires a fresh Healthy Pilot before formal fault injection.
+
+## Local-socket exposure and frozen-model decision
+
+`local_socket_failure_rate` is defined only over meaningful completed socket
+operations. Routine non-blocking `accept` outcomes (`EAGAIN`/`EWOULDBLOCK`) and
+interrupted/restartable accepts are neither failures nor exposure. Its archived
+`sample_count` is the real socket-operation denominator, not the number of raw
+component series. A ratio with at least one meaningful operation is a valid
+healthy-model observation and may enter Baseline and `A_v`. It is eligible as
+current-window root evidence in residual construction and FISTA only when
+`failure_min_requests` is satisfied. This separates sparse modeling coverage
+from incident-time attribution reliability without filling or rewriting data.
+
+After the independent Healthy Validation reaches READY, the formal Baseline,
+`A_s`, and `A_v` snapshot is immutable. Additional healthy raw windows may be
+archived for diagnostics, but cannot update the model used by formal fault
+experiments. A workload, scope, contract, topology, runtime-identity, or model
+configuration fingerprint change requires a new Healthy Pilot.

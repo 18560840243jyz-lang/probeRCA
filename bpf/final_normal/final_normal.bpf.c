@@ -12,6 +12,11 @@
 #define EINPROGRESS 115
 #define EALREADY 114
 #define EINTR 4
+#define EAGAIN 11
+#define ERESTARTSYS 512
+#define ERESTARTNOINTR 513
+#define ERESTARTNOHAND 514
+#define ERESTART_RESTARTBLOCK 516
 #define AF_INET_VALUE 2
 #define IPPROTO_TCP_VALUE 6
 #define IPPROTO_UDP_VALUE 17
@@ -179,6 +184,17 @@ static __always_inline int record_accept(long result)
         get_cgroup_counters(cgroup_id);
 
     if (!counters)
+        return 0;
+    /*
+     * Non-blocking servers routinely call accept/accept4 when no connection
+     * is queued.  EAGAIN/EWOULDBLOCK and restartable interruptions are not
+     * failed socket transactions and must contribute to neither the failure
+     * numerator nor the exposure denominator.  Counting them made idle event
+     * loops look like a 100% LocalNet failure.
+     */
+    if (result == -EAGAIN || result == -EINTR ||
+        result == -ERESTARTSYS || result == -ERESTARTNOINTR ||
+        result == -ERESTARTNOHAND || result == -ERESTART_RESTARTBLOCK)
         return 0;
     __sync_fetch_and_add(&counters->socket_ops_total, 1);
     if (result < 0)

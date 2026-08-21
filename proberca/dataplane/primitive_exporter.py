@@ -664,6 +664,7 @@ class FinalPrimitiveExporter:
         )
         self.core = client.CoreV1Api()
         self._node_cgroup_root = self._resolve_kind_node_cgroup()
+        self._kind_node_pid: int | None = None
         try:
             initial_inventory = self._inventory_refresh_executor.submit(
                 _inventory_worker
@@ -706,6 +707,27 @@ class FinalPrimitiveExporter:
         if not path.is_dir():
             raise RawCollectionError("kind node cgroup root is unavailable")
         return path
+
+    def _resolve_kind_node_pid(self) -> int:
+        result = subprocess.run(
+            [
+                "docker", "inspect", "--format", "{{.State.Pid}}",
+                self.config.kind_node_container,
+            ],
+            check=True, capture_output=True, text=True,
+            timeout=float(self.config.source_timeout_sec),
+        )
+        try:
+            pid = int(result.stdout.strip())
+        except ValueError as error:
+            raise RawCollectionError(
+                "kind node network namespace PID is invalid"
+            ) from error
+        if pid <= 1 or not Path(f"/proc/{pid}/ns/net").is_symlink():
+            raise RawCollectionError(
+                "kind node network namespace is unavailable"
+            )
+        return pid
 
     @staticmethod
     def _pod_services(
@@ -2199,8 +2221,13 @@ class FinalPrimitiveExporter:
 
     def _read_qdisc_transmit_drops(self) -> tuple[tuple[str, float], ...]:
         """Read one immutable qdisc counter snapshot without rebasing it."""
+        if self._kind_node_pid is None:
+            self._kind_node_pid = self._resolve_kind_node_pid()
         result = subprocess.run(
-            ["tc", "-j", "-s", "qdisc", "show"],
+            [
+                "nsenter", "-t", str(self._kind_node_pid), "-n",
+                "tc", "-j", "-s", "qdisc", "show",
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -2321,13 +2348,20 @@ class FinalPrimitiveExporter:
                 output.append(PrometheusSample.create(
                     output_name,
                     {"node": node, "interface": interface},
-                    value.value + (
-                        qdisc_transmit_drops.get(interface, 0.0)
-                        if output_name
-                        == "proberca_node_network_transmit_drop_total"
-                        else 0.0
-                    ),
+                    value.value,
                 ))
+        # node_exporter observes the VM network namespace, while Pod-to-Pod
+        # qdiscs live in the kind node namespace.  Expose qdisc loss as its
+        # own cumulative primitive instead of pretending that the kind
+        # interface also supplied receive-drop and error counters.  The final
+        # host aggregation adds this independently covered source to the
+        # formal NIC drop/error rate.
+        for interface, qdisc_total in sorted(qdisc_transmit_drops.items()):
+            output.append(PrometheusSample.create(
+                "proberca_node_qdisc_transmit_drop_total",
+                {"node": node, "interface": f"kind:{interface}"},
+                qdisc_total,
+            ))
         return tuple(output)
 
     def _cgroup_identity(

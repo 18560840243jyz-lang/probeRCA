@@ -22,7 +22,7 @@ from proberca.data.schema import (
 from .raw import RawCollectionError, RawCollectionWindow, RawMetricSample
 
 
-FINAL_AGGREGATION_VERSION = "probeRCA-final-window-aggregation-v2"
+FINAL_AGGREGATION_VERSION = "probeRCA-final-window-aggregation-v3"
 FINAL_OUTPUT_SOURCE = "final_window_aggregation"
 NANOSECONDS_PER_SECOND = 1_000_000_000
 RATIO_EPSILON = 1.0e-12
@@ -117,6 +117,9 @@ COMPONENTS: dict[str, ComponentSpec] = {
         "host", "net_local", "monotonic_counter", "events", "node"
     ),
     "node_nic_tx_error_total": ComponentSpec(
+        "host", "net_local", "monotonic_counter", "events", "node"
+    ),
+    "node_qdisc_tx_drop_total": ComponentSpec(
         "host", "net_local", "monotonic_counter", "events", "node"
     ),
     # TCP directed edge.
@@ -587,6 +590,7 @@ class FinalWindowAggregator:
         name: str,
         *,
         bounded: bool = True,
+        sample_count_from_denominator: bool = False,
     ) -> _Value:
         if not numerator.valid or not denominator.valid:
             return _combine((numerator, denominator), None)
@@ -606,7 +610,21 @@ class FinalWindowAggregator:
                 f"{name} ratio is invalid: numerator={numerator.value}, "
                 f"denominator={denominator.value}, result={result}"
             )
-        return _combine((numerator, denominator), result)
+        sample_count = None
+        if sample_count_from_denominator:
+            rounded = round(float(denominator.value))
+            if not math.isclose(
+                float(denominator.value), rounded,
+                rel_tol=0.0, abs_tol=RATIO_EPSILON,
+            ):
+                raise RawCollectionError(
+                    f"{name} exposure denominator is not an integer count"
+                )
+            sample_count = int(rounded)
+        return _combine(
+            (numerator, denominator), result,
+            sample_count=sample_count,
+        )
 
     def _histogram_p95(
         self,
@@ -993,6 +1011,7 @@ class FinalWindowAggregator:
             local_failed_operations,
             socket_operations,
             "local_socket_failure_rate",
+            sample_count_from_denominator=True,
         )
         outputs = (
             ("request", "request_rate", request_rate, "requests_per_second", "gauge", None),
@@ -1043,7 +1062,17 @@ class FinalWindowAggregator:
             "node_nic_rx_error_total", "node_nic_tx_error_total",
         )
         self._series_sets_equal(nic, tuple(nic))
-        nic_parts = tuple(self._sum(nic[name]) for name in nic)
+        # qdisc drops are an additional, independently observed transmit-loss
+        # source from the kind node network namespace.  They must not be
+        # inserted into only one member of the four node_exporter interface
+        # families, because doing so would falsely claim complete four-way
+        # interface coverage.  Preserve the strict node_exporter family check
+        # above and add the independently measured qdisc deltas afterwards.
+        qdisc = self._deltas(window, samples, "node_qdisc_tx_drop_total")
+        nic_parts = (
+            *(self._sum(nic[name]) for name in nic),
+            self._sum(qdisc["node_qdisc_tx_drop_total"]),
+        )
         nic_rate = self._add(nic_parts)
         outputs = (
             ("cpu", "cpu_psi", cpu, "ratio"),

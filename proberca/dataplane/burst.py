@@ -38,8 +38,36 @@ def rare_event_strength(
     epsilon_value = _finite("epsilon", epsilon)
     if exposure_value < 0 or threshold_value <= 0 or epsilon_value <= 0:
         raise BurstNormalizationError("exposure and rare-event calibration are invalid")
-    rate = event_count / (exposure_value + epsilon_value)
+    # A zero exposure is not a license to manufacture a 1/epsilon event
+    # rate.  Some kernel-only failure channels have no successful operation
+    # to use as a denominator.  In that case the one-second window count is
+    # the only truthful observation and is calibrated as such.
+    rate = (
+        event_count / exposure_value
+        if exposure_value > 0.0 else float(event_count)
+    )
     return min(max(rate / threshold_value, 0.0), 1.0)
+
+
+def burst_event_rate(event_count: int, exposure: float) -> float:
+    """Return a finite event rate without inventing exposure.
+
+    ``exposure == 0`` means that the source did not observe a usable
+    denominator.  The raw one-second event count is then retained for
+    Healthy calibration instead of dividing by a numerical epsilon.
+    """
+    if isinstance(event_count, bool) or not isinstance(event_count, int) \
+            or event_count < 0:
+        raise BurstNormalizationError(
+            "event_count must be a non-negative integer"
+        )
+    exposure_value = _finite("exposure", exposure)
+    if exposure_value < 0.0:
+        raise BurstNormalizationError("exposure must be non-negative")
+    return (
+        event_count / exposure_value
+        if exposure_value > 0.0 else float(event_count)
+    )
 
 
 def _convert_continuous_value(value: float, transform: str) -> float:

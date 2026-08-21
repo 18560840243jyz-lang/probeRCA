@@ -1,0 +1,21 @@
+schema_version: probeRCA-final-burst-calibration-policy-v2
+rare_event_thresholds:
+  futex.wait_count: 1.0e-06
+  host.memory.oom_victim: 1.0e-06
+  memory.major_page_fault_rate: 1.0e-06
+  memory.oom_victim: 1.0e-06
+  nic.error_rate: 1.0e-06
+  nic.queue_drop_rate: 1.0e-06
+  socket.accept_connect_failure: 1.0e-06
+  socket.backlog_overflow: 1.0e-06
+  tcp.connect_failure_rate: 1.0e-06
+  tcp.retrans_rate: 1.0e-06
+  tcp.rst_rate: 1.0e-06
+  tcp.rto_rate: 1.0e-06
+rare_event_quantile: 0.999
+continuous_transform: log1p
+continuous_polarity: 1
+continuous_z_cap: 5.0
+continuous_minimum_healthy_samples: 300
+continuous_minimum_scale: 0.01
+policy_fingerprint: ce99127eb240cf34cc26d6b2fb4588fcbfb218bd0baa88d379fb9e6ad711b0ee

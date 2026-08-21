@@ -358,6 +358,7 @@ class MetricResolver:
                     "valid": False,
                     "model_valid": False,
                     "alert_eligible": False,
+                    "root_evidence_eligible": False,
                     "invalid_reason": reason,
                     "data_plane_invalid_reason": data_plane_reason,
                     "control_plane_invalid_reason": None,
@@ -395,11 +396,23 @@ class MetricResolver:
                     record.sample_count
                     >= self.latency_alert_min_samples(spec)
                 )
+            elif model_valid and spec.role == "service_localnet":
+                # A single completed socket operation is a real observation
+                # and can train the healthy model.  It is not sufficiently
+                # exposed to act as root evidence in this window, however.
+                # Keep the two concepts separate just as for low-sample P95.
+                alert_eligible = (
+                    record.sample_count
+                    >= self.config.failure_min_requests
+                )
             validity[metric.node_id] = {
                 **scope,
                 "valid": model_valid,
                 "model_valid": model_valid,
                 "alert_eligible": alert_eligible,
+                "root_evidence_eligible": (
+                    model_valid and metric.root_eligible and alert_eligible
+                ),
                 "invalid_reason": reason,
                 "data_plane_invalid_reason": data_plane_reason,
                 "control_plane_invalid_reason": control_plane_reason,

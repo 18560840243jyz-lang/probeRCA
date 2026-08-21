@@ -1197,6 +1197,7 @@ class FinalControlPlane:
             if (
                 node_id in observations
                 and self._soft.metrics[node_id].root_eligible
+                and observations[node_id].alert_eligible
                 and model.target_readiness[node_id].ready
             )
         ]
@@ -1439,8 +1440,17 @@ class FinalControlPlane:
             maximum = max(
                 (*service_scores.values(), *edge_scores.values()), default=0.0,
             )
+            calibration_model_is_frozen = (
+                self._frozen_calibration_model is not None
+            )
             safe_healthy = (
-                self.state in {"starting", "calibrating", "healthy"}
+                (
+                    self.state in {"starting", "calibrating"}
+                    or (
+                        self.state == "healthy"
+                        and not calibration_model_is_frozen
+                    )
+                )
                 and (not baseline_ready or maximum < self.config.soft_threshold)
             )
             self._update_healthy_models(

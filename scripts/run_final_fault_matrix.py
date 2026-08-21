@@ -61,10 +61,67 @@ FAULT_ACTOR_FAILSAFE_GRACE_SEC = 30
 HOST_MEMORY_PILOT_BYTES = 4 * 1024 * 1024 * 1024
 HOST_NIC_DELAY_MS = 20
 HOST_NIC_LOSS_PERCENT = 3.0
+SERVICE_CPU_QUOTA = "25000 100000"
+SERVICE_MEMORY_HIGH_BYTES = 128 * 1024 * 1024
+SERVICE_MEMORY_ACTOR_BYTES = 256 * 1024 * 1024
+SERVICE_LOCALNET_REJECT_PROBABILITY = 0.15
+
+
+LOCK_STRESS_PROGRAM = r"""
+import sys
+import threading
+import time
+
+import grpc
+import demo_pb2 as messages
+import demo_pb2_grpc as services
+
+duration = float(sys.argv[1])
+workers = int(sys.argv[2])
+deadline = time.monotonic() + duration
+channel = grpc.insecure_channel("cartservice:7070")
+grpc.channel_ready_future(channel).result(timeout=30)
+stub = services.CartServiceStub(channel)
+item = messages.CartItem(product_id="OLJCESPC7Z", quantity=1)
+
+def worker(index):
+    user_id = "proberca-lock-shared"
+    add = messages.AddItemRequest(user_id=user_id, item=item)
+    get = messages.GetCartRequest(user_id=user_id)
+    while time.monotonic() < deadline:
+        try:
+            stub.AddItem(add, timeout=3)
+            stub.GetCart(get, timeout=3)
+        except grpc.RpcError:
+            pass
+
+threads = [threading.Thread(target=worker, args=(index,), daemon=True)
+           for index in range(workers)]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join()
+"""
 
 
 class ExperimentError(RuntimeError):
     pass
+
+
+def replace_text_file(path: Path, value: str) -> tuple[str, Callable[[], None]]:
+    """Replace one control value and return an exact idempotent restore."""
+    original = path.read_text(encoding="ascii").strip()
+    path.write_text(f"{value}\n", encoding="ascii")
+    restored = False
+
+    def restore() -> None:
+        nonlocal restored
+        if restored:
+            return
+        path.write_text(f"{original}\n", encoding="ascii")
+        restored = True
+
+    return original, restore
 
 
 def run(
@@ -220,6 +277,60 @@ def formal_service_names() -> tuple[str, ...]:
     if len(names) != len(config.formal_service_entity_ids):
         raise ExperimentError("formal service identities are ambiguous")
     return names
+
+
+def formal_pod_runtime_snapshot() -> dict[str, dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    for service in formal_service_names():
+        payload = kube_json([
+            "-n", NAMESPACE, "get", "pods", "-l", f"app={service}",
+        ])
+        running = [
+            item for item in payload["items"]
+            if (item.get("status") or {}).get("phase") == "Running"
+        ]
+        if len(running) != 1:
+            raise ExperimentError(
+                f"{service} does not have one running formal Pod"
+            )
+        pod = running[0]
+        statuses = (pod.get("status") or {}).get("containerStatuses") or []
+        if len(statuses) != 1 or not statuses[0].get("containerID"):
+            raise ExperimentError(
+                f"{service} formal container identity is ambiguous"
+            )
+        status = statuses[0]
+        output[service] = {
+            "container_id": status["containerID"],
+            "pod_name": pod["metadata"]["name"],
+            "pod_uid": pod["metadata"]["uid"],
+            "ready": bool(status.get("ready")),
+            "restart_count": int(status.get("restartCount", 0)),
+        }
+    return output
+
+
+def assert_no_formal_pod_change(
+    before: dict[str, dict[str, Any]],
+    after: dict[str, dict[str, Any]],
+) -> None:
+    if set(before) != set(after):
+        raise ExperimentError("formal service set changed during experiment")
+    changes = []
+    for service in sorted(before):
+        left = before[service]
+        right = after[service]
+        if (
+            left["pod_uid"] != right["pod_uid"]
+            or left["container_id"] != right["container_id"]
+            or right["restart_count"] != left["restart_count"]
+            or not right["ready"]
+        ):
+            changes.append(service)
+    if changes:
+        raise ExperimentError(
+            "formal Pod identity/restart changed: " + ",".join(changes)
+        )
 
 
 def pod_peer_device(service: str) -> str:
@@ -460,6 +571,14 @@ def validate_archives(
     minimum_mapping = 1.0
     maximum_loss = 0.0
     previous_end_ns: int | None = None
+    control_payload = yaml.safe_load(
+        CONTROL_CONFIG.read_text(encoding="utf-8")
+    )
+    if not isinstance(control_payload, dict):
+        raise ExperimentError("final control config is not a mapping")
+    control_config = FinalControlConfig.from_dict(control_payload)
+    topology_fingerprints = set()
+    runtime_identity_fingerprints = set()
     for left, right in zip(normal_windows, burst_windows):
         if (
             left.sequence != right.sequence
@@ -477,6 +596,17 @@ def validate_archives(
             raise ExperimentError(
                 "data plane embedded normalized Burst evidence"
             )
+        if len(left.topology_events) != 1:
+            raise ExperimentError(
+                "formal window does not have one topology snapshot"
+            )
+        graph = formal_service_graph(
+            left.topology_events[0], control_config,
+        )
+        topology_fingerprints.add(graph.topology_fingerprint)
+        runtime_identity_fingerprints.add(
+            graph.runtime_identity_fingerprint
+        )
         channels = {item.channel_id for item in right.samples}
         if channels != expected_burst_channels:
             raise ExperimentError("Burst channel coverage mismatch")
@@ -497,6 +627,10 @@ def validate_archives(
         maximum_loss = max(maximum_loss, right.event_loss_rate)
     if minimum_mapping < 1.0 or maximum_loss > 0.01:
         raise ExperimentError("Burst quality gate failed")
+    if len(topology_fingerprints) != 1:
+        raise ExperimentError("topology changed inside sealed phase")
+    if len(runtime_identity_fingerprints) != 1:
+        raise ExperimentError("runtime identity changed inside sealed phase")
     return {
         "burst_manifest_fingerprint": burst.manifest_fingerprint,
         "burst_manifest_sha256": sha256_file(
@@ -509,6 +643,10 @@ def validate_archives(
         "normal_manifest_sha256": sha256_file(
             normal_root / "collection-manifest.json"
         ),
+        "runtime_identity_fingerprint": next(
+            iter(runtime_identity_fingerprints)
+        ),
+        "topology_fingerprint": next(iter(topology_fingerprints)),
         "window_count": expected_windows,
         "window_end_ns": normal_windows[-1].window_end_ns,
         "window_start_ns": normal_windows[0].window_start_ns,
@@ -675,6 +813,67 @@ class FaultContext:
     def add_cleanup(self, callback: Callable[[], None]) -> None:
         self.cleanups.append(callback)
 
+    def write_cgroup_control(
+        self, service: str, control_name: str, value: str,
+    ) -> None:
+        if control_name not in {"cpu.max", "memory.high"}:
+            raise ExperimentError("unsupported cgroup control")
+        identity = service_info(service)
+        path = (identity["cgroup"] / control_name).resolve()
+        if not path.is_relative_to(Path("/sys/fs/cgroup")):
+            raise ExperimentError("unsafe cgroup control target")
+        original, restore = replace_text_file(path, value)
+        self.add_cleanup(restore)
+        self.metadata.setdefault("cgroup_controls", []).append({
+            "control": control_name,
+            "original": original,
+            "service": service,
+            "value": value,
+        })
+
+    def start_kubernetes_actor(
+        self, *, workload: str, container: str, duration: float,
+        program: str, arguments: list[str], name: str,
+    ) -> subprocess.Popen:
+        pods = kube_json([
+            "-n", NAMESPACE, "get", "pods", "-l",
+            f"app.kubernetes.io/name={workload}",
+        ])
+        matches = [
+            item for item in pods["items"]
+            if (item.get("status") or {}).get("phase") == "Running"
+        ]
+        if len(matches) != 1:
+            raise ExperimentError(
+                f"{workload} does not resolve to one running Pod"
+            )
+        pod = matches[0]["metadata"]["name"]
+        command = [
+            "kubectl", "--context", KUBE_CONTEXT, "-n", NAMESPACE,
+            "exec", pod, "-c", container, "--", "env",
+            "PYTHONPATH=/email_server:/config", "python", "-c",
+            program, str(duration), *arguments,
+        ]
+        log = (self.experiment_root / f"{name}.log").open(
+            "w", encoding="utf-8"
+        )
+        process = subprocess.Popen(
+            command, stdout=log, stderr=subprocess.STDOUT, text=True,
+        )
+        self.logs.append(log)
+        self.processes.append(process)
+        time.sleep(2)
+        if process.poll() is not None:
+            log.flush()
+            raise ExperimentError(f"{name} actor exited early")
+        self.metadata.setdefault("actors", []).append({
+            "container": container,
+            "mode": name,
+            "pod": pod,
+            "workload": workload,
+        })
+        return process
+
     def start_actor(
         self,
         mode: str,
@@ -788,21 +987,94 @@ def actor_fault(
 
 
 def service_memory(context: FaultContext, windows: int) -> None:
-    # recommendationservice has enough headroom for a sustained, observable
-    # working-set increase without crossing the Pod's hard memory limit.  Do
-    # not alter memory.high here: throttling the whole application cgroup can
-    # make the Kubernetes health probe kill an otherwise non-OOM workload,
-    # which changes topology instead of producing a stable memory fault.
+    # Apply reclaim pressure below memory.max, rather than merely allocating
+    # unused headroom.  Cleanup restores the exact pre-experiment cgroup value.
     target_service = "recommendationservice"
-    byte_count = 192 * 1024 * 1024
+    byte_count = SERVICE_MEMORY_ACTOR_BYTES
     context.metadata["target_service"] = target_service
     context.metadata["bytes_touched"] = byte_count
+    context.write_cgroup_control(
+        target_service, "memory.high", str(SERVICE_MEMORY_HIGH_BYTES)
+    )
     context.start_actor(
         "memory",
         service=target_service,
         duration=windows + FAULT_ACTOR_FAILSAFE_GRACE_SEC,
         arguments=["--bytes", str(byte_count)],
     )
+
+
+def service_cpu(context: FaultContext, _windows: int) -> None:
+    # Throttle the real application workload.  A synthetic yes process in a
+    # low-traffic cgroup can raise CPU counters without affecting the service,
+    # so it is not a valid service-CPU experiment.
+    target_service = "frontend"
+    context.metadata["target_service"] = target_service
+    context.write_cgroup_control(
+        target_service, "cpu.max", SERVICE_CPU_QUOTA
+    )
+    time.sleep(2)
+
+
+def service_lock(context: FaultContext, windows: int) -> None:
+    # Drive the actual CartService RPC path with shared-key concurrency.  The
+    # old standalone futex actor contended only with its own threads and could
+    # not causally block the application.
+    target_service = "cartservice"
+    workers = 24
+    context.metadata.update({
+        "target_service": target_service,
+        "workers": workers,
+        "workload_semantics": "shared-cart real RPC contention",
+    })
+    context.start_kubernetes_actor(
+        workload="proberca-healthy-rpc-load",
+        container="rpc-load",
+        duration=windows + FAULT_ACTOR_FAILSAFE_GRACE_SEC,
+        program=LOCK_STRESS_PROGRAM,
+        arguments=[str(workers)],
+        name="service-lock-rpc",
+    )
+
+
+def service_localnet(context: FaultContext, _windows: int) -> None:
+    # A LocalNet experiment must affect the service's real socket operations.
+    # Apply the same label-independent failure mechanism to all formal egress
+    # destinations; a single destination remains the separate TCP-edge case.
+    target_service = "frontend"
+    source = service_info(target_service)
+    destinations = [
+        service_info(service)["pod_ip"]
+        for service in formal_service_names()
+        if service != target_service
+    ]
+    rules = []
+    for destination in sorted(set(destinations)):
+        rule = [
+            "-I", "FORWARD", "1",
+            "-s", source["pod_ip"], "-d", destination,
+            "-p", "tcp",
+            "-m", "statistic", "--mode", "random",
+            "--probability", str(SERVICE_LOCALNET_REJECT_PROBABILITY),
+            "-m", "comment", "--comment",
+            "proberca-final-service-localnet",
+            "-j", "REJECT", "--reject-with", "tcp-reset",
+        ]
+        add_iptables_rule(rule)
+        rules.append(["-D", "FORWARD", *rule[3:]])
+
+    def cleanup() -> None:
+        for rule in rules:
+            node_command(["iptables", *rule], check=False)
+
+    context.add_cleanup(cleanup)
+    context.metadata.update({
+        "destination_count": len(rules),
+        "probability": SERVICE_LOCALNET_REJECT_PROBABILITY,
+        "scope": "all formal service egress",
+        "target_service": target_service,
+    })
+    time.sleep(5)
 
 
 def host_nic(context: FaultContext, _windows: int) -> None:
@@ -961,9 +1233,7 @@ def experiment_specs() -> list[dict[str, Any]]:
             "fault_type": "service_cpu",
             "root_scope": "service",
             "root_category": "CPU",
-            "activate": lambda context, _windows: context.start_cpu(
-                count=2, service="paymentservice"
-            ),
+            "activate": service_cpu,
         },
         {
             "fault_type": "service_memory",
@@ -980,6 +1250,7 @@ def experiment_specs() -> list[dict[str, Any]]:
                 arguments=[
                     "--file", "/var/tmp/proberca-final-service-io.bin",
                     "--bytes", str(64 * 1024 * 1024),
+                    "--direct",
                 ],
             ),
             "temporary_files": ["/var/tmp/proberca-final-service-io.bin"],
@@ -988,20 +1259,13 @@ def experiment_specs() -> list[dict[str, Any]]:
             "fault_type": "service_lock",
             "root_scope": "service",
             "root_category": "Lock",
-            "activate": actor_fault(
-                "futex", service="cartservice",
-                arguments=["--threads", "12", "--hold-ms", "75"],
-            ),
+            "activate": service_lock,
         },
         {
             "fault_type": "service_localnet",
             "root_scope": "service",
             "root_category": "LocalNet",
-            "activate": actor_fault(
-                "localnet", service="frontend",
-                network_namespace=True,
-                arguments=["--threads", "20"],
-            ),
+            "activate": service_localnet,
         },
         {
             "fault_type": "host_cpu",
@@ -1032,6 +1296,7 @@ def experiment_specs() -> list[dict[str, Any]]:
                 arguments=[
                     "--file", "/var/tmp/proberca-final-host-io.bin",
                     "--bytes", str(128 * 1024 * 1024),
+                    "--direct",
                 ],
             ),
             "temporary_files": ["/var/tmp/proberca-final-host-io.bin"],
@@ -1080,6 +1345,13 @@ def main() -> int:
         action="store_true",
         help="resume an interrupted matrix and preserve failed attempts",
     )
+    parser.add_argument(
+        "--fault-types",
+        help=(
+            "comma-separated formal fault types for a bounded pilot; "
+            "omitting it runs the complete frozen matrix"
+        ),
+    )
     arguments = parser.parse_args()
     try:
         readiness = load_ready_calibration_report(
@@ -1102,6 +1374,24 @@ def main() -> int:
         raise SystemExit("each phase requires at least five windows")
     root = arguments.output.resolve()
     specs = experiment_specs()
+    all_fault_types = tuple(item["fault_type"] for item in specs)
+    if arguments.fault_types:
+        requested = tuple(
+            item.strip() for item in arguments.fault_types.split(",")
+            if item.strip()
+        )
+        if len(set(requested)) != len(requested):
+            raise SystemExit("--fault-types contains duplicates")
+        unknown = sorted(set(requested) - set(all_fault_types))
+        if unknown:
+            raise SystemExit(
+                "unknown formal fault types: " + ",".join(unknown)
+            )
+        requested_set = set(requested)
+        specs = [
+            item for item in specs
+            if item["fault_type"] in requested_set
+        ]
     readiness_reference = {
         "report_fingerprint": readiness["report_fingerprint"],
         **{
@@ -1145,6 +1435,12 @@ def main() -> int:
             != arguments.abnormal_windows
         ):
             raise SystemExit("resume window counts differ from original run")
+        if manifest.get("selected_fault_types") != [
+            item["fault_type"] for item in specs
+        ]:
+            raise SystemExit(
+                "resume fault-type selection differs from original run"
+            )
         if manifest.get("calibration_readiness") != readiness_reference:
             raise SystemExit(
                 "resume calibration readiness differs from original run"
@@ -1169,6 +1465,9 @@ def main() -> int:
             },
             "normal_windows_per_experiment": arguments.normal_windows,
             "abnormal_windows_per_experiment": arguments.abnormal_windows,
+            "selected_fault_types": [
+                item["fault_type"] for item in specs
+            ],
             "experiments": [],
             "failed_attempts": [],
             "started_at_ns": time.time_ns(),
@@ -1236,6 +1535,7 @@ def main() -> int:
         context = FaultContext(root, experiment_root)
         fault_deactivated = False
         try:
+            record["formal_pods_before"] = formal_pod_runtime_snapshot()
             if spec.get("probe"):
                 start_probe(
                     context, fault_type,
@@ -1274,6 +1574,15 @@ def main() -> int:
                 arguments.abnormal_windows,
                 on_capture_complete=deactivate_after_capture,
             )
+            if (
+                record["normal"]["topology_fingerprint"]
+                != record["abnormal"]["topology_fingerprint"]
+                or record["normal"]["runtime_identity_fingerprint"]
+                != record["abnormal"]["runtime_identity_fingerprint"]
+            ):
+                raise ExperimentError(
+                    "formal topology/runtime changed across phases"
+                )
             record["status"] = "collected"
         except Exception as error:
             record["status"] = "failed"
@@ -1310,6 +1619,11 @@ def main() -> int:
             try:
                 wait_data_plane(root)
                 record["recovery_verified_at_ns"] = time.time_ns()
+                record["formal_pods_after"] = formal_pod_runtime_snapshot()
+                assert_no_formal_pod_change(
+                    record.get("formal_pods_before", {}),
+                    record["formal_pods_after"],
+                )
             except Exception as error:
                 cleanup_errors.append(
                     f"{type(error).__name__}: {error}"

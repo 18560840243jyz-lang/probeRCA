@@ -6,12 +6,14 @@ import json
 import threading
 import time
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml
 
 import proberca.dataplane.burst_collection as burst_collection_module
+from proberca.dataplane.burst import burst_event_rate, rare_event_strength
 from proberca.dataplane.archive import CollectionArchive, CollectionArchiveWriter
 from proberca.dataplane.burst_archive import (
     BurstArchive,
@@ -264,7 +266,7 @@ def _service_samples(
     )
 
 
-def _host_samples(output, node):
+def _host_samples(output, node, *, qdisc_delta=0):
     identity = {"node_name": node}
     for component, delta in (
         ("node_cpu_psi_some_ns_total", 10_000_000),
@@ -274,6 +276,7 @@ def _host_samples(output, node):
         ("node_nic_tx_drop_total", 2),
         ("node_nic_rx_error_total", 3),
         ("node_nic_tx_error_total", 4),
+        ("node_qdisc_tx_drop_total", qdisc_delta),
     ):
         _counter(
             output, component, 100, delta,
@@ -472,6 +475,26 @@ def test_real_shape_9_4_3_3_and_exact_math(contract):
     assert edges["dns"]["dns_failure_rate"] == pytest.approx(2 / 21)
 
 
+def test_host_nic_rate_adds_independently_covered_qdisc_drops(contract):
+    samples = []
+    _host_samples(samples, "node-a", qdisc_delta=7)
+    raw = RawCollectionWindow.create(
+        sequence=1,
+        window_start_ns=START,
+        window_end_ns=END,
+        cluster_id=CLUSTER,
+        samples=samples,
+    )
+
+    result = FinalWindowAggregator(contract).aggregate(raw)
+
+    nic = next(
+        item for item in result.node_metrics
+        if item.metric_name == "nic_drop_error_rate"
+    )
+    assert nic.value == 17.0
+
+
 def test_tcp_preconnect_failures_extend_count_and_failure_not_latency(contract):
     raw = _raw_window(include_dns=False)
     samples = list(raw.samples)
@@ -553,12 +576,13 @@ def test_local_socket_failure_events_are_deduplicated_per_operation(contract):
         samples=samples,
     )
     result = FinalWindowAggregator(contract).aggregate(window)
-    value = next(
-        item.value for item in result.node_metrics
+    record = next(
+        item for item in result.node_metrics
         if item.service_name == "frontend"
         and item.metric_name == "local_socket_failure_rate"
     )
-    assert value == pytest.approx(1.0)
+    assert record.value == pytest.approx(1.0)
+    assert record.sample_count == 1
 
 
 def test_tcp_non_monotonic_histogram_invalidates_only_latency(contract):
@@ -1658,6 +1682,67 @@ def test_burst_is_normalized_from_independent_sources(contract):
         )
 
 
+def test_zero_exposure_rare_event_uses_window_count_not_inverse_epsilon():
+    assert burst_event_rate(3, 0.0) == 3.0
+    assert rare_event_strength(1, 0.0, 10.0) == pytest.approx(0.1)
+
+
+def test_continuous_burst_calibration_is_target_scoped(contract):
+    channel_id = "tcp.rtt_p95"
+    calibrations = [
+        item for item in _calibrations(contract)
+        if item.channel_id != channel_id
+    ]
+    target_a = f"{CLUSTER}::{NAMESPACE}::frontend->payment::tcp"
+    target_b = f"{CLUSTER}::{NAMESPACE}::frontend->currency::tcp"
+    for target_id, values in (
+        (target_a, [1.0] * 5),
+        (target_b, [100.0] * 5),
+    ):
+        calibrations.append(BurstChannelCalibration.create(
+            channel_id=channel_id,
+            target_id=target_id,
+            mode="continuous",
+            rare_event_threshold=None,
+            healthy_values=values,
+            transform="identity",
+            polarity=1,
+            z_cap=5.0,
+            minimum_healthy_samples=5,
+            minimum_scale=1.0,
+        ))
+    builder = BurstEvidenceCollector(
+        collection_contract=contract,
+        collector_build_id=fingerprint({"build": "target-scoped"}),
+        calibrations=calibrations,
+    )
+
+    def strength(target_id):
+        sample = RawBurstSample.create(
+            source_object_id="object:" + fingerprint({"target": target_id}),
+            timestamp_ns=END - 1,
+            cluster_id=CLUSTER,
+            namespace=NAMESPACE,
+            entity_type="edge",
+            entity_id=target_id,
+            channel_id=channel_id,
+            value=10.0,
+            exposure=None,
+            coverage=1.0,
+            event_loss_rate=0.0,
+            mapping_quality=1.0,
+        )
+        return builder.collect(
+            samples=(sample,),
+            window_start_ns=START,
+            window_end_ns=END,
+            residual_source_record_ids=(),
+        )[0].normalized_strength
+
+    assert strength(target_a) == 1.0
+    assert strength(target_b) == 0.0
+
+
 def test_continuous_burst_reference_is_fitted_once_per_collector(
     contract, monkeypatch,
 ):
@@ -1800,6 +1885,7 @@ def test_healthy_burst_calibration_is_frozen_and_round_trips(
     assert {item.channel_id for item in artifact.calibrations} == {
         role["channel_id"] for role in contract["burst_channel_roles"]
     }
+    assert all(item.target_id != "*" for item in artifact.calibrations)
     assert artifact.source_dataset_id == archive.dataset_id
     path = tmp_path / "burst-calibration.json"
     artifact.save(path)
@@ -1824,6 +1910,16 @@ def test_healthy_burst_calibration_is_frozen_and_round_trips(
             collection_contract=contract,
             policy=bad_policy,
         )
+
+
+def test_formal_burst_policy_is_fingerprinted_and_target_calibrated():
+    payload = yaml.safe_load(Path(
+        "configs/final_burst_calibration_policy.yaml"
+    ).read_text(encoding="utf-8"))
+    policy = BurstCalibrationPolicy.from_dict(payload)
+    assert policy.rare_event_quantile == pytest.approx(0.999)
+    assert policy.continuous_transform == "log1p"
+    assert policy.continuous_minimum_healthy_samples == 300
 
 
 def test_read_only_burst_join_aligns_evidence_without_mutating_archives(
@@ -2208,9 +2304,9 @@ def test_query_range_chunks_bound_request_fanout_and_memory(monkeypatch):
     ))
     assert len(chunks) == 40
     assert all(len(chunk) == 30 for chunk in chunks)
-    assert len(config.prometheus.queries) == 31
-    assert len(requests_seen) == 31 * 40 == 1240
-    assert source.last_range_query_stats["request_count"] == 1240
+    assert len(config.prometheus.queries) == 32
+    assert len(requests_seen) == 32 * 40 == 1280
+    assert source.last_range_query_stats["request_count"] == 1280
     assert source.last_range_query_stats["max_loaded_windows"] == 30
     assert config.prometheus.range_query_max_workers == 1
     assert concurrency["maximum"] == 1
