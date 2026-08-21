@@ -6,7 +6,11 @@ description: "Enforce the final frozen ProbeRCA-BPF two-plane online RCA scheme 
 # Final ProbeRCA-BPF Scheme
 
 > This is the only active project scheme skill. The former P/B-stage skill is retired.
-> Keep data and control planes separate. Do not inject faults, restore a composite relation-strength variable, or add counterfactual repeated solves.
+> Keep data and control planes separate. Do not inject faults before the current
+> load profile has an exact READY handshake. After READY, fault injection is an
+> explicit data-plane experiment and must never feed its manifest or labels into
+> inference. Do not restore a composite relation-strength variable or add
+> counterfactual repeated solves.
 
 下面给出最终定稿版 ProbeRCA-BPF 在线根因定位方案。这一版严格按照我们最后商议的结果组织，不再引入额外的综合关系强度变量，也暂不加入反事实重复求解。
 
@@ -2322,3 +2326,13 @@ TCP边独立告警
 - 范围外实体可以继续采集、兼容读取和诊断展示，但不得进入Baseline、(A_s)、(A_v)、健康验证告警、候选图或FISTA。
 - 所有正式范围过滤必须从冻结scope/config推导，禁止按具体服务名硬编码。
 - 正式live collector必须从冻结配置读取15条有向TCP边并在正式9/4/3聚合前完成投影；exporter/Prometheus仍可保留范围外动态边用于诊断，但这些原始序列不得进入正式窗口、拓扑指纹、Dataset特征或因边界不完整而阻断正式归档。冻结边若整体缺失，仍必须失败关闭。
+
+## Stable runtime identity handshake
+
+- Runtime identity fingerprints include semantic identity fields such as owner
+  UID, Pod UID, full container ID, image ID, node, and service association.
+- Kubernetes `resourceVersion`, object `generation`, observation timestamps,
+  and serialization order are lifecycle metadata, not runtime identity. They
+  must not invalidate Healthy models while semantic identity is unchanged.
+- A real Pod UID, owner UID, full container ID, node, image, or formal service
+  association change still invalidates the handshake and fails closed.

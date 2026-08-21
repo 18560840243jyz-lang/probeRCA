@@ -305,3 +305,13 @@ same fingerprint is required for the final Healthy Pilot and subsequent formal
 single-VM fault experiments. Any future workload change creates a new profile
 fingerprint and requires a new independent Healthy Pilot; it does not authorize
 changes to RCA mathematics, Soft/Hard scores, or P95 validity rules.
+
+## Stable Runtime Identity Decision
+
+Runtime identity is defined by semantic identities: formal service association,
+owner UID, Pod UID, full container ID, image ID, and node placement. Kubernetes
+`resourceVersion`, object `generation`, observation time, and serialization order
+are excluded because status-only controller updates can change them without
+changing the running workload. A semantic identity change still invalidates the
+Healthy handshake and fails closed. A change to this fingerprint definition
+requires a fresh Healthy Pilot before formal fault injection.

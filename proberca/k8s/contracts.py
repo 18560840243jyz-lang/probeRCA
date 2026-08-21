@@ -147,12 +147,26 @@ class RuntimeIdentityRecord:
     def __post_init__(self) -> None:
         if self.container_type not in {"app", "init", "ephemeral"}:
             raise ValueError("invalid container_type")
-        expected = canonical_hash({
+        identity_payload = {
             key: value for key, value in asdict(self).items()
             if key not in {
                 "identity_fingerprint", "observed_at_ns", "resource_version",
             }
-        })
+        }
+        workload = identity_payload.get("workload_ref")
+        if workload is not None:
+            # resourceVersion and generation describe mutable Kubernetes object
+            # state, not the identity of the owning workload. ReplicaSet and
+            # Deployment status updates must not invalidate a calibration while
+            # the owner UID, Pod UID, and full container ID remain unchanged.
+            workload["owner_chain"] = [
+                {
+                    key: value for key, value in owner.items()
+                    if key not in {"resource_version", "generation"}
+                }
+                for owner in workload["owner_chain"]
+            ]
+        expected = canonical_hash(identity_payload)
         if self.identity_fingerprint and self.identity_fingerprint != expected:
             raise ValueError("runtime identity fingerprint mismatch")
         object.__setattr__(self, "identity_fingerprint", expected)

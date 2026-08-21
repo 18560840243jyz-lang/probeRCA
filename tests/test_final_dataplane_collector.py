@@ -58,7 +58,12 @@ from proberca.dataplane.sources import (
     PrometheusSourceConfig,
 )
 from proberca.cli.collect_final import _write_aligned_windows
-from proberca.k8s.contracts import ResourceVersionVector
+from proberca.k8s.contracts import (
+    KubernetesObjectRef,
+    ResourceVersionVector,
+    RuntimeIdentityRecord,
+    WorkloadRef,
+)
 
 
 START = 1_000_000_000
@@ -88,6 +93,41 @@ FORMAL_TCP_METRICS = frozenset({
     "edge_latency_p95",
     "edge_failure_rate",
 })
+
+
+def _runtime_identity(*, owner_resource_version="100", owner_generation=1,
+                      owner_uid="owner-a", container_id="containerd://abc"):
+    owner = KubernetesObjectRef(
+        "apps/v1", "ReplicaSet", NAMESPACE, "checkout-abc", owner_uid,
+        owner_resource_version, owner_generation,
+    )
+    workload = WorkloadRef(
+        "apps/v1", "Deployment", NAMESPACE, "checkout", "deployment-a",
+        (owner,),
+    )
+    return RuntimeIdentityRecord(
+        CLUSTER, NAMESPACE, "pod-a", "checkout-abc-1", ("10.0.0.1",),
+        "10.0.0.10", "node-a", workload,
+        (f"{CLUSTER}::{NAMESPACE}::checkout",), "server", "app",
+        "containerd", container_id, "image@sha256:abc", True, True, 0,
+        START, "pod-rv",
+    )
+
+
+def test_runtime_identity_ignores_mutable_owner_versions():
+    original = _runtime_identity()
+    status_updated = _runtime_identity(
+        owner_resource_version="999", owner_generation=42,
+    )
+    assert status_updated.identity_fingerprint == original.identity_fingerprint
+
+    replaced_owner = _runtime_identity(owner_uid="owner-b")
+    replaced_container = _runtime_identity(container_id="containerd://def")
+    assert replaced_owner.identity_fingerprint != original.identity_fingerprint
+    assert (
+        replaced_container.identity_fingerprint
+        != original.identity_fingerprint
+    )
 EXPERIMENTAL_DNS_COMPONENTS = frozenset({
     "dns_query_total",
     "dns_success_total",
