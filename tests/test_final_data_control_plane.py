@@ -3462,6 +3462,11 @@ def test_formal_faults_act_on_real_paths_not_isolated_synthetic_signals(
         "recommendationservice", "memory.high",
         str(runner.SERVICE_MEMORY_HIGH_BYTES),
     )
+    # The pressure boundary must not sit below the actor's entire working set:
+    # that configuration caused reclaim stalls and a liveness-driven restart
+    # instead of a stable service-memory incident.
+    assert runner.SERVICE_MEMORY_HIGH_BYTES \
+        >= runner.SERVICE_MEMORY_ACTOR_BYTES
     assert actors[0][1]["service"] == "recommendationservice"
     assert actors[1][1]["workload"] == "proberca-healthy-rpc-load"
     assert actors[1][1]["container"] == "rpc-load"

@@ -367,3 +367,14 @@ After the independent Healthy Validation reaches READY, the formal Baseline,
 archived for diagnostics, but cannot update the model used by formal fault
 experiments. A workload, scope, contract, topology, runtime-identity, or model
 configuration fingerprint change requires a new Healthy Pilot.
+
+## Stable service-memory intervention decision
+
+The formal service-memory intervention must create sustained reclaim pressure
+without restarting the target container. For the single-VM profile it touches
+256 MiB in `recommendationservice` and sets `memory.high` to 256 MiB. The
+previous 128 MiB boundary was below the actor working set, caused liveness
+timeouts and exit 137, and is invalid as an RCA trial. Qualification requires
+non-zero `memory.events high`, zero OOM/oom_kill, and unchanged Pod UID,
+container ID, and restart count. A restart invalidates the trial and the
+runtime-identity handshake; it is never treated as a successful memory fault.

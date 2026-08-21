@@ -2363,3 +2363,8 @@ TCP边独立告警
   and `A_v`. Later healthy raw windows remain available for diagnostics but do
   not mutate the formal model. Any relevant fingerprint or frozen load-profile
   change requires a new Healthy Pilot before formal fault experiments.
+- Qualify service-memory pressure separately before formal collection. The
+  `memory.high` boundary must not be lower than the actor's intended working
+  set, and a valid trial must show reclaim pressure without OOM, Pod/container
+  identity change, or restart. A liveness-driven restart is an invalid
+  intervention, not a detected memory root cause.
