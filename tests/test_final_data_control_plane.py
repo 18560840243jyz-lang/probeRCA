@@ -1801,6 +1801,7 @@ def test_fault_runner_requires_current_readiness_fingerprint_handshake(
             graph.runtime_identity_fingerprint
         ),
     }
+    current_snapshot = [snapshot]
     archive = SimpleNamespace(
         collection_contract_fingerprint=(
             config.collection_contract_fingerprint
@@ -1808,7 +1809,7 @@ def test_fault_runner_requires_current_readiness_fingerprint_handshake(
         dataset_id="preflight-dataset",
         manifest_fingerprint="m" * 64,
         iter_windows=lambda: iter((
-            SimpleNamespace(topology_events=(snapshot,)),
+            SimpleNamespace(topology_events=(current_snapshot[0],)),
         )),
     )
     monkeypatch.setattr(
@@ -1818,13 +1819,61 @@ def test_fault_runner_requires_current_readiness_fingerprint_handshake(
         runner.CollectionArchive, "load", lambda _path: archive,
     )
 
+    pod_binding = runner.formal_pod_binding_fingerprint(snapshot, config)
     handshake = runner.assert_current_readiness_handshake(
-        readiness, tmp_path,
+        readiness, tmp_path, calibration_pod_binding=pod_binding,
     )
     assert handshake["topology_fingerprint"] \
         == graph.topology_fingerprint
     assert handshake["runtime_identity_fingerprint"] \
         == graph.runtime_identity_fingerprint
+    assert handshake["runtime_identity_rebound"] is False
+    assert handshake["calibration_pod_binding_fingerprint"] \
+        == pod_binding
+
+    changed_runtime = dict(snapshot.service_runtime_identity_fingerprints)
+    formal_id = sorted(config.formal_service_entity_ids)[0]
+    changed_runtime[formal_id] = [fingerprint({"runtime": "replacement"})]
+    restarted = replace(
+        snapshot,
+        runtime_identity_fingerprints=sorted({
+            identity
+            for identities in changed_runtime.values()
+            for identity in identities
+        }),
+        service_runtime_identity_fingerprints=changed_runtime,
+    )
+    current_snapshot[0] = restarted
+    rebound = runner.assert_current_readiness_handshake(
+        readiness, tmp_path, calibration_pod_binding=pod_binding,
+    )
+    assert rebound["runtime_identity_rebound"] is True
+    assert rebound["runtime_identity_fingerprint"] \
+        != readiness["runtime_identity_fingerprint"]
+    assert rebound["live_pod_binding_fingerprint"] == pod_binding
+
+    changed_placements = [
+        replace(item, pod_uid="replacement-pod")
+        if (
+            f"{snapshot.cluster_id}::{item.namespace}::"
+            f"{item.service_name}"
+        ) == formal_id
+        else item
+        for item in snapshot.service_nodes
+    ]
+    current_snapshot[0] = replace(
+        restarted, service_nodes=changed_placements,
+    )
+    with pytest.raises(
+        runner.ExperimentError,
+        match="outside the stable same-Pod rebind scope",
+    ):
+        runner.assert_current_readiness_handshake(
+            readiness, tmp_path,
+            calibration_pod_binding=pod_binding,
+        )
+
+    current_snapshot[0] = snapshot
 
     bad = dict(readiness)
     bad["scale_config_fingerprint"] = "bad"
@@ -1832,7 +1881,9 @@ def test_fault_runner_requires_current_readiness_fingerprint_handshake(
         runner.ExperimentError,
         match="readiness/config fingerprint mismatch",
     ):
-        runner.assert_current_readiness_handshake(bad, tmp_path)
+        runner.assert_current_readiness_handshake(
+            bad, tmp_path, calibration_pod_binding=pod_binding,
+        )
 
 def test_fault_runner_subprocesses_use_frozen_kubeconfig(monkeypatch):
     import scripts.run_final_fault_matrix as runner
@@ -3467,6 +3518,14 @@ def test_formal_faults_act_on_real_paths_not_isolated_synthetic_signals(
     # instead of a stable service-memory incident.
     assert runner.SERVICE_MEMORY_HIGH_BYTES \
         >= runner.SERVICE_MEMORY_ACTOR_BYTES
+    assert runner.SERVICE_MEMORY_ACTOR_BYTES == 192 * 1024 * 1024
+    assert runner.SERVICE_MEMORY_HIGH_BYTES == 224 * 1024 * 1024
+    assert (
+        runner.SERVICE_MEMORY_HIGH_BYTES
+        - runner.SERVICE_MEMORY_ACTOR_BYTES
+    ) == runner.SERVICE_MEMORY_HIGH_HEADROOM_BYTES
+    assert Context.metadata["intervention_profile"] \
+        == "service-memory-working-set-v2"
     assert actors[0][1]["service"] == "recommendationservice"
     assert actors[1][1]["workload"] == "proberca-healthy-rpc-load"
     assert actors[1][1]["container"] == "rpc-load"

@@ -2344,8 +2344,20 @@ TCP边独立告警
 - Kubernetes `resourceVersion`, object `generation`, observation timestamps,
   and serialization order are lifecycle metadata, not runtime identity. They
   must not invalidate Healthy models while semantic identity is unchanged.
-- A real Pod UID, owner UID, full container ID, node, image, or formal service
-  association change still invalidates the handshake and fails closed.
+- During Calibration, Healthy Validation, or any Normal/abnormal collection
+  phase, every real Pod UID, full container ID, node, image, or formal service
+  association change still invalidates that segment and fails closed.
+- After READY and only between completed fault trials, a container-runtime
+  replacement inside the same Pod may be rebound without refitting service-level
+  Baseline, `A_s`, or `A_v`. The formal topology, load/config/contract
+  fingerprints, and exact `(service, node, Pod UID)` binding must still match the
+  calibration archive, and a fresh sealed preflight window must prove complete
+  current `9/4/3` attribution. The calibration runtime fingerprint and current
+  runtime fingerprint are both retained in the experiment manifest.
+- A Pod UID, owner, image, node, service association, formal topology, or frozen
+  configuration change is outside that bounded rebind and still requires a new
+  Healthy Pilot. Rebinding can never make a mid-window or cross-phase identity
+  change valid.
 
 ## Local-socket validity and formal model freeze
 
@@ -2361,13 +2373,15 @@ TCP边独立告警
   service-specific exception.
 - Once independent Healthy Validation reaches READY, freeze Baseline, `A_s`,
   and `A_v`. Later healthy raw windows remain available for diagnostics but do
-  not mutate the formal model. Any relevant fingerprint or frozen load-profile
-  change requires a new Healthy Pilot before formal fault experiments.
+  not mutate the formal model. Any model-semantic fingerprint or frozen
+  load-profile change requires a new Healthy Pilot; only the bounded same-Pod
+  runtime rebind above is non-semantic and does not refit the model.
 - Qualify service-memory pressure separately before formal collection. The
-  `memory.high` boundary must not be lower than the actor's intended working
-  set, and a valid trial must show reclaim pressure without OOM, Pod/container
-  identity change, or restart. A liveness-driven restart is an invalid
-  intervention, not a detected memory root cause.
+  single-VM qualified profile touches 192 MiB and sets `memory.high` to 224 MiB.
+  Its 30-second qualification produced non-zero `memory.events high` while
+  retaining Ready state, the same Pod/container identity, and zero OOM/oom_kill.
+  A liveness-driven restart remains an invalid intervention, not a detected
+  memory root cause.
 - Treat the always-on Burst JSONL as bounded runtime transport, never as an
   immutable dataset. A loader start creates a fresh epoch and enforces the
   configured byte cap; rollover during collection fails closed. After boundary
@@ -2383,6 +2397,7 @@ TCP边独立告警
   HTTP/gRPC channels; they remain traffic sources and never become formal root
   entities. Restart the primitive exporter last and require complete formal
   service plus 15-edge coverage. Do not start experimental DNS workloads. Any
-  later application runtime-identity change invalidates
-  the active collection; never use reattachment to hide a mid-experiment
-  identity change.
+  later application runtime-identity change invalidates the active collection;
+  never use reattachment to hide a mid-experiment identity change. A bounded
+  same-Pod rebind may be performed only after that failed trial has stopped and
+  before a fresh trial begins, under the handshake rules above.

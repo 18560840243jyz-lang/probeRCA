@@ -62,8 +62,14 @@ HOST_MEMORY_PILOT_BYTES = 4 * 1024 * 1024 * 1024
 HOST_NIC_DELAY_MS = 20
 HOST_NIC_LOSS_PERCENT = 3.0
 SERVICE_CPU_QUOTA = "25000 100000"
-SERVICE_MEMORY_HIGH_BYTES = 256 * 1024 * 1024
-SERVICE_MEMORY_ACTOR_BYTES = 256 * 1024 * 1024
+# Qualification on the frozen 450-MiB recommendationservice container showed
+# that a 256-MiB actor at a 256-MiB memory.high boundary caused three liveness
+# timeouts and a container restart.  A 192-MiB actor with a 224-MiB boundary
+# produced real memory.high events for 30 seconds without losing readiness or
+# changing runtime identity.
+SERVICE_MEMORY_ACTOR_BYTES = 192 * 1024 * 1024
+SERVICE_MEMORY_HIGH_HEADROOM_BYTES = 32 * 1024 * 1024
+SERVICE_MEMORY_HIGH_BYTES = 224 * 1024 * 1024
 SERVICE_LOCALNET_REJECT_PROBABILITY = 0.15
 
 
@@ -442,8 +448,76 @@ def wait_data_plane(root: Path, *, restart_on_failure: bool = True) -> None:
     raise ExperimentError("data plane did not become ready")
 
 
+def formal_pod_binding_fingerprint(
+    snapshot, config: FinalControlConfig,
+) -> str:
+    """Hash the stable service-to-Pod binding used to bound runtime rebinds."""
+    formal_services = set(config.formal_service_entity_ids)
+    bindings: list[tuple[str, str, str]] = []
+    covered: set[str] = set()
+    for placement in snapshot.service_nodes:
+        service_id = (
+            f"{snapshot.cluster_id}::{placement.namespace}::"
+            f"{placement.service_name}"
+        )
+        if service_id not in formal_services:
+            continue
+        if not placement.pod_uid:
+            raise ExperimentError(
+                "formal runtime rebind requires complete Pod UIDs"
+            )
+        bindings.append((
+            service_id, placement.node_name, placement.pod_uid,
+        ))
+        covered.add(service_id)
+    if covered != formal_services:
+        raise ExperimentError(
+            "formal runtime rebind lacks service-to-Pod bindings"
+        )
+    payload = json.dumps(
+        sorted(bindings), sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def calibration_pod_binding_fingerprint(
+    readiness_path: Path, readiness: dict[str, Any],
+) -> str:
+    """Recover the immutable calibration Pod binding without rewriting it."""
+    payload = yaml.safe_load(CONTROL_CONFIG.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ExperimentError("final control config is not a mapping")
+    config = FinalControlConfig.from_dict(payload)
+    archive_root = readiness_path.resolve().parent.parent / "normal"
+    try:
+        archive = CollectionArchive.load(archive_root)
+        first = next(archive.iter_windows())
+    except (OSError, StopIteration, ValueError) as exc:
+        raise ExperimentError(
+            "fault injection refused: calibration archive cannot prove "
+            "the stable Pod binding"
+        ) from exc
+    if len(first.topology_events) != 1:
+        raise ExperimentError(
+            "fault injection refused: calibration topology is ambiguous"
+        )
+    snapshot = first.topology_events[0]
+    graph = formal_service_graph(snapshot, config)
+    if (
+        graph.topology_fingerprint != readiness["topology_fingerprint"]
+        or graph.runtime_identity_fingerprint
+        != readiness["runtime_identity_fingerprint"]
+    ):
+        raise ExperimentError(
+            "fault injection refused: calibration archive does not match "
+            "the READY report"
+        )
+    return formal_pod_binding_fingerprint(snapshot, config)
+
+
 def assert_current_readiness_handshake(
-    readiness: dict[str, Any], root: Path,
+    readiness: dict[str, Any], root: Path, *,
+    calibration_pod_binding: str,
 ) -> dict[str, Any]:
     payload = yaml.safe_load(CONTROL_CONFIG.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -519,18 +593,46 @@ def assert_current_readiness_handshake(
                 graph.runtime_identity_fingerprint
             ),
         }
+        live_pod_binding = formal_pod_binding_fingerprint(
+            windows[0].topology_events[0], config,
+        )
         live_mismatch = [
             name for name, value in live.items()
-            if readiness.get(name) != value
+            if name != "runtime_identity_fingerprint"
+            and readiness.get(name) != value
         ]
         if live_mismatch:
             raise ExperimentError(
                 "fault injection refused: readiness/live fingerprint "
                 "mismatch: " + ",".join(live_mismatch)
             )
+        calibration_runtime = readiness.get(
+            "calibration_runtime_identity_fingerprint",
+            readiness["runtime_identity_fingerprint"],
+        )
+        runtime_rebound = (
+            live["runtime_identity_fingerprint"]
+            != readiness["runtime_identity_fingerprint"]
+        )
+        if runtime_rebound and live_pod_binding != calibration_pod_binding:
+            raise ExperimentError(
+                "fault injection refused: runtime identity changed outside "
+                "the stable same-Pod rebind scope"
+            )
         return {
             **expected,
             **live,
+            "calibration_runtime_identity_fingerprint": (
+                calibration_runtime
+            ),
+            "readiness_runtime_identity_fingerprint": (
+                readiness["runtime_identity_fingerprint"]
+            ),
+            "runtime_identity_rebound": runtime_rebound,
+            "calibration_pod_binding_fingerprint": (
+                calibration_pod_binding
+            ),
+            "live_pod_binding_fingerprint": live_pod_binding,
             "snapshot_id": graph.snapshot_id,
             "preflight_dataset_id": archive.dataset_id,
             "preflight_manifest_fingerprint": (
@@ -987,12 +1089,17 @@ def actor_fault(
 
 
 def service_memory(context: FaultContext, windows: int) -> None:
-    # Apply reclaim pressure below memory.max, rather than merely allocating
-    # unused headroom.  Cleanup restores the exact pre-experiment cgroup value.
+    # Increase the real target cgroup's working set without crossing the
+    # qualified liveness-stall boundary. Cleanup restores the exact original
+    # cgroup value, and the runner still rejects any runtime identity change.
     target_service = "recommendationservice"
     byte_count = SERVICE_MEMORY_ACTOR_BYTES
     context.metadata["target_service"] = target_service
     context.metadata["bytes_touched"] = byte_count
+    context.metadata["memory_high_bytes"] = SERVICE_MEMORY_HIGH_BYTES
+    context.metadata["intervention_profile"] = (
+        "service-memory-working-set-v2"
+    )
     context.write_cgroup_control(
         target_service, "memory.high", str(SERVICE_MEMORY_HIGH_BYTES)
     )
@@ -1477,7 +1584,19 @@ def main() -> int:
     atomic_json(root / "dataset-manifest.json", manifest)
     assert_no_stale_network_faults()
     wait_data_plane(root)
-    handshake = assert_current_readiness_handshake(readiness, root)
+    calibration_pod_binding = calibration_pod_binding_fingerprint(
+        arguments.calibration_readiness, readiness,
+    )
+    handshake = assert_current_readiness_handshake(
+        readiness, root,
+        calibration_pod_binding=calibration_pod_binding,
+    )
+    previous_handshake = manifest.get("readiness_handshake")
+    history = manifest.setdefault("readiness_handshake_history", [])
+    if previous_handshake and previous_handshake not in history:
+        history.append(previous_handshake)
+    if handshake not in history:
+        history.append(handshake)
     manifest["readiness_handshake"] = handshake
     atomic_json(root / "dataset-manifest.json", manifest)
     log_event(
@@ -1487,6 +1606,9 @@ def main() -> int:
         runtime_identity_fingerprint=(
             handshake["runtime_identity_fingerprint"]
         ),
+        runtime_identity_rebound=handshake[
+            "runtime_identity_rebound"
+        ],
     )
 
     for index, spec in enumerate(specs, 1):

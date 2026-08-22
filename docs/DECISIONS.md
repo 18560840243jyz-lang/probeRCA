@@ -346,9 +346,15 @@ Runtime identity is defined by semantic identities: formal service association,
 owner UID, Pod UID, full container ID, image ID, and node placement. Kubernetes
 `resourceVersion`, object `generation`, observation time, and serialization order
 are excluded because status-only controller updates can change them without
-changing the running workload. A semantic identity change still invalidates the
-Healthy handshake and fails closed. A change to this fingerprint definition
-requires a fresh Healthy Pilot before formal fault injection.
+changing the running workload. Runtime changes during Calibration, Healthy
+Validation, or a Normal/abnormal phase still fail closed. After READY and only
+between completed trials, a container replacement inside the same Pod may be
+rebound without refitting the service-level model when the formal topology,
+configuration, load profile, and exact `(service, node, Pod UID)` mapping match
+the calibration archive and a fresh sealed preflight window passes `9/4/3`.
+Both runtime fingerprints are retained. A Pod UID, owner, image, node, service
+association, topology, or frozen configuration change remains model-semantic and
+requires a fresh Healthy Pilot. A rebind never repairs a mid-window change.
 
 ## Local-socket exposure and frozen-model decision
 
@@ -366,18 +372,20 @@ After the independent Healthy Validation reaches READY, the formal Baseline,
 `A_s`, and `A_v` snapshot is immutable. Additional healthy raw windows may be
 archived for diagnostics, but cannot update the model used by formal fault
 experiments. A workload, scope, contract, topology, runtime-identity, or model
-configuration fingerprint change requires a new Healthy Pilot.
+configuration fingerprint change requires a new Healthy Pilot. The only
+exception is the bounded same-Pod, between-trial runtime rebind defined above;
+it changes attribution provenance but not the frozen service/host/TCP model.
 
 ## Stable service-memory intervention decision
 
 The formal service-memory intervention must create sustained reclaim pressure
 without restarting the target container. For the single-VM profile it touches
-256 MiB in `recommendationservice` and sets `memory.high` to 256 MiB. The
-previous 128 MiB boundary was below the actor working set, caused liveness
-timeouts and exit 137, and is invalid as an RCA trial. Qualification requires
-non-zero `memory.events high`, zero OOM/oom_kill, and unchanged Pod UID,
-container ID, and restart count. A restart invalidates the trial and the
-runtime-identity handshake; it is never treated as a successful memory fault.
+192 MiB in `recommendationservice` and sets `memory.high` to 224 MiB. The former
+256/256 MiB profile caused three consecutive liveness timeouts and a container
+restart and is invalid as an RCA trial. A 30-second qualification of the new
+profile produced 718 `memory.events high`, zero OOM/oom_kill, no not-Ready
+sample, and unchanged Pod UID, container ID, and restart count. A restart
+invalidates the trial; it is never treated as a successful memory fault.
 
 ## Bounded Burst runtime-log decision
 
