@@ -378,3 +378,42 @@ timeouts and exit 137, and is invalid as an RCA trial. Qualification requires
 non-zero `memory.events high`, zero OOM/oom_kill, and unchanged Pod UID,
 container ID, and restart count. A restart invalidates the trial and the
 runtime-identity handshake; it is never treated as a successful memory fault.
+
+## Bounded Burst runtime-log decision
+
+The always-on Burst loader writes a transient runtime transport log, not a
+research archive. Each loader start creates a fresh log epoch instead of
+appending across deployments, and the formal service enforces a 4 GiB hard
+limit. Reaching that limit terminates the loader so systemd starts a new epoch;
+an overlapping collection detects the truncation and fails closed rather than
+losing or fabricating a target window.
+
+After exact boundaries have been captured, the live Burst reader consumes the
+log sequentially only through the checkpoint needed by the current one-second
+window. It retains at most the configured event-record bound plus the latest
+checkpoint/look-ahead state, then discards already aggregated events. It must
+not load the entire Healthy interval into Python objects. This changes only
+runtime retention and transport; the sealed Burst window schema, channels,
+sampling profile, event-loss calculation, and RCA evidence semantics remain
+unchanged.
+
+## Formal instrumentation-epoch decision
+
+Beyla's process attachment is runtime identity scoped. A container may remain
+Ready and serve real RPCs after a restart while an older long-lived Beyla
+instance exposes only discovery metadata or probe traffic for the replacement
+process. Treating that partial source as a valid zero would corrupt the formal
+service baseline.
+
+The formal installer therefore creates one deterministic instrumentation epoch
+before a Healthy Pilot or fault campaign: restart the Beyla DaemonSet, restart
+the 11 formal workload Deployments in the frozen dependency order while Beyla
+is active, and wait for each dependency before restarting its callers. After
+the services are stable, restart the frozen load-generator Deployments so their
+long-lived HTTP/gRPC channels cannot retain pre-epoch connections. The
+primitive exporter starts last and must pass complete service plus 15-edge
+coverage. Load generators remain traffic sources and are never formal RCA
+entities; experimental DNS workloads are not started. A later application
+runtime-identity change still
+invalidates an active collection; the installer rule is preparation, not an
+online repair that hides changes during an experiment.

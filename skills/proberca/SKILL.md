@@ -2368,3 +2368,21 @@ TCP边独立告警
   set, and a valid trial must show reclaim pressure without OOM, Pod/container
   identity change, or restart. A liveness-driven restart is an invalid
   intervention, not a detected memory root cause.
+- Treat the always-on Burst JSONL as bounded runtime transport, never as an
+  immutable dataset. A loader start creates a fresh epoch and enforces the
+  configured byte cap; rollover during collection fails closed. After boundary
+  capture, consume events sequentially only through each window's required
+  checkpoint, prune completed records, and fail if the configured in-memory
+  event bound is exceeded. Never load or retain an entire long Healthy interval
+  merely to construct per-window Burst aggregates.
+- Create a clean, deterministic Beyla instrumentation epoch before a formal
+  Healthy Pilot or fault campaign. Restart Beyla first, then restart exactly the
+  11 formal workload Deployments in the frozen dependency order while Beyla is
+  active, waiting for each dependency before its callers. After services are
+  stable, restart the frozen load-generator Deployments to clear pre-epoch
+  HTTP/gRPC channels; they remain traffic sources and never become formal root
+  entities. Restart the primitive exporter last and require complete formal
+  service plus 15-edge coverage. Do not start experimental DNS workloads. Any
+  later application runtime-identity change invalidates
+  the active collection; never use reattachment to hide a mid-experiment
+  identity change.

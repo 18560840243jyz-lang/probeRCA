@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -149,7 +150,7 @@ def _normal_raw_window():
 
 def _config(tmp_path: Path) -> FinalLiveBurstConfig:
     return FinalLiveBurstConfig(
-        schema_version="probeRCA-final-live-burst-v1",
+        schema_version="probeRCA-final-live-burst-v2",
         cluster_id="cluster",
         event_log_path=str(tmp_path / "events.jsonl"),
         cgroup_root=str(tmp_path / "cgroup"),
@@ -157,6 +158,7 @@ def _config(tmp_path: Path) -> FinalLiveBurstConfig:
         maximum_event_lag_sec=0.5,
         expected_program_count=31,
         sampling_profile="low",
+        max_buffered_event_records=250_000,
     )
 
 
@@ -425,14 +427,16 @@ def test_boundary_defers_log_read_and_collects_all_timestamped_events(
     ]
     with event_path.open("a", encoding="utf-8") as handle:
         handle.write("".join(json.dumps(item) + "\n" for item in later))
-    original_read_log = source._read_log
+    original_read_log_until = source._read_log_until
     read_calls = []
 
-    def counted_read_log():
-        read_calls.append(True)
-        return original_read_log()
+    def counted_read_log_until(through_ns):
+        read_calls.append(through_ns)
+        return original_read_log_until(through_ns)
 
-    monkeypatch.setattr(source, "_read_log", counted_read_log)
+    monkeypatch.setattr(
+        source, "_read_log_until", counted_read_log_until,
+    )
     source.capture_boundary(START, inventory)
     source.capture_boundary(END, inventory)
     assert read_calls == []
@@ -443,13 +447,205 @@ def test_boundary_defers_log_read_and_collects_all_timestamped_events(
         inventory_revision=inventory,
         normal_raw_window=_normal_raw_window(),
     )
-    assert read_calls == [True]
+    assert read_calls == [END]
     futex = next(
         sample for sample in window.samples
         if sample.channel_id == "futex.wait_count"
     )
     assert futex.value == 1
     assert window.event_loss_rate == 0
+
+
+def test_event_log_is_consumed_one_window_at_a_time(tmp_path, monkeypatch):
+    cgroup = _filesystem(tmp_path)
+    cgroup_id = cgroup.stat().st_ino
+    event_path = Path(_config(tmp_path).event_log_path)
+    event_path.write_text(
+        "".join(json.dumps(item) + "\n" for item in (
+            {
+                "record_type": "checkpoint",
+                "schema_version": 1,
+                "timestamp_ns": START,
+                "monotonic_ns": 0,
+                "emitted": 0,
+                "reserve_failed": 0,
+                "program_count": 31,
+                "sampling_profile": "low",
+            },
+        )),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "proberca.dataplane.burst_live.runtime_identities",
+        lambda revision: (_identity(),),
+    )
+    source = FinalLiveBurstSource(
+        _config(tmp_path),
+        burst_config_fingerprint=fingerprint({"burst": "contract"}),
+    )
+    inventory = _inventory()
+    source.begin_capture(inventory)
+    records = []
+    for index in range(3):
+        start = START + index * 1_000_000_000
+        end = start + 1_000_000_000
+        records.extend((
+            _event(
+                5,
+                cgroup_id,
+                timestamp_ns=start + 500_000_000,
+                sequence=index + 1,
+            ),
+            {
+                "record_type": "checkpoint",
+                "schema_version": 1,
+                "timestamp_ns": end,
+                "monotonic_ns": end - START,
+                "emitted": index + 1,
+                "reserve_failed": 0,
+                "program_count": 31,
+                "sampling_profile": "low",
+            },
+        ))
+    with event_path.open("a", encoding="utf-8") as handle:
+        handle.write("".join(json.dumps(item) + "\n" for item in records))
+    file_size = event_path.stat().st_size
+
+    for index in range(4):
+        source.capture_boundary(
+            START + index * 1_000_000_000,
+            inventory,
+        )
+
+    for index in range(3):
+        start = START + index * 1_000_000_000
+        end = start + 1_000_000_000
+        window = source.collect_window(
+            sequence=index + 1,
+            window_start_ns=start,
+            window_end_ns=end,
+            inventory_revision=inventory,
+            normal_raw_window=_normal_raw_window(),
+        )
+        futex = next(
+            sample for sample in window.samples
+            if sample.channel_id == "futex.wait_count"
+        )
+        assert futex.value == 1
+        assert len(source._events) == 0
+        assert len(source._checkpoints) <= 2
+        if index < 2:
+            assert source._offset < file_size
+        else:
+            assert source._offset == file_size
+
+
+def test_event_log_buffer_limit_fails_closed(tmp_path, monkeypatch):
+    cgroup = _filesystem(tmp_path)
+    cgroup_id = cgroup.stat().st_ino
+    config = replace(_config(tmp_path), max_buffered_event_records=1)
+    Path(config.event_log_path).write_text(
+        "".join(json.dumps(item) + "\n" for item in (
+            _event(5, cgroup_id, sequence=1),
+            _event(5, cgroup_id, sequence=2),
+            {
+                "record_type": "checkpoint",
+                "schema_version": 1,
+                "timestamp_ns": END,
+                "monotonic_ns": 1_000_000_000,
+                "emitted": 2,
+                "reserve_failed": 0,
+                "program_count": 31,
+                "sampling_profile": "low",
+            },
+        )),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "proberca.dataplane.burst_live.runtime_identities",
+        lambda revision: (_identity(),),
+    )
+    source = FinalLiveBurstSource(
+        config,
+        burst_config_fingerprint=fingerprint({"burst": "contract"}),
+    )
+    with pytest.raises(
+        RawCollectionError,
+        match="event buffer exceeded its configured limit",
+    ):
+        source.collect_window(
+            sequence=1,
+            window_start_ns=START,
+            window_end_ns=END,
+            inventory_revision=_inventory(),
+            normal_raw_window=_normal_raw_window(),
+        )
+
+
+def test_event_log_transport_stays_bounded_for_1600_windows(
+    tmp_path, monkeypatch,
+):
+    cgroup = _filesystem(tmp_path)
+    cgroup_id = cgroup.stat().st_ino
+    event_path = Path(_config(tmp_path).event_log_path)
+    event_path.write_text(
+        json.dumps({
+            "record_type": "checkpoint",
+            "schema_version": 1,
+            "timestamp_ns": START,
+            "monotonic_ns": 0,
+            "emitted": 0,
+            "reserve_failed": 0,
+            "program_count": 31,
+            "sampling_profile": "low",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "proberca.dataplane.burst_live.runtime_identities",
+        lambda revision: (_identity(),),
+    )
+    source = FinalLiveBurstSource(
+        _config(tmp_path),
+        burst_config_fingerprint=fingerprint({"burst": "contract"}),
+    )
+    source.begin_capture(_inventory())
+    records = []
+    for index in range(1600):
+        start = START + index * 1_000_000_000
+        end = start + 1_000_000_000
+        records.extend((
+            _event(
+                5,
+                cgroup_id,
+                timestamp_ns=start + 500_000_000,
+                sequence=index + 1,
+            ),
+            {
+                "record_type": "checkpoint",
+                "schema_version": 1,
+                "timestamp_ns": end,
+                "monotonic_ns": end - START,
+                "emitted": index + 1,
+                "reserve_failed": 0,
+                "program_count": 31,
+                "sampling_profile": "low",
+            },
+        ))
+    with event_path.open("a", encoding="utf-8") as handle:
+        handle.write("".join(json.dumps(item) + "\n" for item in records))
+    file_size = event_path.stat().st_size
+
+    for index in range(1600):
+        end = START + (index + 1) * 1_000_000_000
+        source._read_log_until(end)
+        assert len(source._events) == 1
+        assert len(source._checkpoints) <= 2
+        source._prune_log_state(end)
+        assert len(source._events) == 0
+        assert len(source._checkpoints) <= 2
+
+    assert source._offset == file_size
 
 
 def test_memory_totals_reads_each_counter_file_once(tmp_path, monkeypatch):

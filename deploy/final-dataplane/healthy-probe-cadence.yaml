@@ -1,6 +1,18 @@
-schema_version: proberca-healthy-probe-cadence-v5
+schema_version: proberca-healthy-probe-cadence-v6
 namespace: online-boutique
 readiness_period_seconds: 1
+instrumentation_restart_order:
+  - redis-cart
+  - adservice
+  - currencyservice
+  - emailservice
+  - paymentservice
+  - productcatalogservice
+  - shippingservice
+  - cartservice
+  - recommendationservice
+  - checkoutservice
+  - frontend
 probe_profiles:
   default:
     liveness_initial_delay_seconds: 0

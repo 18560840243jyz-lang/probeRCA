@@ -21,6 +21,9 @@
 
 #define MAX_LINKS 96
 #define DEFAULT_TIMEOUT_MS 5000
+#define DEFAULT_MAX_OUTPUT_BYTES (4ULL * 1024ULL * 1024ULL * 1024ULL)
+#define MIN_MAX_OUTPUT_BYTES (64ULL * 1024ULL * 1024ULL)
+#define MAX_MAX_OUTPUT_BYTES (64ULL * 1024ULL * 1024ULL * 1024ULL)
 
 struct options {
     const char *object_path;
@@ -28,6 +31,7 @@ struct options {
     const char *output_path;
     const char *sampling_profile;
     uint64_t timeout_ms;
+    uint64_t max_output_bytes;
     bool dns_only;
 };
 
@@ -35,6 +39,8 @@ struct writer_context {
     FILE *output;
     const char *sampling_profile;
     uint64_t epoch_offset_ns;
+    uint64_t output_bytes;
+    uint64_t max_output_bytes;
 };
 
 static volatile sig_atomic_t stopping;
@@ -72,6 +78,7 @@ static int parse_options(
         OPT_CGROUP,
         OPT_OUTPUT,
         OPT_TIMEOUT_MS,
+        OPT_MAX_OUTPUT_BYTES,
         OPT_SAMPLING_PROFILE,
         OPT_DNS_ONLY,
     };
@@ -80,6 +87,7 @@ static int parse_options(
         {"cgroup", required_argument, NULL, OPT_CGROUP},
         {"output", required_argument, NULL, OPT_OUTPUT},
         {"timeout-ms", required_argument, NULL, OPT_TIMEOUT_MS},
+        {"max-output-bytes", required_argument, NULL, OPT_MAX_OUTPUT_BYTES},
         {"sampling-profile", required_argument, NULL, OPT_SAMPLING_PROFILE},
         {"dns-only", no_argument, NULL, OPT_DNS_ONLY},
         {NULL, 0, NULL, 0},
@@ -90,6 +98,7 @@ static int parse_options(
     options->cgroup_path = "/sys/fs/cgroup";
     options->sampling_profile = "low";
     options->timeout_ms = DEFAULT_TIMEOUT_MS;
+    options->max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES;
     while ((option = getopt_long(
                 argc, argv, "", long_options, NULL)) != -1) {
         switch (option) {
@@ -106,6 +115,12 @@ static int parse_options(
             if (parse_u64(optarg, &options->timeout_ms) != 0 ||
                 options->timeout_ms < 100 ||
                 options->timeout_ms > 60000)
+                return -EINVAL;
+            break;
+        case OPT_MAX_OUTPUT_BYTES:
+            if (parse_u64(optarg, &options->max_output_bytes) != 0 ||
+                options->max_output_bytes < MIN_MAX_OUTPUT_BYTES ||
+                options->max_output_bytes > MAX_MAX_OUTPUT_BYTES)
                 return -EINVAL;
             break;
         case OPT_SAMPLING_PROFILE:
@@ -126,6 +141,17 @@ static int parse_options(
     return 0;
 }
 
+static int account_output(
+    struct writer_context *writer, int written)
+{
+    if (written < 0)
+        return -EIO;
+    writer->output_bytes += (uint64_t)written;
+    return writer->output_bytes <= writer->max_output_bytes
+               ? 0
+               : -EFBIG;
+}
+
 static int write_event(
     struct writer_context *writer,
     const struct proberca_burst_event *event)
@@ -133,7 +159,7 @@ static int write_event(
     uint64_t timestamp_ns = event->monotonic_ns +
                             writer->epoch_offset_ns;
 
-    if (fprintf(
+    int written = fprintf(
             writer->output,
             "{\"record_type\":\"event\",\"schema_version\":%u,"
             "\"timestamp_ns\":%llu,\"monotonic_ns\":%llu,"
@@ -163,9 +189,8 @@ static int write_event(
             event->direction,
             event->transaction_id,
             event->rcode,
-            event->sampling_divisor) < 0)
-        return -EIO;
-    return 0;
+            event->sampling_divisor);
+    return account_output(writer, written);
 }
 
 static int handle_event(
@@ -296,10 +321,11 @@ static int write_checkpoint(
     uint64_t epoch_ns = clock_ns(CLOCK_REALTIME);
     uint64_t monotonic_ns = clock_ns(CLOCK_MONOTONIC);
     int result = read_loss(loss_fd, &emitted, &reserve_failed);
+    int written;
 
     if (result != 0)
         return result;
-    if (fprintf(
+    written = fprintf(
             writer->output,
             "{\"record_type\":\"checkpoint\",\"schema_version\":%u,"
             "\"timestamp_ns\":%llu,\"monotonic_ns\":%llu,"
@@ -311,8 +337,10 @@ static int write_checkpoint(
             (unsigned long long)emitted,
             (unsigned long long)reserve_failed,
             program_count,
-            writer->sampling_profile) < 0)
-        return -EIO;
+            writer->sampling_profile);
+    result = account_output(writer, written);
+    if (result != 0)
+        return result;
     return fflush(writer->output) == 0 ? 0 : -EIO;
 }
 
@@ -379,7 +407,7 @@ static int run(const struct options *options)
         perror("setrlimit(RLIMIT_MEMLOCK)");
         goto cleanup;
     }
-    writer.output = fopen(options->output_path, "a");
+    writer.output = fopen(options->output_path, "w");
     if (!writer.output) {
         perror("open Burst event output");
         goto cleanup;
@@ -391,6 +419,7 @@ static int run(const struct options *options)
     writer.epoch_offset_ns =
         clock_ns(CLOCK_REALTIME) - clock_ns(CLOCK_MONOTONIC);
     writer.sampling_profile = options->sampling_profile;
+    writer.max_output_bytes = options->max_output_bytes;
     object = bpf_object__open_file(options->object_path, NULL);
     if (libbpf_get_error(object)) {
         object = NULL;
@@ -436,7 +465,8 @@ static int run(const struct options *options)
         fprintf(stderr, "cannot create final Burst ring reader\n");
         goto cleanup;
     }
-    if (fprintf(
+    {
+        int written = fprintf(
             writer.output,
             "{\"record_type\":\"control\",\"schema_version\":%u,"
             "\"state\":\"ready\",\"timestamp_ns\":%llu,"
@@ -447,8 +477,10 @@ static int run(const struct options *options)
             link_count,
             (unsigned long long)options->timeout_ms,
             options->sampling_profile,
-            options->dns_only ? "true" : "false") < 0)
-        goto cleanup;
+            options->dns_only ? "true" : "false");
+        if (account_output(&writer, written) != 0)
+            goto cleanup;
+    }
     fflush(writer.output);
     next_checkpoint_ns = clock_ns(CLOCK_MONOTONIC);
     while (!stopping) {
@@ -456,7 +488,10 @@ static int run(const struct options *options)
         uint64_t now;
 
         if (poll_result < 0 && poll_result != -EINTR) {
-            fprintf(stderr, "final Burst ring poll failed\n");
+            if (poll_result == -EFBIG)
+                fprintf(stderr, "final Burst output byte limit reached\n");
+            else
+                fprintf(stderr, "final Burst ring poll failed\n");
             goto cleanup;
         }
         if (expire_dns(
@@ -503,7 +538,8 @@ int main(int argc, char **argv)
         fprintf(
             stderr,
             "usage: %s --object PATH [--cgroup PATH] --output PATH "
-            "[--timeout-ms N] [--sampling-profile low|full] [--dns-only]\n",
+            "[--timeout-ms N] [--max-output-bytes N] "
+            "[--sampling-profile low|full] [--dns-only]\n",
             argv[0]);
         return 2;
     }

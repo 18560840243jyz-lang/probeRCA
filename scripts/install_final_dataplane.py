@@ -50,6 +50,93 @@ def _apply_frozen_healthy_load_profile(repository: Path) -> None:
         _run(list(command))
 
 
+def _restart_formal_instrumentation_epoch(repository: Path) -> None:
+    """Bind a fresh Beyla epoch to dependency-ordered workload processes."""
+    configuration = _load_mapping(
+        repository
+        / "deploy/final-dataplane/healthy-probe-cadence.yaml"
+    )
+    deployments = configuration.get("deployments")
+    if (
+        not isinstance(deployments, dict)
+        or not deployments
+        or any(not isinstance(name, str) or not name for name in deployments)
+    ):
+        raise SystemExit(
+            "formal instrumentation deployments are not frozen"
+        )
+    restart_order = configuration.get("instrumentation_restart_order")
+    if (
+        not isinstance(restart_order, list)
+        or any(not isinstance(name, str) or not name for name in restart_order)
+        or len(restart_order) != len(set(restart_order))
+        or set(restart_order) != set(deployments)
+    ):
+        raise SystemExit(
+            "formal instrumentation restart order must partition deployments"
+        )
+    common = [
+        "kubectl",
+        "--kubeconfig", "/home/jyz/.kube/config",
+        "--context", "kind-proberca-ob",
+    ]
+    _run([
+        *common,
+        "-n", "proberca-observe",
+        "rollout", "restart", "daemonset/proberca-beyla",
+    ])
+    _run([
+        *common,
+        "-n", "proberca-observe",
+        "rollout", "status", "daemonset/proberca-beyla",
+        "--timeout=120s",
+    ])
+    # Restart each workload only after its dependencies are Ready.  In
+    # particular, redis-cart must be stable before cartservice constructs its
+    # long-lived Redis connection; callers are deliberately restarted later.
+    for deployment in restart_order:
+        _run([
+            *common,
+            "-n", "online-boutique",
+            "rollout", "restart", f"deployment/{deployment}",
+        ])
+        _run([
+            *common,
+            "-n", "online-boutique",
+            "rollout", "status", f"deployment/{deployment}",
+            "--timeout=180s",
+        ])
+
+    # Frozen traffic drivers keep HTTP/gRPC channels.  Restart them only after
+    # every target is stable so no pre-epoch connection leaks into a Pilot.
+    # These deployments remain load sources, never formal RCA entities.
+    profiles = HealthyLoadProfiles.load(
+        repository / "configs/final_healthy_load_profiles.yaml"
+    )
+    if profiles.status != "frozen":
+        raise SystemExit(
+            "formal instrumentation requires a frozen load profile"
+        )
+    load_deployments = tuple(
+        workload.deployment for workload in profiles.selected().workloads
+    )
+    if len(load_deployments) != len(set(load_deployments)):
+        raise SystemExit("frozen load deployments must be unique")
+    for deployment in load_deployments:
+        _run([
+            *common,
+            "-n", profiles.namespace,
+            "rollout", "restart", f"deployment/{deployment}",
+        ])
+    for deployment in load_deployments:
+        _run([
+            *common,
+            "-n", profiles.namespace,
+            "rollout", "status", f"deployment/{deployment}",
+            "--timeout=180s",
+        ])
+
+
 def _find_bpftool() -> str:
     candidates = [
         shutil.which("bpftool"),
@@ -155,11 +242,11 @@ def _configure_healthy_probe_cadence(repository: Path) -> None:
     configuration = _load_mapping(path)
     if set(configuration) != {
         "schema_version", "namespace", "readiness_period_seconds",
-        "probe_profiles", "deployments",
+        "instrumentation_restart_order", "probe_profiles", "deployments",
     }:
         raise SystemExit("healthy probe cadence fields are not frozen")
     if configuration["schema_version"] \
-            != "proberca-healthy-probe-cadence-v5":
+            != "proberca-healthy-probe-cadence-v6":
         raise SystemExit("healthy probe cadence schema is unsupported")
     namespace = configuration["namespace"]
     readiness_period_seconds = configuration[
@@ -511,6 +598,7 @@ def install(repository: Path) -> None:
         "rollout", "status", "daemonset/proberca-beyla",
         "--timeout=120s",
     ])
+    _restart_formal_instrumentation_epoch(repository)
     _run(["systemctl", "daemon-reload"])
     _run([
         "systemctl", "enable",
@@ -536,6 +624,15 @@ def install(repository: Path) -> None:
     _run([
         "systemctl", "is-active", "--quiet",
         "proberca-final-primitive-exporter.service",
+    ])
+    _run([
+        sys.executable,
+        str(repository / "scripts/check_final_dataplane_readiness.py"),
+        "--collector-config",
+        str(repository / "configs/final_live_collector.example.yaml"),
+        "--metrics-url", "http://127.0.0.1:9477/metrics",
+        "--timeout-sec", "300",
+        "--poll-interval-sec", "1",
     ])
 
 

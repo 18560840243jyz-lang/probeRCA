@@ -1,4 +1,4 @@
-schema_version: probeRCA-final-live-burst-v1
+schema_version: probeRCA-final-live-burst-v2
 cluster_id: kind-proberca-ob
 event_log_path: /var/lib/proberca-final-burst/events.jsonl
 cgroup_root: /sys/fs/cgroup
@@ -6,3 +6,4 @@ network_class_path: /sys/class/net
 maximum_event_lag_sec: 0.5
 expected_program_count: 31
 sampling_profile: low
+max_buffered_event_records: 250000

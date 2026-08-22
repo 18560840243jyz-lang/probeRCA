@@ -12,6 +12,7 @@ from urllib.request import urlopen
 import pytest
 import yaml
 
+import scripts.check_final_dataplane_readiness as readiness_module
 import scripts.install_final_dataplane as install_module
 import proberca.dataplane.primitive_exporter as primitive_module
 from scripts.install_final_dataplane import (
@@ -296,6 +297,21 @@ def test_final_bpf_normal_path_is_map_aggregated_and_window_safe():
         "PROBERCA_BURST_SOCKET_FAILURE", tcp_failure
     )
     assert local_failure > tcp_failure
+
+
+def test_final_burst_runtime_log_is_epoch_scoped_and_bounded():
+    loader = Path(
+        "bpf/user/proberca_final_burst_loader.c"
+    ).read_text(encoding="utf-8")
+    service = Path(
+        "deploy/final-dataplane/proberca-final-burst.service"
+    ).read_text(encoding="utf-8")
+
+    assert 'fopen(options->output_path, "w")' in loader
+    assert 'fopen(options->output_path, "a")' not in loader
+    assert '"max-output-bytes"' in loader
+    assert "final Burst output byte limit reached" in loader
+    assert "--max-output-bytes 4294967296" in service
 
 
 def test_bpf_snapshot_filters_to_sorted_active_cgroups(monkeypatch):
@@ -1886,6 +1902,58 @@ def test_formal_installer_executes_only_formal_workloads(monkeypatch):
         "deploy/final-dataplane/beyla.yaml" in command
         for command in rendered
     )
+    cadence = yaml.safe_load(Path(
+        "deploy/final-dataplane/healthy-probe-cadence.yaml"
+    ).read_text(encoding="utf-8"))
+    formal_deployments = set(cadence["deployments"])
+    formal_restart_order = cadence["instrumentation_restart_order"]
+    restarted_deployments = [
+        command.split("deployment/", 1)[1]
+        for command in rendered
+        if "rollout restart deployment/" in command
+    ]
+    assert restarted_deployments[:len(formal_restart_order)] \
+        == formal_restart_order
+    assert set(formal_restart_order) == formal_deployments
+    load_restart_order = restarted_deployments[len(formal_restart_order):]
+    assert load_restart_order == [
+        "proberca-healthy-checkout-load",
+        "proberca-healthy-rpc-load",
+        "loadgenerator",
+    ]
+    beyla_restart = next(
+        index for index, command in enumerate(rendered)
+        if "rollout restart daemonset/proberca-beyla" in command
+    )
+    formal_workload_restarts = [
+        index for index, command in enumerate(rendered)
+        if any(
+            f"rollout restart deployment/{name}" in command
+            for name in formal_deployments
+        )
+    ]
+    load_restarts = [
+        index for index, command in enumerate(rendered)
+        if any(
+            f"rollout restart deployment/{name}" in command
+            for name in load_restart_order
+        )
+    ]
+    primitive_restart = next(
+        index for index, command in enumerate(rendered)
+        if "systemctl restart proberca-final-primitive-exporter.service"
+        in command
+    )
+    assert beyla_restart < min(formal_workload_restarts)
+    assert max(formal_workload_restarts) < min(load_restarts)
+    assert max(load_restarts) < primitive_restart
+    assert any(
+        "scripts/check_final_dataplane_readiness.py" in command
+        and "configs/final_live_collector.example.yaml" in command
+        and "http://127.0.0.1:9477/metrics" in command
+        and "--timeout-sec 300" in command
+        for command in rendered
+    )
     assert any(
         "patch deployment/coredns" in command
         for command in rendered
@@ -1908,6 +1976,65 @@ def test_formal_installer_executes_only_formal_workloads(monkeypatch):
     )
     assert probe_configurations == [repository]
     assert prometheus_configurations == [repository]
+
+
+def test_formal_readiness_requires_exporter_and_every_tcp_edge():
+    cluster_id = "cluster"
+    required_edges = frozenset({
+        "cluster::ns::caller-a->callee-a::tcp",
+        "cluster::ns::caller-b->callee-b::tcp",
+    })
+    ready = PrometheusSample.create(
+        "proberca_final_primitive_exporter_ready",
+        {"cluster_id": cluster_id},
+        1.0,
+    )
+
+    def edge(caller, callee):
+        return PrometheusSample.create(
+            "proberca_tcp_edge_request_total",
+            {
+                "namespace": "ns",
+                "src_service": caller,
+                "dst_namespace": "ns",
+                "dst_service": callee,
+                "protocol": "tcp",
+                "source_series": f"{caller}-{callee}",
+                "source_coverage": "1",
+            },
+            1.0,
+        )
+
+    incomplete = readiness_module.evaluate_formal_coverage(
+        render_prometheus_text(
+            (ready, edge("caller-a", "callee-a")),
+            timestamp_ms=1_000,
+        ),
+        cluster_id=cluster_id,
+        required_edges=required_edges,
+    )
+    assert incomplete == {
+        "ready": False,
+        "exporter_ready": True,
+        "required_tcp_edges": 2,
+        "observed_required_tcp_edges": 1,
+        "missing_tcp_edges": [
+            "cluster::ns::caller-b->callee-b::tcp",
+        ],
+    }
+
+    complete = readiness_module.evaluate_formal_coverage(
+        render_prometheus_text((
+            ready,
+            edge("caller-a", "callee-a"),
+            edge("caller-b", "callee-b"),
+        ), timestamp_ms=1_000),
+        cluster_id=cluster_id,
+        required_edges=required_edges,
+    )
+    assert complete["ready"] is True
+    assert complete["observed_required_tcp_edges"] == 2
+    assert complete["missing_tcp_edges"] == []
 
 
 def test_experimental_dns_exposure_is_retained_but_not_formally_installed():
@@ -1964,12 +2091,25 @@ def test_healthy_probe_cadence_is_explicit_and_reproducible():
     ).read_text(encoding="utf-8"))
     assert set(configuration) == {
         "schema_version", "namespace", "readiness_period_seconds",
-        "probe_profiles", "deployments",
+        "instrumentation_restart_order", "probe_profiles", "deployments",
     }
     assert configuration["schema_version"] \
-        == "proberca-healthy-probe-cadence-v5"
+        == "proberca-healthy-probe-cadence-v6"
     assert configuration["namespace"] == "online-boutique"
     assert configuration["readiness_period_seconds"] == 1
+    assert configuration["instrumentation_restart_order"] == [
+        "redis-cart",
+        "adservice",
+        "currencyservice",
+        "emailservice",
+        "paymentservice",
+        "productcatalogservice",
+        "shippingservice",
+        "cartservice",
+        "recommendationservice",
+        "checkoutservice",
+        "frontend",
+    ]
     assert configuration["probe_profiles"] == {
         "default": {
             "liveness_initial_delay_seconds": 0,

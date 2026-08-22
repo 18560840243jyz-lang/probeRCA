@@ -19,7 +19,7 @@ from .contracts import fingerprint
 from .raw import RawCollectionError
 
 
-LIVE_BURST_CONFIG_SCHEMA_VERSION = "probeRCA-final-live-burst-v1"
+LIVE_BURST_CONFIG_SCHEMA_VERSION = "probeRCA-final-live-burst-v2"
 INITIAL_LOG_TAIL_BYTES = 32 * 1024 * 1024
 
 EVENT_SCHED_RUNQUEUE = 1
@@ -108,6 +108,7 @@ class FinalLiveBurstConfig:
     maximum_event_lag_sec: float
     expected_program_count: int
     sampling_profile: str
+    max_buffered_event_records: int
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "FinalLiveBurstConfig":
@@ -142,6 +143,14 @@ class FinalLiveBurstConfig:
             raise RawCollectionError("expected_program_count is invalid")
         if self.sampling_profile not in {"low", "full"}:
             raise RawCollectionError("sampling_profile is invalid")
+        if (
+            isinstance(self.max_buffered_event_records, bool)
+            or not isinstance(self.max_buffered_event_records, int)
+            or not 1 <= self.max_buffered_event_records <= 10_000_000
+        ):
+            raise RawCollectionError(
+                "max_buffered_event_records is invalid"
+            )
 
     @property
     def public_fingerprint(self) -> str:
@@ -275,7 +284,7 @@ class FinalLiveBurstSource:
         self._boundary_capture_enabled = True
         self._boundary_memory = {}
         self._boundary_nic = {}
-        self._read_log()
+        self._prime_log_cursor()
         paths = self._runtime_counter_paths(revision)
         self._boundary_revision_token = self._revision_token(revision)
         self._boundary_runtime_paths = dict(paths)
@@ -469,7 +478,85 @@ class FinalLiveBurstSource:
         self._cgroup_paths = paths
         self._ambiguous_cgroups = ambiguous
 
-    def _read_log(self) -> None:
+    @staticmethod
+    def _parse_log_record(line: str) -> dict[str, Any]:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise RawCollectionError("invalid final Burst JSONL") from error
+        if record.get("schema_version") != 1:
+            raise RawCollectionError("unsupported final Burst event schema")
+        return record
+
+    def _ingest_log_record(self, record: dict[str, Any]) -> None:
+        record_type = record.get("record_type")
+        if record_type == "event":
+            divisor = record.setdefault("sampling_divisor", 1)
+            if (
+                isinstance(divisor, bool)
+                or not isinstance(divisor, int)
+                or not 1 <= divisor <= 1024
+            ):
+                raise RawCollectionError(
+                    "invalid final Burst sampling divisor"
+                )
+            self._events.append(record)
+            if len(self._events) > self.config.max_buffered_event_records:
+                raise RawCollectionError(
+                    "final Burst event buffer exceeded its configured limit"
+                )
+        elif record_type == "checkpoint":
+            self._checkpoints.append(record)
+        elif record_type == "control" and record.get("state") == "ready":
+            self._ready_records.clear()
+            self._ready_records.append(record)
+        else:
+            raise RawCollectionError("unknown final Burst log record")
+
+    def _prime_log_cursor(self) -> None:
+        """Start at EOF while retaining only the latest prior checkpoint."""
+        path = Path(self.config.event_log_path)
+        if not path.is_file():
+            raise RawCollectionError("final Burst event log is unavailable")
+        with path.open("r", encoding="utf-8") as handle:
+            size = path.stat().st_size
+            start = max(0, size - INITIAL_LOG_TAIL_BYTES)
+            handle.seek(start)
+            if start:
+                handle.readline()
+            latest_checkpoint = None
+            latest_ready = None
+            while True:
+                line = handle.readline()
+                if not line:
+                    break
+                if not line.endswith(("\n", "\r")):
+                    break
+                record = self._parse_log_record(line)
+                if record.get("record_type") == "checkpoint":
+                    latest_checkpoint = record
+                elif (
+                    record.get("record_type") == "control"
+                    and record.get("state") == "ready"
+                ):
+                    latest_ready = record
+            self._offset = handle.tell()
+        self._pending_line = ""
+        self._events.clear()
+        self._checkpoints.clear()
+        self._ready_records.clear()
+        if latest_checkpoint is not None:
+            self._checkpoints.append(latest_checkpoint)
+        if latest_ready is not None:
+            self._ready_records.append(latest_ready)
+
+    def _read_log_until(self, through_ns: int | None) -> None:
+        """Read sequentially, stopping after a sufficient checkpoint."""
+        if through_ns is not None and any(
+            record["timestamp_ns"] >= through_ns
+            for record in self._checkpoints
+        ):
+            return
         path = Path(self.config.event_log_path)
         if not path.is_file():
             raise RawCollectionError("final Burst event log is unavailable")
@@ -486,37 +573,42 @@ class FinalLiveBurstSource:
                 )
             else:
                 handle.seek(self._offset)
-            text = self._pending_line + handle.read()
-            self._offset = handle.tell()
-        lines = text.splitlines(keepends=True)
-        self._pending_line = ""
-        if lines and not lines[-1].endswith(("\n", "\r")):
-            self._pending_line = lines.pop()
-        for line in lines:
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise RawCollectionError("invalid final Burst JSONL") from error
-            if record.get("schema_version") != 1:
-                raise RawCollectionError("unsupported final Burst event schema")
-            record_type = record.get("record_type")
-            if record_type == "event":
-                divisor = record.setdefault("sampling_divisor", 1)
+            prefix = self._pending_line
+            self._pending_line = ""
+            while True:
+                fragment = handle.readline()
+                if not fragment:
+                    self._pending_line = prefix
+                    break
+                line = prefix + fragment
+                prefix = ""
+                if not line.endswith(("\n", "\r")):
+                    self._pending_line = line
+                    break
+                record = self._parse_log_record(line)
+                self._ingest_log_record(record)
                 if (
-                    isinstance(divisor, bool)
-                    or not isinstance(divisor, int)
-                    or not 1 <= divisor <= 1024
+                    through_ns is not None
+                    and record.get("record_type") == "checkpoint"
+                    and record["timestamp_ns"] >= through_ns
                 ):
-                    raise RawCollectionError(
-                        "invalid final Burst sampling divisor"
-                    )
-                self._events.append(record)
-            elif record_type == "checkpoint":
-                self._checkpoints.append(record)
-            elif record_type == "control" and record.get("state") == "ready":
-                self._ready_records.append(record)
-            else:
-                raise RawCollectionError("unknown final Burst log record")
+                    break
+            self._offset = handle.tell()
+
+    def _read_log(self) -> None:
+        """Compatibility helper for diagnostics that intentionally drain EOF."""
+        self._read_log_until(None)
+
+    def _prune_log_state(self, through_ns: int) -> None:
+        self._events = deque(
+            record for record in self._events
+            if record["timestamp_ns"] >= through_ns
+        )
+        while (
+            len(self._checkpoints) > 1
+            and self._checkpoints[1]["timestamp_ns"] <= through_ns
+        ):
+            self._checkpoints.popleft()
 
     def _identities(
         self, revision, monitored_services, edge_destinations,
@@ -760,7 +852,7 @@ class FinalLiveBurstSource:
         inventory_revision,
         normal_raw_window,
     ) -> RawBurstWindow:
-        self._read_log()
+        self._read_log_until(window_end_ns)
         monitored_services = {
             (sample.namespace, sample.service_name)
             for sample in normal_raw_window.samples
@@ -792,9 +884,8 @@ class FinalLiveBurstSource:
             self._events.popleft()
         selected = []
         for record in self._events:
-            if record["timestamp_ns"] >= window_end_ns:
-                break
-            selected.append(record)
+            if window_start_ns <= record["timestamp_ns"] < window_end_ns:
+                selected.append(record)
         timestamp_ns = window_end_ns - 1
         by_service = defaultdict(lambda: defaultdict(list))
         by_host = defaultdict(list)
@@ -1233,7 +1324,7 @@ class FinalLiveBurstSource:
                 "dns.rcode_failure_rate", len(values["rcode"]),
                 exposure, dns_mapping,
             )
-        return RawBurstWindow._create_from_validated_samples(
+        window = RawBurstWindow._create_from_validated_samples(
             sequence=sequence,
             window_start_ns=window_start_ns,
             window_end_ns=window_end_ns,
@@ -1243,3 +1334,5 @@ class FinalLiveBurstSource:
             burst_config_fingerprint=self.burst_config_fingerprint,
             event_loss_rate=event_loss,
         )
+        self._prune_log_state(window_end_ns)
+        return window
