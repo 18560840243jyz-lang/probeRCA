@@ -3838,17 +3838,15 @@ def test_formal_faults_act_on_real_paths_not_isolated_synthetic_signals(
     assert actors[0][1]["service"] == "recommendationservice"
     specs["service_lock"]["activate"](Context(), 60)
     assert Context.metadata["intervention_profile"] \
-        == "service-cgroup-futex-v6"
+        == "service-cgroup-futex-stall-v1"
     assert runner.SERVICE_LOCK_THREADS == 10
-    assert runner.SERVICE_LOCK_HOLD_MS == 350.0
-    assert runner.SERVICE_LOCK_WAITER_PAUSE_MS == 5.0
     assert actors[1][0] == ("futex",)
     assert actors[1][1]["service"] == "cartservice"
     assert actors[1][1]["arguments"] == [
         "--threads", str(runner.SERVICE_LOCK_THREADS),
-        "--hold-ms", str(runner.SERVICE_LOCK_HOLD_MS),
-        "--waiter-pause-ms", str(runner.SERVICE_LOCK_WAITER_PAUSE_MS),
+        "--continuous-hold",
     ]
+    assert actors[1][1]["ready_event"] == "futex_waiters_blocked"
 
     # IO actors are explicitly direct/synchronous in the formal spec.  This
     # checks the closure without duplicating implementation logic in a test.
@@ -3982,6 +3980,26 @@ def test_memory_actor_reports_readiness_after_real_chunk_threshold(
             time.monotonic(),
             ready_after_bytes=8192,
         )
+
+
+def test_continuous_futex_actor_blocks_waiters_without_spin():
+    import scripts.final_fault_actor as actor
+
+    actor.STOP.clear()
+    actor.COUNTERS.clear()
+    ready = []
+    actor.futex_actor(
+        3,
+        1.0,
+        time.monotonic() + 0.05,
+        continuous_hold=True,
+        ready_callback=lambda: ready.append(True),
+    )
+
+    assert ready == [True]
+    assert actor.COUNTERS["lock_holds"] == 1
+    assert actor.COUNTERS["lock_waiters"] == 3
+    assert actor.COUNTERS["lock_acquires"] == 3
 
 
 def test_fault_signal_qualification_accepts_root_and_rejects_competitor(

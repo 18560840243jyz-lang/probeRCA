@@ -165,11 +165,44 @@ def futex_actor(
     deadline: float,
     *,
     waiter_pause_ms: float = 0.0,
+    continuous_hold: bool = False,
+    ready_callback=None,
 ) -> None:
     if thread_count <= 0 or hold_ms <= 0 or waiter_pause_ms < 0:
         raise ValueError("invalid futex actor parameters")
     threading.stack_size(256 * 1024)
     mutex = threading.Lock()
+
+    if continuous_hold:
+        waiter_started = [threading.Event() for _ in range(thread_count)]
+        mutex.acquire()
+
+        def blocked_waiter(index: int) -> None:
+            waiter_started[index].set()
+            mutex.acquire()
+            increment("lock_acquires")
+            mutex.release()
+
+        threads = [
+            threading.Thread(target=blocked_waiter, args=(index,), daemon=True)
+            for index in range(thread_count)
+        ]
+        for thread in threads:
+            thread.start()
+        for event in waiter_started:
+            if not event.wait(timeout=1.0):
+                mutex.release()
+                raise RuntimeError("futex waiter did not start")
+        time.sleep(0.05)
+        increment("lock_holds")
+        increment("lock_waiters", thread_count)
+        if ready_callback is not None:
+            ready_callback()
+        wait_until(deadline)
+        mutex.release()
+        for thread in threads:
+            thread.join(timeout=1)
+        return
 
     def holder() -> None:
         while not STOP.is_set() and time.monotonic() < deadline:
@@ -293,6 +326,7 @@ def main() -> int:
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--hold-ms", type=float, default=50.0)
     parser.add_argument("--waiter-pause-ms", type=float, default=0.0)
+    parser.add_argument("--continuous-hold", action="store_true")
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
     parser.add_argument("--interval", type=float, default=0.02)
@@ -346,6 +380,11 @@ def main() -> int:
                 arguments.hold_ms,
                 deadline,
                 waiter_pause_ms=arguments.waiter_pause_ms,
+                continuous_hold=arguments.continuous_hold,
+                ready_callback=lambda: print(json.dumps({
+                    "event": "futex_waiters_blocked",
+                    "timestamp_ns": time.time_ns(),
+                }, sort_keys=True), flush=True),
             )
         elif arguments.mode == "localnet":
             localnet_actor(arguments.threads, deadline)
