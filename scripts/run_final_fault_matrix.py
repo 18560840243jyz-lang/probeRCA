@@ -60,9 +60,9 @@ STATE_SERVICES = (
 WINDOW_WALL_BUDGET_SEC = 10
 DATA_PLANE_READY_TIMEOUT_SEC = 90
 FAULT_ACTOR_FAILSAFE_GRACE_SEC = 30
-HOST_MEMORY_PILOT_BYTES = 8 * 1024 * 1024 * 1024
-HOST_MEMORY_HIGH_BYTES = 4 * 1024 * 1024 * 1024
-HOST_MEMORY_MAX_BYTES = 10 * 1024 * 1024 * 1024
+HOST_MEMORY_PILOT_BYTES = 4 * 1024 * 1024 * 1024
+HOST_MEMORY_HIGH_BYTES = 2 * 1024 * 1024 * 1024
+HOST_MEMORY_MAX_BYTES = 6 * 1024 * 1024 * 1024
 HOST_MEMORY_CGROUP_NAME = "proberca-final-host-memory"
 HOST_NIC_DELAY_MS = 20
 HOST_NIC_LOSS_PERCENT = 3.0
@@ -77,8 +77,8 @@ SERVICE_MEMORY_HIGH_HEADROOM_BYTES = 32 * 1024 * 1024
 SERVICE_MEMORY_HIGH_BYTES = 224 * 1024 * 1024
 SERVICE_IO_FILE_BYTES = 256 * 1024 * 1024
 SERVICE_IO_WRITE_BYTES_PER_SEC = 8 * 1024 * 1024
-SERVICE_LOCK_THREADS = 32
-SERVICE_LOCK_HOLD_MS = 100.0
+SERVICE_LOCK_THREADS = 8
+SERVICE_LOCK_HOLD_MS = 250.0
 SERVICE_LOCALNET_THREADS = 32
 
 
@@ -639,7 +639,7 @@ def wait_data_plane(root: Path, *, restart_on_failure: bool = True) -> None:
 def formal_pod_binding_fingerprint(
     snapshot, config: FinalControlConfig,
 ) -> str:
-    """Hash the stable service-to-Pod binding used to bound runtime rebinds."""
+    """Hash the service-to-Pod binding retained as experiment provenance."""
     formal_services = set(config.formal_service_entity_ids)
     bindings: list[tuple[str, str, str]] = []
     covered: set[str] = set()
@@ -652,7 +652,7 @@ def formal_pod_binding_fingerprint(
             continue
         if not placement.pod_uid:
             raise ExperimentError(
-                "formal runtime rebind requires complete Pod UIDs"
+                "formal runtime provenance requires complete Pod UIDs"
             )
         bindings.append((
             service_id, placement.node_name, placement.pod_uid,
@@ -660,7 +660,7 @@ def formal_pod_binding_fingerprint(
         covered.add(service_id)
     if covered != formal_services:
         raise ExperimentError(
-            "formal runtime rebind lacks service-to-Pod bindings"
+            "formal runtime provenance lacks service-to-Pod bindings"
         )
     payload = json.dumps(
         sorted(bindings), sort_keys=True, separators=(",", ":"),
@@ -802,10 +802,10 @@ def assert_current_readiness_handshake(
             live["runtime_identity_fingerprint"]
             != readiness["runtime_identity_fingerprint"]
         )
-        if runtime_rebound and live_pod_binding != calibration_pod_binding:
+        if runtime_rebound:
             raise ExperimentError(
-                "fault injection refused: runtime identity changed outside "
-                "the stable same-Pod rebind scope"
+                "fault injection refused: runtime identity differs from "
+                "the frozen Healthy calibration"
             )
         return {
             **expected,
@@ -1234,6 +1234,8 @@ class FaultContext:
         duration: float,
         arguments: list[str] | None = None,
         name: str | None = None,
+        ready_event: str | None = None,
+        ready_timeout_sec: float = 30.0,
     ) -> subprocess.Popen:
         command = [
             sys.executable, "-u", str(ACTOR),
@@ -1264,7 +1266,8 @@ class FaultContext:
             actor_metadata["cgroup"] = str(resolved_cgroup)
         command.extend(arguments or [])
         actor_name = name or mode
-        log = (self.experiment_root / f"{actor_name}.log").open(
+        log_path = self.experiment_root / f"{actor_name}.log"
+        log = log_path.open(
             "w", encoding="utf-8"
         )
         process = subprocess.Popen(
@@ -1276,6 +1279,28 @@ class FaultContext:
         if process.poll() is not None:
             log.flush()
             raise ExperimentError(f"{actor_name} actor exited early")
+        if ready_event is not None:
+            deadline = time.monotonic() + ready_timeout_sec
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    log.flush()
+                    raise ExperimentError(
+                        f"{actor_name} actor exited before readiness"
+                    )
+                log.flush()
+                if ready_event in log_path.read_text(
+                    encoding="utf-8", errors="replace",
+                ):
+                    break
+                time.sleep(0.1)
+            else:
+                raise ExperimentError(
+                    f"{actor_name} actor readiness timed out: {ready_event}"
+                )
+            self.metadata.setdefault("actor_readiness", []).append({
+                "event": ready_event,
+                "mode": actor_name,
+            })
         self.metadata.setdefault("actors", []).append(actor_metadata)
         return process
 
@@ -1429,7 +1454,7 @@ def service_lock(context: FaultContext, windows: int) -> None:
         "target_service": target_service,
         "threads": SERVICE_LOCK_THREADS,
         "hold_ms": SERVICE_LOCK_HOLD_MS,
-        "intervention_profile": "service-cgroup-futex-v1",
+        "intervention_profile": "service-cgroup-futex-v2",
     })
     context.start_actor(
         "futex",
@@ -1458,7 +1483,7 @@ def host_memory(context: FaultContext, windows: int) -> None:
         "bytes_touched": HOST_MEMORY_PILOT_BYTES,
         "memory_high_bytes": HOST_MEMORY_HIGH_BYTES,
         "memory_max_bytes": HOST_MEMORY_MAX_BYTES,
-        "intervention_profile": "host-memory-reclaim-v1",
+        "intervention_profile": "host-memory-reclaim-v2",
     })
     context.start_actor(
         "memory",
@@ -1471,6 +1496,8 @@ def host_memory(context: FaultContext, windows: int) -> None:
             "--bulk-fill",
         ],
         name="host-memory",
+        ready_event="memory_working_set_ready",
+        ready_timeout_sec=45.0,
     )
 
 
@@ -1702,6 +1729,20 @@ def experiment_specs() -> list[dict[str, Any]]:
                     "futex_wait_time_rate"
                 ),
                 "minimum_median_z": 5.0,
+                "competitors": [
+                    {
+                        "metric_name": "cpu_throttle_ratio",
+                        "scope": "service",
+                        "service_name": "cartservice",
+                        "maximum_abnormal_median": 0.02,
+                    },
+                    {
+                        "metric_name": "cpu_usage_rate",
+                        "scope": "service",
+                        "service_name": "cartservice",
+                        "maximum_median_lift": 0.10,
+                    },
+                ],
             },
         },
         {

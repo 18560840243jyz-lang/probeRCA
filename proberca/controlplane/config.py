@@ -341,7 +341,9 @@ class FinalControlConfig:
     resource_alert_metric_names: tuple[str, ...] = (
         "cpu_psi",
         "cpu_usage_rate",
+        "futex_wait_time_rate",
         "io_psi",
+        "local_socket_failure_rate",
         "memory_psi",
         "memory_working_set_ratio",
         "nic_drop_error_rate",

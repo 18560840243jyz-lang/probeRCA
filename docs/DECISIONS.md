@@ -237,13 +237,17 @@ The final normal metric contract is `9/4/3`: nine metrics per service, four
 metrics per host, and three metrics per directed TCP edge
 (`count`, `latency_p95`, and `failure_rate`). TCP edge alert state is
 independent from its endpoint services. Formal service and host roots also have
-a label-blind, Healthy-calibrated stable-resource change channel. It uses a
-strictly-prior 30-window rolling median, freezes per-metric-name change
+a label-blind, Healthy-calibrated configured-root change channel. It uses a
+strictly-prior 30-window rolling median, freezes per-coordinate change
 thresholds from CALIBRATING data, and applies a two-window transient prefilter
 before the common entity state machine. Metric names and all thresholds come
 from frozen configuration; entity or fault-name exceptions are forbidden.
-Sparse event metrics are not converted into zeros or promoted into this stable
-channel. Soft remains score `>=3` for three
+Thresholds are keyed by the complete `(entity, metric)` coordinate; a noisy
+service cannot raise the threshold for another service carrying the same
+metric name.
+Formal Lock and LocalNet ratios participate only after their existing validity
+and exposure gates pass. Sparse or missing event windows are not converted
+into zeros or promoted into this channel. Soft remains score `>=3` for three
 consecutive one-second windows. Score `>=5` for two consecutive one-second
 windows is a **Hard Candidate** diagnostic only. A **Confirmed Hard** requires
 score `>=5` for three consecutive one-second windows; only Confirmed Hard enters
@@ -354,14 +358,13 @@ owner UID, Pod UID, full container ID, image ID, and node placement. Kubernetes
 `resourceVersion`, object `generation`, observation time, and serialization order
 are excluded because status-only controller updates can change them without
 changing the running workload. Runtime changes during Calibration, Healthy
-Validation, or a Normal/abnormal phase still fail closed. After READY and only
-between completed trials, a container replacement inside the same Pod may be
-rebound without refitting the service-level model when the formal topology,
-configuration, load profile, and exact `(service, node, Pod UID)` mapping match
-the calibration archive and a fresh sealed preflight window passes `9/4/3`.
-Both runtime fingerprints are retained. A Pod UID, owner, image, node, service
-association, topology, or frozen configuration change remains model-semantic and
-requires a fresh Healthy Pilot. A rebind never repairs a mid-window change.
+Validation, a Normal/abnormal phase, or the interval between READY and a fault
+trial fail closed. A container replacement changes cgroup-local counter epochs
+and may change the healthy distribution even when the Pod UID is unchanged;
+therefore a same-Pod runtime rebind cannot reuse frozen Baseline, `A_s`, or
+`A_v`. The live runtime fingerprint must exactly match the Healthy calibration
+fingerprint. Any runtime, Pod UID, owner, image, node, service association,
+topology, or frozen configuration change requires a fresh Healthy Pilot.
 
 ## Local-socket exposure and frozen-model decision
 
@@ -379,9 +382,8 @@ After the independent Healthy Validation reaches READY, the formal Baseline,
 `A_s`, and `A_v` snapshot is immutable. Additional healthy raw windows may be
 archived for diagnostics, but cannot update the model used by formal fault
 experiments. A workload, scope, contract, topology, runtime-identity, or model
-configuration fingerprint change requires a new Healthy Pilot. The only
-exception is the bounded same-Pod, between-trial runtime rebind defined above;
-it changes attribution provenance but not the frozen service/host/TCP model.
+configuration fingerprint change requires a new Healthy Pilot. There is no
+same-Pod runtime-rebind exception for a frozen formal model.
 
 ## Stable service-memory intervention decision
 

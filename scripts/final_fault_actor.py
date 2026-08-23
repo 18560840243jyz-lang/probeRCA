@@ -51,6 +51,7 @@ def memory_actor(
     *,
     churn: bool = False,
     bulk_fill: bool = False,
+    ready_callback=None,
 ) -> None:
     region = mmap.mmap(-1, byte_count)
     pass_index = 0
@@ -69,6 +70,8 @@ def memory_actor(
                     break
         pass_index += 1
         increment("memory_scan_passes")
+        if pass_index == 1 and ready_callback is not None:
+            ready_callback()
         if not churn:
             break
     increment("bytes_touched", byte_count)
@@ -262,6 +265,10 @@ def main() -> int:
                 deadline,
                 churn=arguments.churn,
                 bulk_fill=arguments.bulk_fill,
+                ready_callback=lambda: print(json.dumps({
+                    "event": "memory_working_set_ready",
+                    "timestamp_ns": time.time_ns(),
+                }, sort_keys=True), flush=True),
             )
         elif arguments.mode == "io":
             if arguments.file is None:

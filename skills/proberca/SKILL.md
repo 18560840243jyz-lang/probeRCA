@@ -2360,20 +2360,24 @@ TCP边独立告警
 - During Calibration, Healthy Validation, or any Normal/abnormal collection
   phase, every real Pod UID, full container ID, node, image, or formal service
   association change still invalidates that segment and fails closed.
-- After READY and only between completed fault trials, a container-runtime
-  replacement inside the same Pod may be rebound without refitting service-level
-  Baseline, `A_s`, or `A_v`. The formal topology, load/config/contract
-  fingerprints, and exact `(service, node, Pod UID)` binding must still match the
-  calibration archive, and a fresh sealed preflight window must prove complete
-  current `9/4/3` attribution. The calibration runtime fingerprint and current
-  runtime fingerprint are both retained in the experiment manifest.
-- A Pod UID, owner, image, node, service association, formal topology, or frozen
-  configuration change is outside that bounded rebind and still requires a new
-  Healthy Pilot. Rebinding can never make a mid-window or cross-phase identity
+- After READY, the live runtime identity fingerprint must still exactly match
+  the independent Healthy calibration. A same-Pod container replacement changes
+  cgroup counter epochs and can change resource-metric distributions; it cannot
+  reuse the frozen Baseline, `A_s`, or `A_v`.
+- Any container runtime, Pod UID, owner, image, node, service association,
+  formal topology, or frozen configuration change requires a new Healthy Pilot.
+  Runtime rebinding can never make a frozen model or a cross-phase identity
   change valid.
 
 ## Local-socket validity and formal model freeze
 
+- The frozen, label-blind configured-root alert channel includes the formal
+  `futex_wait_time_rate` and `local_socket_failure_rate` ratios. They may enter
+  it only after their normal validity, quality, and exposure gates pass;
+  missing or sparse event windows are never converted into zero alert evidence.
+- Healthy change thresholds in this channel are frozen per complete
+  `(entity_id, metric_name)` coordinate. Metric names select channel membership
+  but are never pooled across services or hosts for threshold calibration.
 - `local_socket_failure_rate` counts only meaningful completed socket
   operations. Normal non-blocking `accept` results such as
   `EAGAIN`/`EWOULDBLOCK` and restartable/interrupted accepts are excluded from
@@ -2386,9 +2390,8 @@ TCP边独立告警
   service-specific exception.
 - Once independent Healthy Validation reaches READY, freeze Baseline, `A_s`,
   and `A_v`. Later healthy raw windows remain available for diagnostics but do
-  not mutate the formal model. Any model-semantic fingerprint or frozen
-  load-profile change requires a new Healthy Pilot; only the bounded same-Pod
-  runtime rebind above is non-semantic and does not refit the model.
+  not mutate the formal model. Any runtime, model-semantic fingerprint, or
+  frozen load-profile change requires a new Healthy Pilot.
 - Qualify service-memory pressure separately before formal collection. The
   single-VM qualified profile touches 192 MiB and sets `memory.high` to 224 MiB.
   Its 30-second qualification produced non-zero `memory.events high` while
@@ -2411,6 +2414,4 @@ TCP边独立告警
   entities. Restart the primitive exporter last and require complete formal
   service plus 15-edge coverage. Do not start experimental DNS workloads. Any
   later application runtime-identity change invalidates the active collection;
-  never use reattachment to hide a mid-experiment identity change. A bounded
-  same-Pod rebind may be performed only after that failed trial has stopped and
-  before a fresh trial begins, under the handshake rules above.
+  never use reattachment or a same-Pod rebind to reuse the frozen model.

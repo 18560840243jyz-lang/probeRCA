@@ -1845,13 +1845,13 @@ def test_fault_runner_requires_current_readiness_fingerprint_handshake(
         service_runtime_identity_fingerprints=changed_runtime,
     )
     current_snapshot[0] = restarted
-    rebound = runner.assert_current_readiness_handshake(
-        readiness, tmp_path, calibration_pod_binding=pod_binding,
-    )
-    assert rebound["runtime_identity_rebound"] is True
-    assert rebound["runtime_identity_fingerprint"] \
-        != readiness["runtime_identity_fingerprint"]
-    assert rebound["live_pod_binding_fingerprint"] == pod_binding
+    with pytest.raises(
+        runner.ExperimentError,
+        match="runtime identity differs from the frozen Healthy calibration",
+    ):
+        runner.assert_current_readiness_handshake(
+            readiness, tmp_path, calibration_pod_binding=pod_binding,
+        )
 
     changed_placements = [
         replace(item, pod_uid="replacement-pod")
@@ -1867,7 +1867,7 @@ def test_fault_runner_requires_current_readiness_fingerprint_handshake(
     )
     with pytest.raises(
         runner.ExperimentError,
-        match="outside the stable same-Pod rebind scope",
+        match="runtime identity differs from the frozen Healthy calibration",
     ):
         runner.assert_current_readiness_handshake(
             readiness, tmp_path,
@@ -2183,10 +2183,145 @@ def test_resource_alert_threshold_is_healthy_learned_and_entity_generic():
         )
     channel.freeze()
 
-    assert channel.thresholds["cpu_usage_rate"] == pytest.approx(
+    coordinate = f"{service}::cpu_usage_rate"
+    assert channel.thresholds[coordinate] == pytest.approx(
         7.0 + config.resource_alert_calibration_margin
     )
     assert channel.threshold_fingerprint is not None
+
+
+def test_resource_alert_thresholds_are_isolated_by_metric_coordinate():
+    config = replace(
+        FinalControlConfig(),
+        resource_alert_history_windows=5,
+        resource_alert_metric_names=("futex_wait_time_rate",),
+    )
+    channel = ResourceAlertChannel(config)
+    quiet = "cluster::ns::quiet-service"
+    noisy = "cluster::ns::noisy-service"
+    for sequence in range(1, 11):
+        observations = {}
+        for service, anomaly in (
+            (quiet, 0.0),
+                (noisy, 100.0 if sequence >= 6 else 0.0),
+        ):
+            observation = _resource_observation(
+                entity_id=service,
+                entity_type="service",
+                metric_name="futex_wait_time_rate",
+                anomaly=anomaly,
+            )
+            observations[observation.metric.node_id] = observation
+        channel.observe(
+            sequence=sequence,
+            observations=observations,
+            learn=True,
+        )
+    channel.freeze()
+
+    assert channel.thresholds[f"{quiet}::futex_wait_time_rate"] == 5.0
+    assert channel.thresholds[
+        f"{noisy}::futex_wait_time_rate"
+    ] == pytest.approx(100.0 + config.resource_alert_calibration_margin)
+
+
+def test_formal_lock_and_localnet_roots_use_the_generic_resource_channel():
+    config = FinalControlConfig()
+
+    assert "futex_wait_time_rate" in config.resource_alert_metric_names
+    assert "local_socket_failure_rate" in config.resource_alert_metric_names
+
+    channel = ResourceAlertChannel(replace(
+        config,
+        resource_alert_history_windows=3,
+        resource_alert_metric_names=(
+            "futex_wait_time_rate",
+            "local_socket_failure_rate",
+        ),
+    ))
+    service = "cluster::ns::service-a"
+
+    for sequence in range(1, 7):
+        observations = {}
+        for metric_name in channel.config.resource_alert_metric_names:
+            observation = _resource_observation(
+                entity_id=service,
+                entity_type="service",
+                metric_name=metric_name,
+                anomaly=0.0,
+            )
+            observations[observation.metric.node_id] = observation
+        channel.observe(
+            sequence=sequence,
+            observations=observations,
+            learn=True,
+        )
+    channel.freeze()
+
+    for metric_name in channel.config.resource_alert_metric_names:
+        channel.begin_observation_session()
+        for sequence in range(1, 4):
+            observation = _resource_observation(
+                entity_id=service,
+                entity_type="service",
+                metric_name=metric_name,
+                anomaly=0.0,
+            )
+            assert channel.observe(
+                sequence=sequence,
+                observations={observation.metric.node_id: observation},
+                learn=False,
+            ).service_scores == {}
+
+        emitted = []
+        for sequence in range(4, 6):
+            observation = _resource_observation(
+                entity_id=service,
+                entity_type="service",
+                metric_name=metric_name,
+                anomaly=8.0,
+            )
+            emitted.append(channel.observe(
+                sequence=sequence,
+                observations={observation.metric.node_id: observation},
+                learn=False,
+            ).service_scores.get(service, 0.0))
+        assert emitted == [0.0, 8.0]
+
+
+def test_invalid_formal_root_observation_never_enters_resource_alert_channel():
+    config = replace(
+        FinalControlConfig(),
+        resource_alert_history_windows=1,
+        resource_alert_prefilter_windows=1,
+        resource_alert_metric_names=("local_socket_failure_rate",),
+    )
+    channel = ResourceAlertChannel(config)
+    observation = replace(
+        _resource_observation(
+            entity_id="cluster::ns::service-a",
+            entity_type="service",
+            metric_name="local_socket_failure_rate",
+            anomaly=100.0,
+        ),
+        alert_eligible=False,
+    )
+    channel.observe(
+        sequence=1,
+        observations={observation.metric.node_id: observation},
+        learn=True,
+    )
+    channel.freeze()
+    channel.begin_observation_session()
+
+    result = channel.observe(
+        sequence=1,
+        observations={observation.metric.node_id: observation},
+        learn=False,
+    )
+
+    assert result.service_scores == {}
+    assert result.metric_scores == {}
 
 
 def test_resource_alert_prefilter_rejects_transient_but_detects_sustained_change():
@@ -2196,7 +2331,6 @@ def test_resource_alert_prefilter_rejects_transient_but_detects_sustained_change
         resource_alert_metric_names=("cpu_usage_rate",),
     )
     channel = ResourceAlertChannel(config)
-    channel.freeze()
     service = "cluster::ns::service-a"
 
     def score(sequence: int, anomaly: float) -> float:
@@ -2213,6 +2347,20 @@ def test_resource_alert_prefilter_rejects_transient_but_detects_sustained_change
         )
         return result.service_scores.get(service, 0.0)
 
+    for sequence in range(1, 8):
+        observation = _resource_observation(
+            entity_id=service,
+            entity_type="service",
+            metric_name="cpu_usage_rate",
+            anomaly=0.0,
+        )
+        channel.observe(
+            sequence=sequence,
+            observations={observation.metric.node_id: observation},
+            learn=True,
+        )
+    channel.freeze()
+    channel.begin_observation_session()
     for sequence in range(1, 8):
         assert score(sequence, 0.0) == 0.0
     emitted = [score(sequence, 10.0) for sequence in range(8, 11)]
@@ -2242,8 +2390,21 @@ def test_resource_alert_supports_hosts_without_changing_edge_alerts():
         resource_alert_metric_names=("cpu_psi",),
     )
     channel = ResourceAlertChannel(config)
-    channel.freeze()
     host = "cluster::host::node-a"
+    for sequence in range(1, 4):
+        observation = _resource_observation(
+            entity_id=host,
+            entity_type="host",
+            metric_name="cpu_psi",
+            anomaly=0.0,
+        )
+        assert channel.observe(
+            sequence=sequence,
+            observations={observation.metric.node_id: observation},
+            learn=True,
+        ).host_scores == {}
+    channel.freeze()
+    channel.begin_observation_session()
     for sequence in range(1, 4):
         observation = _resource_observation(
             entity_id=host,
@@ -3129,7 +3290,7 @@ def test_formal_fault_matrix_keeps_tcp_and_excludes_dns():
     assert any(item["fault_type"] == "tcp_edge" for item in specs)
     assert all(item["fault_type"] != "dns_edge" for item in specs)
     assert all(item["root_category"] != "DNS" for item in specs)
-    assert HOST_MEMORY_PILOT_BYTES == 8 * 1024 * 1024 * 1024
+    assert HOST_MEMORY_PILOT_BYTES == 4 * 1024 * 1024 * 1024
     assert HOST_MEMORY_HIGH_BYTES < HOST_MEMORY_PILOT_BYTES
     assert HOST_MEMORY_PILOT_BYTES < HOST_MEMORY_MAX_BYTES
 
@@ -3676,7 +3837,7 @@ def test_formal_faults_act_on_real_paths_not_isolated_synthetic_signals(
     assert actors[0][1]["service"] == "recommendationservice"
     specs["service_lock"]["activate"](Context(), 60)
     assert Context.metadata["intervention_profile"] \
-        == "service-cgroup-futex-v1"
+        == "service-cgroup-futex-v2"
     assert actors[1][0] == ("futex",)
     assert actors[1][1]["service"] == "cartservice"
     assert actors[1][1]["arguments"] == [
@@ -3759,6 +3920,9 @@ def test_host_memory_fault_uses_bounded_reclaim_cgroup_and_churn():
     )
     assert "--churn" in actors[0][1]["arguments"]
     assert "--bulk-fill" in actors[0][1]["arguments"]
+    assert actors[0][1]["ready_event"] == "memory_working_set_ready"
+    assert Context.metadata["intervention_profile"] \
+        == "host-memory-reclaim-v2"
 
 
 def test_fault_signal_qualification_accepts_root_and_rejects_competitor(
