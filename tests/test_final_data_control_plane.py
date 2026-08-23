@@ -38,6 +38,7 @@ from proberca.controlplane.observations import (
     quantile_required_samples,
 )
 from proberca.controlplane.pipeline import ControlPlaneError
+from proberca.controlplane.resource_alerts import ResourceAlertChannel
 from proberca.controlplane.service_model import (
     AllowedServiceGraph,
     ServiceRLS,
@@ -2133,6 +2134,148 @@ def test_formal_alert_defaults_and_per_entity_consecutive_state():
     )
     assert ("edge", "edge-a") in hard
     assert ("edge", "edge-a") in soft
+
+
+def _resource_observation(
+    *, entity_id: str, entity_type: str, metric_name: str, anomaly: float,
+) -> NormalizedObservation:
+    metric = MetricNode(
+        node_id=f"{entity_id}::{metric_name}",
+        entity_id=entity_id,
+        entity_type=entity_type,
+        metric_name=metric_name,
+        role=metric_name,
+        root_category="CPU" if "cpu" in metric_name else "Memory",
+        root_eligible=True,
+    )
+    return NormalizedObservation(
+        metric=metric,
+        signed_z=anomaly,
+        anomaly=anomaly,
+        quality=1.0,
+        source_record_id="resource-test",
+        baseline_center=0.0,
+        baseline_scale=1.0,
+        scale_source="mad",
+        alert_eligible=True,
+    )
+
+
+def test_resource_alert_threshold_is_healthy_learned_and_entity_generic():
+    config = replace(
+        FinalControlConfig(),
+        resource_alert_history_windows=5,
+        resource_alert_metric_names=("cpu_usage_rate",),
+    )
+    channel = ResourceAlertChannel(config)
+    service = "cluster::ns::service-a"
+    for sequence, anomaly in enumerate((0, 0, 0, 0, 0, 7, 7, 7), 1):
+        observation = _resource_observation(
+            entity_id=service,
+            entity_type="service",
+            metric_name="cpu_usage_rate",
+            anomaly=float(anomaly),
+        )
+        channel.observe(
+            sequence=sequence,
+            observations={observation.metric.node_id: observation},
+            learn=True,
+        )
+    channel.freeze()
+
+    assert channel.thresholds["cpu_usage_rate"] == pytest.approx(
+        7.0 + config.resource_alert_calibration_margin
+    )
+    assert channel.threshold_fingerprint is not None
+
+
+def test_resource_alert_prefilter_rejects_transient_but_detects_sustained_change():
+    config = replace(
+        FinalControlConfig(),
+        resource_alert_history_windows=7,
+        resource_alert_metric_names=("cpu_usage_rate",),
+    )
+    channel = ResourceAlertChannel(config)
+    channel.freeze()
+    service = "cluster::ns::service-a"
+
+    def score(sequence: int, anomaly: float) -> float:
+        observation = _resource_observation(
+            entity_id=service,
+            entity_type="service",
+            metric_name="cpu_usage_rate",
+            anomaly=anomaly,
+        )
+        result = channel.observe(
+            sequence=sequence,
+            observations={observation.metric.node_id: observation},
+            learn=False,
+        )
+        return result.service_scores.get(service, 0.0)
+
+    for sequence in range(1, 8):
+        assert score(sequence, 0.0) == 0.0
+    emitted = [score(sequence, 10.0) for sequence in range(8, 11)]
+    assert emitted[0] == 0.0
+    assert emitted[1:] == [10.0, 10.0]
+
+    # A new sealed observation session has no label input and must warm its
+    # rolling history again.  Four sustained samples yield three common Hard
+    # scores; a three-sample transient yields only two and cannot confirm Hard.
+    channel.begin_observation_session()
+    control = FinalControlPlane(config)
+    for sequence in range(1, 8):
+        assert score(sequence, 0.0) == 0.0
+    hard = set()
+    for sequence in range(8, 12):
+        value = score(sequence, 10.0)
+        _soft, _candidate, hard = control._advance_alert_counters(
+            {service: value} if value else {}, {}, {},
+        )
+    assert ("service", service) in hard
+
+
+def test_resource_alert_supports_hosts_without_changing_edge_alerts():
+    config = replace(
+        FinalControlConfig(),
+        resource_alert_history_windows=3,
+        resource_alert_metric_names=("cpu_psi",),
+    )
+    channel = ResourceAlertChannel(config)
+    channel.freeze()
+    host = "cluster::host::node-a"
+    for sequence in range(1, 4):
+        observation = _resource_observation(
+            entity_id=host,
+            entity_type="host",
+            metric_name="cpu_psi",
+            anomaly=0.0,
+        )
+        assert channel.observe(
+            sequence=sequence,
+            observations={observation.metric.node_id: observation},
+            learn=False,
+        ).host_scores == {}
+    for sequence in range(4, 6):
+        observation = _resource_observation(
+            entity_id=host,
+            entity_type="host",
+            metric_name="cpu_psi",
+            anomaly=8.0,
+        )
+        result = channel.observe(
+            sequence=sequence,
+            observations={observation.metric.node_id: observation},
+            learn=False,
+        )
+    assert result.host_scores[host] == pytest.approx(8.0)
+
+    control = FinalControlPlane(config)
+    _soft, candidate, _hard = control._advance_alert_counters(
+        {}, {"edge-a": 6.0}, {host: 6.0},
+    )
+    assert ("edge", "edge-a") not in candidate
+    assert ("host", host) not in candidate
 
 
 def test_metric_unit_kind_and_p95_aggregation_semantics_fail_closed(tmp_path):

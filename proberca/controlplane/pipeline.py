@@ -21,6 +21,7 @@ from .model import (
     RootCandidateScore,
 )
 from .observations import MetricResolver, RobustBaselineStore
+from .resource_alerts import ResourceAlertChannel
 from .service_model import (
     AllowedServiceGraph,
     ServiceRLS,
@@ -73,6 +74,7 @@ class FinalControlPlane:
         self.baseline = RobustBaselineStore(config)
         self.resolver = MetricResolver(config)
         self.service_rls = ServiceRLS(config)
+        self.resource_alerts = ResourceAlertChannel(config)
         self.state = "starting"
         self._soft_counts: dict[tuple[str, str], int] = {}
         self._hard_counts: dict[tuple[str, str], int] = {}
@@ -120,6 +122,9 @@ class FinalControlPlane:
         self._has_run = False
         self._dataset_id = ""
         self._dataset_fingerprint = ""
+        self._latest_resource_service_scores: dict[str, float] = {}
+        self._latest_resource_host_scores: dict[str, float] = {}
+        self._latest_resource_metric_scores: dict[str, dict[str, Any]] = {}
 
     def _active_topology(self, window_start_ns: int, window_end_ns: int):
         matches = [
@@ -146,6 +151,23 @@ class FinalControlPlane:
             "topology_epoch": graph.topology_epoch,
         }
 
+    def _resource_alert_provenance(self) -> dict[str, Any]:
+        return {
+            "resource_service_scores": dict(sorted(
+                self._latest_resource_service_scores.items()
+            )),
+            "resource_host_scores": dict(sorted(
+                self._latest_resource_host_scores.items()
+            )),
+            "resource_metric_scores": dict(sorted(
+                self._latest_resource_metric_scores.items()
+            )),
+            "resource_alert_thresholds": self.resource_alerts.thresholds,
+            "resource_alert_threshold_fingerprint": (
+                self.resource_alerts.threshold_fingerprint
+            ),
+        }
+
     def _initialize_healthy_segment(self, graph: AllowedServiceGraph) -> None:
         if self._topology_epoch != 0:
             raise ControlPlaneError("topology epoch is already initialized")
@@ -170,6 +192,7 @@ class FinalControlPlane:
         self.baseline.reset()
         self._baseline_reset_count += 1
         self.service_rls.reset()
+        self.resource_alerts.reset()
         self._healthy_history.clear()
         self._metric_history_reset_count += 1
         self._signed_history.clear()
@@ -197,6 +220,9 @@ class FinalControlPlane:
         self._latest_calibration_model = None
         self._frozen_calibration_model = None
         self._calibration_report = {}
+        self._latest_resource_service_scores = {}
+        self._latest_resource_host_scores = {}
+        self._latest_resource_metric_scores = {}
         self.state = "calibrating"
         self._healthy_topology_fingerprint = graph.topology_fingerprint
         self._healthy_runtime_identity_fingerprint = (
@@ -438,6 +464,9 @@ class FinalControlPlane:
             "scale_config_fingerprint": scale_config_fingerprint,
             "As_fingerprint": service_model_fingerprint,
             "Av_fingerprint": metric_model_fingerprint,
+            "resource_alert_threshold_fingerprint": (
+                self.resource_alerts.threshold_fingerprint
+            ),
         })
         for statuses in (baseline_status, all_baseline_status):
             for status in statuses.values():
@@ -521,6 +550,10 @@ class FinalControlPlane:
             "scale_config_fingerprint": scale_config_fingerprint,
             "As_fingerprint": service_model_fingerprint,
             "Av_fingerprint": metric_model_fingerprint,
+            "resource_alert_thresholds": self.resource_alerts.thresholds,
+            "resource_alert_threshold_fingerprint": (
+                self.resource_alerts.threshold_fingerprint
+            ),
             "calibration_fingerprint": calibration_fingerprint,
             "baseline_ready_count": sum(
                 item["ready"] for item in baseline_status.values()
@@ -592,6 +625,13 @@ class FinalControlPlane:
             self._frozen_calibration_model = (
                 self._latest_calibration_model
             )
+            self.resource_alerts.freeze()
+            # Rebuild once so the frozen resource thresholds and their
+            # fingerprint become part of the readiness handshake.
+            report = self._build_calibration_report(
+                graph=graph, timestamp_ns=timestamp_ns, maximum=maximum,
+            )
+            report["ready"] = False
             self._calibration_validation_count = 0
             self._healthy_validation_failed = False
             self._healthy_validation_alerts = []
@@ -646,6 +686,7 @@ class FinalControlPlane:
             ),
             "baseline_frozen": enter_validation,
             "service_model_frozen": enter_validation,
+            **self._resource_alert_provenance(),
             **self._topology_provenance(graph),
             "calibration_report_fingerprint": (
                 report["report_fingerprint"]
@@ -654,11 +695,12 @@ class FinalControlPlane:
 
     def _advance_healthy_validation(
         self, *, graph: AllowedServiceGraph, timestamp_ns: int,
-        maximum: float, service_scores, edge_scores, observations,
+        maximum: float, service_scores, edge_scores, host_scores,
+        observations,
     ) -> None:
         previous = self.state
         soft, hard_candidates, confirmed_hard = self._advance_alert_counters(
-            service_scores, edge_scores,
+            service_scores, edge_scores, host_scores,
         )
         scores = {
             **{
@@ -668,6 +710,10 @@ class FinalControlPlane:
             **{
                 ("edge", key): value
                 for key, value in edge_scores.items()
+            },
+            **{
+                ("host", key): value
+                for key, value in host_scores.items()
             },
         }
         role_scores: dict[tuple[str, str], dict[str, float]] = {}
@@ -816,6 +862,7 @@ class FinalControlPlane:
             ),
             "baseline_frozen": True,
             "service_model_frozen": True,
+            **self._resource_alert_provenance(),
             **self._topology_provenance(graph),
             "calibration_report_fingerprint": (
                 report["report_fingerprint"]
@@ -973,7 +1020,7 @@ class FinalControlPlane:
             self.service_rls.update(sequence, service_scores, graph)
 
     def _advance_alert_counters(
-        self, service_scores, edge_scores,
+        self, service_scores, edge_scores, host_scores=None,
     ) -> tuple[
         set[tuple[str, str]],
         set[tuple[str, str]],
@@ -982,6 +1029,10 @@ class FinalControlPlane:
         scores = {
             **{("service", key): value for key, value in service_scores.items()},
             **{("edge", key): value for key, value in edge_scores.items()},
+            **{
+                ("host", key): value
+                for key, value in (host_scores or {}).items()
+            },
         }
         keys = set(scores) | set(self._soft_counts) | set(self._hard_counts)
         for key in keys:
@@ -1015,6 +1066,14 @@ class FinalControlPlane:
     ) -> None:
         seeds = {entity_id for kind, entity_id in alert_entities if kind == "service"}
         edge_seeds = {entity_id for kind, entity_id in alert_entities if kind == "edge"}
+        host_seeds = {
+            entity_id for kind, entity_id in alert_entities if kind == "host"
+        }
+
+        seeds.update(
+            service for service, host in graph.placements
+            if host in host_seeds
+        )
         candidate = build_candidate_graph(
             graph=graph,
             service_strengths=self.service_rls.relation_strengths(),
@@ -1066,9 +1125,15 @@ class FinalControlPlane:
 
     def _transition(
         self, *, sequence: int, timestamp_ns: int, service_scores, edge_scores,
-        graph: AllowedServiceGraph, observations,
+        host_scores, graph: AllowedServiceGraph, observations,
     ) -> None:
-        maximum = max((*service_scores.values(), *edge_scores.values()), default=0.0)
+        maximum = max(
+            (
+                *service_scores.values(), *edge_scores.values(),
+                *host_scores.values(),
+            ),
+            default=0.0,
+        )
         previous = self.state
         soft_entities: set[tuple[str, str]] = set()
         hard_candidate_entities: set[tuple[str, str]] = set()
@@ -1078,7 +1143,9 @@ class FinalControlPlane:
                 soft_entities,
                 hard_candidate_entities,
                 hard_entities,
-            ) = self._advance_alert_counters(service_scores, edge_scores)
+            ) = self._advance_alert_counters(
+                service_scores, edge_scores, host_scores,
+            )
         if self.state in {"healthy", "soft"} and hard_entities:
             if self._soft is None:
                 # Confirmed Hard has its own per-entity 5x3 detector. It may freeze the
@@ -1145,6 +1212,7 @@ class FinalControlPlane:
             "maximum_symptom_score": maximum,
             "service_scores": dict(sorted(service_scores.items())),
             "edge_scores": dict(sorted(edge_scores.items())),
+            "host_scores": dict(sorted(host_scores.items())),
             "scale_sources": {
                 node_id: item.scale_source
                 for node_id, item in sorted(observations.items())
@@ -1175,6 +1243,7 @@ class FinalControlPlane:
             "confirmed_hard_entities": [
                 list(item) for item in sorted(hard_entities)
             ],
+            **self._resource_alert_provenance(),
             **self._topology_provenance(graph),
             "baseline_frozen": not models_updated,
             "service_model_frozen": not models_updated,
@@ -1358,6 +1427,11 @@ class FinalControlPlane:
         if self._has_run:
             raise ControlPlaneError("FinalControlPlane instances are single-use")
         self._has_run = True
+        if self._frozen_calibration_model is not None:
+            # A cloned frozen model may analyze a later sealed archive after an
+            # unobserved wall-clock gap.  Short-term resource-change history
+            # must be rebuilt from that archive's own normal prefix.
+            self.resource_alerts.begin_observation_session()
         if not isinstance(archive, CollectionArchive):
             raise TypeError("control plane requires a loaded CollectionArchive")
         archive.validate()
@@ -1435,13 +1509,16 @@ class FinalControlPlane:
                 node_id: item.signed_z for node_id, item in observations.items()
             }
             self._signed_history[window.sequence] = signed
-            service_scores, edge_scores = self._scores(observations, graph)
-            baseline_ready = self._baseline_ready(observations)
-            maximum = max(
-                (*service_scores.values(), *edge_scores.values()), default=0.0,
+            symptom_service_scores, edge_scores = self._scores(
+                observations, graph,
             )
+            baseline_ready = self._baseline_ready(observations)
             calibration_model_is_frozen = (
                 self._frozen_calibration_model is not None
+            )
+            symptom_maximum = max(
+                (*symptom_service_scores.values(), *edge_scores.values()),
+                default=0.0,
             )
             safe_healthy = (
                 (
@@ -1451,13 +1528,40 @@ class FinalControlPlane:
                         and not calibration_model_is_frozen
                     )
                 )
-                and (not baseline_ready or maximum < self.config.soft_threshold)
+                and (
+                    not baseline_ready
+                    or symptom_maximum < self.config.soft_threshold
+                )
+            )
+            resource = self.resource_alerts.observe(
+                sequence=window.sequence,
+                observations=observations,
+                learn=(
+                    self.state in {"starting", "calibrating"}
+                    and safe_healthy
+                ),
+            )
+            self._latest_resource_service_scores = resource.service_scores
+            self._latest_resource_host_scores = resource.host_scores
+            self._latest_resource_metric_scores = resource.metric_scores
+            service_scores = dict(symptom_service_scores)
+            for entity_id, score in resource.service_scores.items():
+                service_scores[entity_id] = max(
+                    service_scores.get(entity_id, 0.0), score,
+                )
+            host_scores = resource.host_scores
+            maximum = max(
+                (
+                    *service_scores.values(), *edge_scores.values(),
+                    *host_scores.values(),
+                ),
+                default=0.0,
             )
             self._update_healthy_models(
                 sequence=window.sequence,
                 raw=raw,
                 observations=observations,
-                service_scores=service_scores,
+                service_scores=symptom_service_scores,
                 graph=graph,
                 safe_healthy=safe_healthy,
             )
@@ -1481,6 +1585,7 @@ class FinalControlPlane:
                     maximum=maximum,
                     service_scores=service_scores,
                     edge_scores=edge_scores,
+                    host_scores=host_scores,
                     observations=observations,
                 )
                 continue
@@ -1490,6 +1595,7 @@ class FinalControlPlane:
                     timestamp_ns=window.window_end_ns,
                     service_scores=service_scores,
                     edge_scores=edge_scores,
+                    host_scores=host_scores,
                     graph=graph,
                     observations=observations,
                 )
@@ -1501,8 +1607,10 @@ class FinalControlPlane:
                     "maximum_symptom_score": 0.0,
                     "service_scores": {},
                     "edge_scores": {},
+                    "host_scores": {},
                     "baseline_frozen": False,
                     "service_model_frozen": False,
+                    **self._resource_alert_provenance(),
                     "reason": (
                         "topology_changed_baseline_reset"
                         if topology_reset else "baseline_not_ready"

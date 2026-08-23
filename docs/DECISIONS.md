@@ -236,13 +236,20 @@ root-eligible, or required for Readiness.
 The final normal metric contract is `9/4/3`: nine metrics per service, four
 metrics per host, and three metrics per directed TCP edge
 (`count`, `latency_p95`, and `failure_rate`). TCP edge alert state is
-independent from its endpoint services. Soft remains score `>=3` for three
+independent from its endpoint services. Formal service and host roots also have
+a label-blind, Healthy-calibrated stable-resource change channel. It uses a
+strictly-prior 30-window rolling median, freezes per-metric-name change
+thresholds from CALIBRATING data, and applies a two-window transient prefilter
+before the common entity state machine. Metric names and all thresholds come
+from frozen configuration; entity or fault-name exceptions are forbidden.
+Sparse event metrics are not converted into zeros or promoted into this stable
+channel. Soft remains score `>=3` for three
 consecutive one-second windows. Score `>=5` for two consecutive one-second
 windows is a **Hard Candidate** diagnostic only. A **Confirmed Hard** requires
 score `>=5` for three consecutive one-second windows; only Confirmed Hard enters
 the Hard state, starts formal RCA, or fails Healthy Validation. A single formal
-TCP edge may independently produce either state; multi-entity corroboration is
-not required.
+service, host, or TCP edge may independently produce either state;
+multi-entity corroboration is not required.
 
 The directed TCP edge path remains:
 

@@ -56,12 +56,16 @@ STARTING -> CALIBRATING -> READY -> Healthy / Soft / Hard / Recovery
 且独立Healthy验证段没有Confirmed Hard。Soft和Hard Candidate仍保留为健康质量
 诊断，不单独阻断READY。
 
-服务与有向TCP边分别维护连续告警计数，不同实体不能拼成连续异常：
+正式服务、正式主机与有向TCP边分别维护连续告警计数，不同实体不能拼成连续异常。
+服务请求/TCP症状沿用原分数；服务和主机的连续资源占用/压力指标增加统一的健康校准
+变化通道：使用严格在前的30窗滚动中位数、按指标名从CALIBRATING健康段冻结变化
+阈值，并在公共状态机前过滤仅持续3窗的瞬时尖峰。配置和学习均不得按实体或故障
+标签特判，稀疏事件指标不得补零后进入该通道。
 
 - Soft：异常分数`>=3`，同一实体连续3个1秒窗口；
 - Hard Candidate：异常分数`>=5`，同一实体连续2个1秒窗口，只记录诊断；
 - Confirmed Hard：异常分数`>=5`，同一实体连续3个1秒窗口。只有Confirmed Hard
-  进入Hard、触发RCA或阻断Healthy Validation。单条正式TCP边可独立确认，
+  进入Hard、触发RCA或阻断Healthy Validation。单个正式服务、主机或TCP边可独立确认，
   不需要多实体佐证。
 
 ## 有向TCP边完整路径

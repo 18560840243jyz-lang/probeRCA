@@ -138,6 +138,16 @@ soft_consecutive_windows: 3
 hard_threshold: 5.0
 hard_candidate_windows: 2
 hard_consecutive_windows: 3
+resource_alert_history_windows: 30
+resource_alert_prefilter_windows: 2
+resource_alert_calibration_margin: 1.0e-06
+resource_alert_metric_names:
+- cpu_psi
+- cpu_usage_rate
+- io_psi
+- memory_psi
+- memory_working_set_ratio
+- nic_drop_error_rate
 recovery_threshold: 1.0
 recovery_windows: 2
 candidate_hops: 2

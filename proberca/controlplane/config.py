@@ -335,6 +335,17 @@ class FinalControlConfig:
     hard_threshold: float = 5.0
     hard_candidate_windows: int = 2
     hard_consecutive_windows: int = 3
+    resource_alert_history_windows: int = 30
+    resource_alert_prefilter_windows: int = 2
+    resource_alert_calibration_margin: float = 1.0e-6
+    resource_alert_metric_names: tuple[str, ...] = (
+        "cpu_psi",
+        "cpu_usage_rate",
+        "io_psi",
+        "memory_psi",
+        "memory_working_set_ratio",
+        "nic_drop_error_rate",
+    )
     recovery_threshold: float = 1.0
     recovery_windows: int = 2
     candidate_hops: int = 2
@@ -358,7 +369,8 @@ class FinalControlConfig:
             "service_min_training_updates", "calibration_learning_windows",
             "calibration_validation_windows",
             "soft_consecutive_windows", "hard_candidate_windows",
-            "hard_consecutive_windows",
+            "hard_consecutive_windows", "resource_alert_history_windows",
+            "resource_alert_prefilter_windows",
             "recovery_windows", "candidate_hops", "burst_window_count",
             "fista_max_iterations", "top_k",
         ):
@@ -381,6 +393,7 @@ class FinalControlConfig:
             "soft_threshold", "hard_threshold", "l1_penalty",
             "fista_tolerance", "metric_rows_per_feature",
             "metric_rank_tolerance", "metric_max_condition_number",
+            "resource_alert_calibration_margin",
         )
         for name in finite_positive:
             value = getattr(self, name)
@@ -391,6 +404,10 @@ class FinalControlConfig:
             raise ValueError("control.rls_forgetting_factor must be in (0,1]")
         if self.hard_threshold <= self.soft_threshold:
             raise ValueError("control hard threshold must exceed soft threshold")
+        if self.resource_alert_prefilter_windows > self.hard_consecutive_windows:
+            raise ValueError(
+                "resource alert prefilter cannot exceed Hard confirmation"
+            )
         if not 0.0 <= self.recovery_threshold < self.soft_threshold:
             raise ValueError("control recovery threshold must be below soft threshold")
         if self.alpha_latency < 0 or self.alpha_failure < 0 \
@@ -439,6 +456,15 @@ class FinalControlConfig:
             raise ValueError(
                 "calibration root coordinates must be sorted, unique strings"
             )
+        if not self.resource_alert_metric_names or tuple(sorted(set(
+            self.resource_alert_metric_names
+        ))) != self.resource_alert_metric_names or any(
+            not isinstance(item, str) or not item
+            for item in self.resource_alert_metric_names
+        ):
+            raise ValueError(
+                "resource alert metric names must be sorted, unique strings"
+            )
         if not isinstance(self.load_profile_id, str) \
                 or not self.load_profile_id:
             raise ValueError("control.load_profile_id must be non-empty")
@@ -459,6 +485,14 @@ class FinalControlConfig:
             not isinstance(item, MetricRoleSpec) for item in self.metric_roles
         ):
             raise TypeError("metric_roles must contain MetricRoleSpec")
+        formal_resource_names = {
+            item.metric_name for item in self.metric_roles
+            if item.root_eligible and item.entity_type in {"service", "host"}
+        }
+        if not set(self.resource_alert_metric_names) <= formal_resource_names:
+            raise ValueError(
+                "resource alert metric names must be formal service/host roots"
+            )
         identities = [(
             item.record_type, item.metric_name, item.entity_type,
             item.scopes, item.protocols,
@@ -483,6 +517,9 @@ class FinalControlConfig:
         )
         values["calibration_required_root_coordinates"] = tuple(
             values["calibration_required_root_coordinates"]
+        )
+        values["resource_alert_metric_names"] = tuple(
+            values["resource_alert_metric_names"]
         )
         values["metric_roles"] = tuple(
             item if isinstance(item, MetricRoleSpec) else MetricRoleSpec.from_dict(item)
@@ -685,6 +722,9 @@ class FinalControlConfig:
         payload = asdict(self)
         payload["service_lags"] = list(self.service_lags)
         payload["metric_lags"] = list(self.metric_lags)
+        payload["resource_alert_metric_names"] = list(
+            self.resource_alert_metric_names
+        )
         payload["metric_roles"] = [item.to_dict() for item in self.metric_roles]
         payload["group_penalties"] = dict(sorted(self.group_penalties.items()))
         return payload
