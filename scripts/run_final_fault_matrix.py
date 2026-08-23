@@ -20,9 +20,17 @@ from typing import Any, Callable
 
 import yaml
 
-from proberca.dataplane.archive import CollectionArchive
-from proberca.dataplane.burst_archive import BurstArchive
+from proberca.dataplane.archive import (
+    CollectionArchive,
+    CollectionArchiveWriter,
+)
+from proberca.dataplane.burst_archive import (
+    BurstArchive,
+    BurstArchiveWriter,
+    RawBurstWindow,
+)
 from proberca.dataplane.burst_collection import BURST_CHANNEL_MODES
+from proberca.dataplane.contracts import CollectedWindow, fingerprint
 from proberca.controlplane import (
     CalibrationNotReadyError,
     FinalControlConfig,
@@ -940,6 +948,290 @@ def validate_archives(
         "window_count": expected_windows,
         "window_end_ns": normal_windows[-1].window_end_ns,
         "window_start_ns": normal_windows[0].window_start_ns,
+    }
+
+
+def _resequence_normal_window(
+    window: CollectedWindow, sequence: int,
+) -> CollectedWindow:
+    return CollectedWindow.create(
+        sequence=sequence,
+        window_start_ns=window.window_start_ns,
+        window_end_ns=window.window_end_ns,
+        node_metrics=window.node_metrics,
+        edge_metrics=window.edge_metrics,
+        topology_events=window.topology_events,
+        burst_evidence=window.burst_evidence,
+        source_record_ids=window.source_record_ids,
+        residual_source_record_ids=window.residual_source_record_ids,
+        collection_metadata=window.collection_metadata,
+    )
+
+
+def _resequence_burst_window(
+    window: RawBurstWindow, sequence: int,
+) -> RawBurstWindow:
+    return RawBurstWindow.create(
+        sequence=sequence,
+        window_start_ns=window.window_start_ns,
+        window_end_ns=window.window_end_ns,
+        cluster_id=window.cluster_id,
+        samples=window.samples,
+        event_source_fingerprint=window.event_source_fingerprint,
+        burst_config_fingerprint=window.burst_config_fingerprint,
+        event_loss_rate=window.event_loss_rate,
+    )
+
+
+def split_aligned_archive_slice(
+    *,
+    source_normal_root: Path,
+    source_burst_root: Path,
+    output_root: Path,
+    start_index: int,
+    window_count: int,
+) -> dict[str, Any]:
+    """Seal one contiguous, byte-independent phase view of a live capture."""
+    normal = CollectionArchive.load(source_normal_root)
+    burst = BurstArchive.load(source_burst_root)
+    normal_windows = tuple(normal.iter_windows())
+    burst_windows = tuple(burst.iter_windows())
+    stop_index = start_index + window_count
+    if (
+        start_index < 0
+        or window_count <= 0
+        or stop_index > len(normal_windows)
+        or len(normal_windows) != len(burst_windows)
+    ):
+        raise ExperimentError("continuous archive slice is invalid")
+    selected_normal = normal_windows[start_index:stop_index]
+    selected_burst = burst_windows[start_index:stop_index]
+    for left, right in zip(selected_normal, selected_burst):
+        if (
+            left.sequence != right.sequence
+            or left.window_start_ns != right.window_start_ns
+            or left.window_end_ns != right.window_end_ns
+        ):
+            raise ExperimentError("continuous Normal/Burst slice is misaligned")
+    dataset_id = fingerprint({
+        "source_dataset_id": normal.dataset_id,
+        "window_start_ns": selected_normal[0].window_start_ns,
+        "window_end_ns": selected_normal[-1].window_end_ns,
+        "window_count": window_count,
+        "semantics": "contiguous_phase_slice_v1",
+    })
+    normal_root = output_root / "normal"
+    burst_root = output_root / "burst"
+    normal_writer = CollectionArchiveWriter(
+        normal_root,
+        dataset_id=dataset_id,
+        collection_contract=normal.collection_contract,
+        source_description=normal.source_description,
+        collection_metadata=normal.collection_metadata,
+    )
+    burst_writer = BurstArchiveWriter(
+        burst_root,
+        dataset_id=dataset_id,
+        cluster_id=burst.cluster_id,
+        event_source_fingerprint=burst.event_source_fingerprint,
+        burst_config_fingerprint=burst.burst_config_fingerprint,
+    )
+    try:
+        for sequence, (left, right) in enumerate(
+            zip(selected_normal, selected_burst), 1,
+        ):
+            normal_writer.append(_resequence_normal_window(left, sequence))
+            burst_writer.append(_resequence_burst_window(right, sequence))
+        sealed_normal = normal_writer.seal()
+        sealed_burst = burst_writer.seal()
+    except Exception:
+        normal_writer.close_partial()
+        burst_writer.close_partial()
+        raise
+    if (
+        sealed_normal.dataset_id != sealed_burst.dataset_id
+        or sealed_normal.window_count != sealed_burst.window_count
+        or sealed_normal.start_ns != sealed_burst.start_ns
+        or sealed_normal.end_ns != sealed_burst.end_ns
+    ):
+        raise ExperimentError("sealed phase slice identities are misaligned")
+    return {
+        "dataset_id": sealed_normal.dataset_id,
+        "normal_archive": str(normal_root),
+        "burst_archive": str(burst_root),
+        "window_count": sealed_normal.window_count,
+        "window_start_ns": sealed_normal.start_ns,
+        "window_end_ns": sealed_normal.end_ns,
+    }
+
+
+def collect_contiguous_phases(
+    root: Path,
+    experiment_root: Path,
+    *,
+    normal_windows: int,
+    abnormal_windows: int,
+    on_phase_boundary: Callable[[dict[str, Any]], None],
+    on_capture_complete: Callable[[dict[str, Any]], None],
+) -> dict[str, Any]:
+    """Capture Normal and fault windows on one uninterrupted one-second axis."""
+    capture_root = experiment_root / "continuous-capture"
+    capture_root.mkdir(parents=True, exist_ok=False)
+    normal_root = capture_root / "normal"
+    burst_root = capture_root / "burst"
+    phase_marker = capture_root / "phase-boundary.json"
+    final_marker = capture_root / "capture-complete.json"
+    total_windows = normal_windows + abnormal_windows
+    command = [
+        sys.executable, "-u", "-m", "proberca.cli.collect_final",
+        "--source-config", str(NORMAL_CONFIG),
+        "--collection-contract", str(CONTRACT),
+        "--burst-config", str(BURST_CONFIG),
+        "--output", str(normal_root),
+        "--burst-output", str(burst_root),
+        "--windows", str(total_windows),
+        "--phase-boundary-window", str(normal_windows),
+        "--phase-boundary-marker", str(phase_marker),
+        "--capture-complete-marker", str(final_marker),
+    ]
+    log_path = capture_root / "collection.log"
+    phase_payload: dict[str, Any] | None = None
+    final_payload: dict[str, Any] | None = None
+    deadline = time.monotonic() + (
+        total_windows * WINDOW_WALL_BUDGET_SEC + 180
+    )
+
+    def consume_marker(
+        path: Path, expected_phase: str,
+    ) -> dict[str, Any] | None:
+        if not path.is_file():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("phase") != expected_phase:
+            raise ExperimentError(f"invalid {expected_phase} marker")
+        return payload
+
+    with log_path.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            command,
+            cwd=REPOSITORY,
+            env={
+                **os.environ,
+                "PYTHONPATH": os.pathsep.join(
+                    (str(REPOSITORY), str(USER_SITE_PACKAGES))
+                ),
+            },
+            text=True,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            while process.poll() is None:
+                if phase_payload is None:
+                    phase_payload = consume_marker(
+                        phase_marker, "phase_boundary",
+                    )
+                    if phase_payload is not None:
+                        if (
+                            phase_payload.get("boundary_sequence")
+                            != normal_windows
+                            or not isinstance(
+                                phase_payload.get("boundary_target_ns"), int,
+                            )
+                        ):
+                            raise ExperimentError(
+                                "phase boundary marker identity mismatch"
+                            )
+                        on_phase_boundary(phase_payload)
+                if final_payload is None:
+                    final_payload = consume_marker(
+                        final_marker, "capture_complete",
+                    )
+                    if final_payload is not None:
+                        on_capture_complete(final_payload)
+                if time.monotonic() >= deadline:
+                    raise ExperimentError(
+                        "continuous phase collection timed out"
+                    )
+                time.sleep(0.05)
+            process.wait()
+        except Exception:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+            raise
+    if process.returncode != 0:
+        raise ExperimentError(
+            f"continuous phase collector failed with {process.returncode}"
+        )
+    if phase_payload is None or final_payload is None:
+        raise ExperimentError("continuous collector omitted a lifecycle marker")
+    combined = validate_archives(normal_root, burst_root, total_windows)
+    boundary_target_ns = int(phase_payload["boundary_target_ns"])
+    if (
+        combined["window_start_ns"] + normal_windows * 1_000_000_000
+        != boundary_target_ns
+    ):
+        raise ExperimentError("phase marker is not on the archive time axis")
+
+    phase_normal_root = experiment_root / "phase-normal"
+    phase_abnormal_root = experiment_root / "phase-abnormal"
+    phase_normal_root.mkdir(exist_ok=False)
+    phase_abnormal_root.mkdir(exist_ok=False)
+    split_aligned_archive_slice(
+        source_normal_root=normal_root,
+        source_burst_root=burst_root,
+        output_root=phase_normal_root,
+        start_index=0,
+        window_count=normal_windows,
+    )
+    split_aligned_archive_slice(
+        source_normal_root=normal_root,
+        source_burst_root=burst_root,
+        output_root=phase_abnormal_root,
+        start_index=normal_windows,
+        window_count=abnormal_windows,
+    )
+    normal_result = validate_archives(
+        phase_normal_root / "normal",
+        phase_normal_root / "burst",
+        normal_windows,
+    )
+    abnormal_result = validate_archives(
+        phase_abnormal_root / "normal",
+        phase_abnormal_root / "burst",
+        abnormal_windows,
+    )
+    if normal_result["window_end_ns"] != abnormal_result["window_start_ns"]:
+        raise ExperimentError("Normal and abnormal phase slices are not contiguous")
+    for phase, result, phase_root in (
+        ("normal", normal_result, phase_normal_root),
+        ("abnormal", abnormal_result, phase_abnormal_root),
+    ):
+        result.update({
+            "phase_variable": "experiment_phase",
+            "phase_value": phase,
+            "normal_archive": str(phase_root / "normal"),
+            "burst_archive": str(phase_root / "burst"),
+            "continuous_source_dataset_id": combined["dataset_id"],
+        })
+        atomic_json(phase_root / "phase-manifest.json", result)
+    source_summary = {
+        **combined,
+        "phase_boundary": phase_payload,
+        "capture_complete": final_payload,
+    }
+    atomic_json(capture_root / "continuous-capture-summary.json", source_summary)
+    shutil.rmtree(normal_root)
+    shutil.rmtree(burst_root)
+    return {
+        "normal": normal_result,
+        "abnormal": abnormal_result,
+        "continuous_capture": source_summary,
     }
 
 
@@ -2064,13 +2356,18 @@ def main() -> int:
                 )
                 time.sleep(3)
             wait_data_plane(root)
-            record["normal"] = collect_phase(
-                root, experiment_root, "normal",
-                arguments.normal_windows,
-            )
-            spec["activate"](context, arguments.abnormal_windows)
-            record["injector"] = context.metadata
-            log_event(root, "fault_activated", fault_type=fault_type)
+            def activate_at_boundary(
+                payload: dict[str, Any],
+            ) -> None:
+                spec["activate"](context, arguments.abnormal_windows)
+                record["injector"] = context.metadata
+                record["fault_activated_at_ns"] = time.time_ns()
+                record["fault_phase_boundary"] = payload
+                log_event(
+                    root, "fault_activated", fault_type=fault_type,
+                    boundary_target_ns=payload["boundary_target_ns"],
+                )
+
             def deactivate_after_capture(
                 payload: dict[str, Any],
             ) -> None:
@@ -2087,11 +2384,19 @@ def main() -> int:
                     final_target_ns=payload["final_target_ns"],
                 )
 
-            record["abnormal"] = collect_phase(
-                root, experiment_root, "abnormal",
-                arguments.abnormal_windows,
+            contiguous = collect_contiguous_phases(
+                root,
+                experiment_root,
+                normal_windows=arguments.normal_windows,
+                abnormal_windows=arguments.abnormal_windows,
+                on_phase_boundary=activate_at_boundary,
                 on_capture_complete=deactivate_after_capture,
             )
+            record["normal"] = contiguous["normal"]
+            record["abnormal"] = contiguous["abnormal"]
+            record["continuous_capture"] = contiguous[
+                "continuous_capture"
+            ]
             if spec.get("signal") is not None:
                 record["signal_qualification"] = qualify_fault_signal(
                     record["normal"]["normal_archive"],

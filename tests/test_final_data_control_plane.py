@@ -3566,6 +3566,109 @@ def test_tcp_edge_runs_av_residual_burst_penalty_and_fista():
         control._diagnose()
 
 
+def test_diagnosis_removes_only_strictly_prior_resource_level_drift():
+    config = FinalControlConfig(
+        baseline_min_windows=6,
+        resource_alert_history_windows=30,
+        soft_consecutive_windows=3,
+        l1_penalty=0.01,
+        fista_tolerance=1.0e-10,
+    )
+    control = FinalControlPlane(config)
+    service = "cluster::ns::cartservice"
+    node_id = f"{service}::futex_wait_time_rate"
+    metric = MetricNode(
+        node_id=node_id,
+        entity_id=service,
+        entity_type="service",
+        metric_name="futex_wait_time_rate",
+        role="service_lock",
+        root_category="Lock",
+        root_eligible=True,
+    )
+    ready = MetricTargetReadiness(
+        target_metric=node_id,
+        root_eligible=True,
+        allowed_feature_count=0,
+        valid_training_rows=0,
+        minimum_training_rows=0,
+        effective_rank=0,
+        raw_design_rank_ratio=0.0,
+        condition_number=None,
+        regularized_gram_condition_number=None,
+        ready=True,
+        not_ready_reason=None,
+    )
+    model = MetricPropagationModel(
+        node_ids=(node_id,),
+        lags=(1, 2),
+        coefficients={},
+        semantic_mask=(),
+        training_rows=0,
+        healthy_cutoff_ns=30 * _NS,
+        target_readiness={node_id: ready},
+    )
+    candidate = CandidateEntityGraph(
+        seed_services=(service,),
+        seed_edges=(),
+        services=(service,),
+        hosts=(),
+        edges=(),
+        strong_service_relations=(),
+        topology_snapshot_id="snapshot",
+    )
+    observation = NormalizedObservation(
+        metric=metric,
+        signed_z=108.0,
+        anomaly=108.0,
+        quality=1.0,
+        source_record_id="source:" + "3" * 64,
+        baseline_center=0.0,
+        baseline_scale=1.0,
+        scale_source="mad",
+    )
+    control._soft = SimpleNamespace(
+        soft_sequence=33,
+        metric_model=model,
+        metrics={node_id: metric},
+        candidate_graph=candidate,
+        seed_services={service},
+        seed_edges=set(),
+    )
+    control._hard = SimpleNamespace(
+        sequence=34,
+        timestamp_ns=34 * _NS,
+        analysis_cutoff_ns=35 * _NS,
+        observations={node_id: observation},
+    )
+    # The three Soft windows 31--33 are excluded.  Only the strictly prior
+    # 30-window level is used, without changing the frozen baseline itself.
+    control._signed_history = {
+        sequence: {node_id: 100.0}
+        for sequence in range(1, 31)
+    } | {
+        31: {node_id: 106.0},
+        32: {node_id: 107.0},
+        33: {node_id: 108.0},
+    }
+    control._evidence = []
+    control._dataset_fingerprint = fingerprint({"dataset": "resource-drift"})
+
+    result = control._diagnose()
+
+    score = result.candidates[0]
+    assert score.entity_id == service
+    assert score.root_category == "Lock"
+    assert score.signed_residuals[node_id] == pytest.approx(8.0)
+    assert result.model_metadata[
+        "preincident_resource_residual_offsets"
+    ][node_id] == pytest.approx(100.0)
+    assert result.model_metadata[
+        "preincident_resource_residual_offset_samples"
+    ][node_id] == 30
+    assert "preincident_resource_offset" in result.residual_signal
+
+
 def test_legacy_dns_archive_is_readable_but_dns_is_excluded(tmp_path):
     config = _config()
     legacy_contract = _legacy_v3_dns_contract(config)
@@ -4221,3 +4324,108 @@ def test_fault_phase_does_not_retry_after_capture_completion(
     assert len(processes) == 1
     assert len(callbacks) == 1
     assert callbacks[0]["final_target_ns"] == 123_000_000_000
+
+
+def test_continuous_fault_capture_activates_on_exact_boundary_and_then_slices(
+    tmp_path, monkeypatch,
+):
+    import scripts.run_final_fault_matrix as runner
+
+    events = []
+    start_ns = 100_000_000_000
+    phase_target_ns = start_ns + 2_000_000_000
+    final_target_ns = start_ns + 4_000_000_000
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, command, **_kwargs):
+            values = {
+                command[index]: Path(command[index + 1])
+                for index in range(len(command) - 1)
+                if command[index].startswith("--")
+            }
+            self.normal_root = values["--output"]
+            self.burst_root = values["--burst-output"]
+            self.phase_marker = values["--phase-boundary-marker"]
+            self.final_marker = values["--capture-complete-marker"]
+            self.normal_root.mkdir(parents=True)
+            self.burst_root.mkdir(parents=True)
+            self.calls = 0
+
+        def poll(self):
+            self.calls += 1
+            if self.calls == 1:
+                self.phase_marker.write_text(json.dumps({
+                    "phase": "phase_boundary",
+                    "boundary_sequence": 2,
+                    "boundary_target_ns": phase_target_ns,
+                    "timestamp_ns": phase_target_ns,
+                }), encoding="utf-8")
+                return None
+            if self.calls == 2:
+                self.final_marker.write_text(json.dumps({
+                    "phase": "capture_complete",
+                    "final_target_ns": final_target_ns,
+                    "timestamp_ns": final_target_ns,
+                }), encoding="utf-8")
+                return None
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    validation_results = iter((
+        {
+            "dataset_id": "a" * 64,
+            "window_count": 4,
+            "window_start_ns": start_ns,
+            "window_end_ns": final_target_ns,
+        },
+        {
+            "dataset_id": "b" * 64,
+            "window_count": 2,
+            "window_start_ns": start_ns,
+            "window_end_ns": phase_target_ns,
+        },
+        {
+            "dataset_id": "c" * 64,
+            "window_count": 2,
+            "window_start_ns": phase_target_ns,
+            "window_end_ns": final_target_ns,
+        },
+    ))
+
+    monkeypatch.setattr(runner.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        runner, "validate_archives",
+        lambda *_args, **_kwargs: next(validation_results),
+    )
+
+    def fake_split(**kwargs):
+        events.append(("slice", kwargs["start_index"], kwargs["window_count"]))
+        return {}
+
+    monkeypatch.setattr(runner, "split_aligned_archive_slice", fake_split)
+    result = runner.collect_contiguous_phases(
+        tmp_path,
+        tmp_path / "trial",
+        normal_windows=2,
+        abnormal_windows=2,
+        on_phase_boundary=lambda payload: events.append(
+            ("activate", payload["boundary_target_ns"])
+        ),
+        on_capture_complete=lambda payload: events.append(
+            ("deactivate", payload["final_target_ns"])
+        ),
+    )
+
+    assert events == [
+        ("activate", phase_target_ns),
+        ("deactivate", final_target_ns),
+        ("slice", 0, 2),
+        ("slice", 2, 2),
+    ]
+    assert result["normal"]["window_end_ns"] == phase_target_ns
+    assert result["abnormal"]["window_start_ns"] == phase_target_ns

@@ -1469,6 +1469,19 @@ z_j(t-\ell)\rightarrow z_i(t),
 正残差表示当前异常高于健康传播预测；
 负残差表示健康模型预测值高于实际观测。
 
+15.2 服务/主机资源坐标的事故前局部偏移
+
+Baseline和(A_v)在READY后仍然冻结，不得重新拟合。对于已经由资源变化告警通道
+管理的正式服务/主机资源坐标，根因选择必须与告警采用一致的变化语义：先得到上述
+冻结跨指标残差，再减去严格位于完整Soft连续段之前、长度为
+`resource_alert_history_windows`的残差中位数。Soft连续段本身不得进入参考窗口。
+
+该偏移只消除事故发生前已经存在的长期水平漂移，不得读取故障标签、阶段manifest或
+注入目标；不得修改原始归档、Baseline、(A_s)、(A_v)、family floor或Soft/Hard阈值。
+有向TCP边和非资源坐标继续使用原始冻结跨指标残差，不执行该偏移。有效参考样本少于
+`baseline_min_windows`时不应用偏移。最终RCA结果必须保存每个坐标的偏移值、样本数和
+参考窗口长度以供审计。
+
 十六、步骤14：确定可作为根因的残差坐标
 16.1 这一步的作用
 不是所有指标都能成为根因。
@@ -2415,3 +2428,22 @@ TCP边独立告警
   service plus 15-edge coverage. Do not start experimental DNS workloads. Any
   later application runtime-identity change invalidates the active collection;
   never use reattachment or a same-Pod rebind to reuse the frozen model.
+
+## Continuous Normal-to-fault phase capture
+
+- Capture every formal trial on one uninterrupted exact one-second target
+  sequence. Do not run separate collection commands for pre-fault and fault
+  phases; Prometheus query and sealing time would create an unobserved gap.
+- Emit one atomic data-plane boundary marker after the final pre-fault boundary
+  is captured, activate the fault only after that marker, and continue boundary
+  capture immediately. Deactivate only after the final capture marker.
+- Seal and validate the combined Normal/Burst source first, then make two
+  immutable contiguous archive slices with opaque Dataset IDs and sequences
+  rebased from one. The end of the first slice must equal the start of the
+  second, with exact Normal/Burst alignment.
+- Keep phase/fault labels only in the experiment manifest. They must never be
+  copied into records, Burst evidence, alert seeds, `A_s`, `A_v`, residuals,
+  candidate construction, FISTA, or ranking.
+- Missing markers, phase gaps, overlapping windows, runtime/topology changes,
+  or activation before the boundary fail closed. Never hide them with copied
+  windows, timestamp rewriting, zero fill, interpolation, or model changes.

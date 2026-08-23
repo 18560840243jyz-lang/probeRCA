@@ -2495,9 +2495,15 @@ def test_live_runner_reports_capture_complete_before_history_query():
         capture_complete_callback=lambda target: events.append(
             f"capture-complete-{target}"
         ),
+        boundary_callback=lambda sequence, target: events.append(
+            f"boundary-{sequence}-{target}"
+        ),
     ))
 
     assert len(pairs) == 1
+    boundary_index = events.index(f"boundary-1-{END}")
+    assert events[boundary_index - 1] == "burst-boundary"
+    assert boundary_index < events.index("primitive-target-ready")
     capture_index = events.index(f"capture-complete-{END}")
     assert events[capture_index - 1] == "primitive-target-ready"
     assert events[capture_index + 1] == "discover-2"
@@ -2535,3 +2541,86 @@ def test_aligned_writer_atomically_records_capture_completion(
     assert payload["final_target_ns"] == END
     assert isinstance(payload["timestamp_ns"], int)
     assert not tuple(marker.parent.glob(f".{marker.name}.*.tmp"))
+
+
+def test_aligned_writer_atomically_records_internal_phase_boundary(
+    contract, tmp_path,
+):
+    pairs = (
+        _aligned_test_pair(contract, 1),
+        _aligned_test_pair(contract, 2),
+    )
+    normal_writer, burst_writer = _aligned_test_writers(
+        contract, tmp_path, pairs[0][0].collection_metadata,
+    )
+    marker = tmp_path / "lifecycle" / "phase-boundary.json"
+
+    class Runner:
+        @staticmethod
+        def iter_collect_aligned(
+            _window_count, capture_complete_callback=None,
+            boundary_callback=None,
+        ):
+            assert capture_complete_callback is None
+            assert boundary_callback is not None
+            boundary_callback(1, END)
+            boundary_callback(2, END + 1_000_000_000)
+            yield from pairs
+
+    _write_aligned_windows(
+        runner=Runner(),
+        normal_writer=normal_writer,
+        burst_writer=burst_writer,
+        window_count=2,
+        phase_boundary_window=1,
+        phase_boundary_marker=marker,
+    )
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["phase"] == "phase_boundary"
+    assert payload["boundary_sequence"] == 1
+    assert payload["boundary_target_ns"] == END
+    assert isinstance(payload["timestamp_ns"], int)
+    assert not tuple(marker.parent.glob(f".{marker.name}.*.tmp"))
+
+
+def test_contiguous_capture_splits_into_two_aligned_phase_archives(
+    contract, tmp_path,
+):
+    from scripts.run_final_fault_matrix import split_aligned_archive_slice
+
+    pairs = tuple(_aligned_test_pair(contract, index) for index in range(1, 5))
+    source_root = tmp_path / "source"
+    normal_writer, burst_writer = _aligned_test_writers(
+        contract, source_root, pairs[0][0].collection_metadata,
+    )
+    for normal, burst in pairs:
+        normal_writer.append(normal)
+        burst_writer.append(burst)
+    normal_writer.seal()
+    burst_writer.seal()
+
+    first = split_aligned_archive_slice(
+        source_normal_root=source_root / "normal",
+        source_burst_root=source_root / "burst",
+        output_root=tmp_path / "phase-one",
+        start_index=0,
+        window_count=2,
+    )
+    second = split_aligned_archive_slice(
+        source_normal_root=source_root / "normal",
+        source_burst_root=source_root / "burst",
+        output_root=tmp_path / "phase-two",
+        start_index=2,
+        window_count=2,
+    )
+
+    assert first["window_count"] == second["window_count"] == 2
+    assert first["window_end_ns"] == second["window_start_ns"]
+    assert first["dataset_id"] != second["dataset_id"]
+    for phase_root in (tmp_path / "phase-one", tmp_path / "phase-two"):
+        normal = CollectionArchive.load(phase_root / "normal")
+        burst = BurstArchive.load(phase_root / "burst")
+        assert normal.dataset_id == burst.dataset_id
+        assert [item.sequence for item in normal.iter_windows()] == [1, 2]
+        assert [item.sequence for item in burst.iter_windows()] == [1, 2]

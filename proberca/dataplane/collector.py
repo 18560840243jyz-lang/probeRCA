@@ -713,6 +713,7 @@ class FinalLiveCollectionRunner:
         self,
         window_count: int,
         capture_complete_callback: Callable[[int], None] | None = None,
+        boundary_callback: Callable[[int, int], None] | None = None,
     ):
         """Yield fully validated Normal/Burst pairs one sequence at a time."""
 
@@ -751,9 +752,11 @@ class FinalLiveCollectionRunner:
             begin_capture(before)
             self._wait_until(bounds[0][0])
             capture_boundary(bounds[0][0], before)
-            for _start_ns, end_ns in bounds:
+            for sequence, (_start_ns, end_ns) in enumerate(bounds, 1):
                 self._wait_until(end_ns)
                 capture_boundary(end_ns, before)
+                if boundary_callback is not None:
+                    boundary_callback(sequence, end_ns)
             self._wait_until(
                 bounds[-1][1] + int(
                     self.config.collection_delay_sec
@@ -761,6 +764,10 @@ class FinalLiveCollectionRunner:
                 )
             )
         else:
+            if boundary_callback is not None:
+                raise RawCollectionError(
+                    "exact boundary callbacks require the Burst source"
+                )
             self._wait_until(
                 bounds[-1][1] + int(
                     self.config.collection_delay_sec

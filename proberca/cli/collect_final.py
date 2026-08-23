@@ -49,6 +49,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--capture-complete-marker", type=Path,
         help="atomically record completion of exact boundary capture",
     )
+    parser.add_argument(
+        "--phase-boundary-window", type=int,
+        help="emit one exact boundary marker after this completed window",
+    )
+    parser.add_argument(
+        "--phase-boundary-marker", type=Path,
+        help="atomic marker written at --phase-boundary-window",
+    )
 
     return parser
 
@@ -68,6 +76,22 @@ def _write_capture_complete_marker(
     os.replace(temporary, marker)
 
 
+def _write_phase_boundary_marker(
+    marker: Path, sequence: int, target_ns: int,
+) -> None:
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker.with_name(
+        f".{marker.name}.{os.getpid()}.tmp"
+    )
+    temporary.write_text(canonical_json({
+        "boundary_sequence": sequence,
+        "boundary_target_ns": target_ns,
+        "phase": "phase_boundary",
+        "timestamp_ns": time.time_ns(),
+    }) + "\n", encoding="utf-8")
+    os.replace(temporary, marker)
+
+
 def _write_aligned_windows(
     *,
     runner,
@@ -75,6 +99,8 @@ def _write_aligned_windows(
     burst_writer: BurstArchiveWriter,
     window_count: int,
     capture_complete_marker: Path | None = None,
+    phase_boundary_window: int | None = None,
+    phase_boundary_marker: Path | None = None,
 ) -> None:
     try:
         if normal_writer.dataset_id != burst_writer.dataset_id:
@@ -84,6 +110,17 @@ def _write_aligned_windows(
             iterator_kwargs["capture_complete_callback"] = (
                 lambda final_target_ns: _write_capture_complete_marker(
                     capture_complete_marker, final_target_ns,
+                )
+            )
+        if phase_boundary_window is not None:
+            if phase_boundary_marker is None:
+                raise ValueError("phase boundary marker path is required")
+            iterator_kwargs["boundary_callback"] = (
+                lambda sequence, target_ns: (
+                    _write_phase_boundary_marker(
+                        phase_boundary_marker, sequence, target_ns,
+                    )
+                    if sequence == phase_boundary_window else None
                 )
             )
         for normal_window, burst_window in runner.iter_collect_aligned(
@@ -121,6 +158,17 @@ def _write_aligned_windows(
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if (args.phase_boundary_window is None) \
+            != (args.phase_boundary_marker is None):
+        raise ValueError(
+            "phase boundary window and marker must be configured together"
+        )
+    if args.phase_boundary_window is not None and not (
+        0 < args.phase_boundary_window < args.windows
+    ):
+        raise ValueError(
+            "phase boundary window must be inside the collection interval"
+        )
     source_payload = _mapping(args.source_config)
     contract = _mapping(args.collection_contract)
     burst_payload = _mapping(args.burst_config)
@@ -182,6 +230,8 @@ def main(argv=None) -> int:
         burst_writer=burst_writer,
         window_count=args.windows,
         capture_complete_marker=args.capture_complete_marker,
+        phase_boundary_window=args.phase_boundary_window,
+        phase_boundary_marker=args.phase_boundary_marker,
     )
     archive = writer.seal()
     burst_archive = burst_writer.seal()

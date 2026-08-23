@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+import statistics
 from typing import Any
 
 import numpy as np
@@ -1249,6 +1250,47 @@ class FinalControlPlane:
             "service_model_frozen": not models_updated,
         })
 
+    def _preincident_resource_residual_offset(
+        self, metric, model,
+    ) -> tuple[float, int]:
+        """Return a label-blind recent offset for resource-root residuals.
+
+        Resource alerts already detect changes relative to a strictly prior
+        rolling history so that harmless long-lived level drift does not create
+        an incident.  Diagnosis must use the same change semantics; otherwise
+        a stale absolute residual from an unrelated service can outrank the
+        entity whose change actually triggered the incident.  TCP edge roots
+        and non-resource coordinates retain their frozen A_v residual exactly.
+        """
+        if (
+            metric.entity_type not in {"service", "host"}
+            or metric.metric_name not in self.config.resource_alert_metric_names
+        ):
+            return 0.0, 0
+        soft_sequence = getattr(self._soft, "soft_sequence", None)
+        if soft_sequence is None:
+            return 0.0, 0
+        reference_end = (
+            int(soft_sequence) - self.config.soft_consecutive_windows
+        )
+        reference_start = (
+            reference_end - self.config.resource_alert_history_windows + 1
+        )
+        values: list[float] = []
+        for sequence in range(reference_start, reference_end + 1):
+            row = self._signed_history.get(sequence)
+            if row is None or metric.node_id not in row:
+                continue
+            values.append(
+                float(row[metric.node_id])
+                - model.cross_prediction(
+                    metric.node_id, self._signed_history, sequence,
+                )
+            )
+        if len(values) < self.config.baseline_min_windows:
+            return 0.0, len(values)
+        return float(statistics.median(values)), len(values)
+
     def _diagnose(self) -> FinalRCAResult:
         if self._soft is None or self._hard is None:
             raise ControlPlaneError("diagnosis requires frozen Soft and Hard contexts")
@@ -1273,13 +1315,23 @@ class FinalControlPlane:
         if not root_metrics:
             raise ControlPlaneError("candidate graph has no observed root coordinates")
         root_metrics.sort(key=lambda item: item.node_id)
-        residual = np.asarray([
-            observations[item.node_id].signed_z
-            - model.cross_prediction(
-                item.node_id, self._signed_history, self._hard.sequence,
+        residual_offsets: dict[str, float] = {}
+        residual_offset_samples: dict[str, int] = {}
+        residual_values = []
+        for item in root_metrics:
+            value = (
+                observations[item.node_id].signed_z
+                - model.cross_prediction(
+                    item.node_id, self._signed_history, self._hard.sequence,
+                )
             )
-            for item in root_metrics
-        ], dtype=float)
+            offset, sample_count = self._preincident_resource_residual_offset(
+                item, model,
+            )
+            residual_offsets[item.node_id] = offset
+            residual_offset_samples[item.node_id] = sample_count
+            residual_values.append(value - offset)
+        residual = np.asarray(residual_values, dtype=float)
         quality = np.asarray([
             observations[item.node_id].quality for item in root_metrics
         ], dtype=float)
@@ -1383,7 +1435,10 @@ class FinalControlPlane:
             candidates=ranked,
             top_k=ranked[:self.config.top_k],
             candidate_graph=self._soft.candidate_graph,
-            residual_signal="signed_z_minus_frozen_healthy_cross_metric_Av_only",
+            residual_signal=(
+                "signed_z_minus_frozen_healthy_cross_metric_Av_only_with_"
+                "preincident_resource_offset"
+            ),
             solver=solved,
             model_metadata={
                 "service_model": "healthy_only_masked_RLS_As",
@@ -1392,6 +1447,15 @@ class FinalControlPlane:
                 "self_history_learned": True,
                 "self_history_subtracted_from_residual": False,
                 "root_coordinates_only": True,
+                "preincident_resource_residual_offsets": dict(sorted(
+                    residual_offsets.items()
+                )),
+                "preincident_resource_residual_offset_samples": dict(sorted(
+                    residual_offset_samples.items()
+                )),
+                "preincident_resource_residual_reference_windows": (
+                    self.config.resource_alert_history_windows
+                ),
                 "burst_role": "candidate_group_penalty_only",
                 "counterfactual_resolve": False,
                 "metric_training_rows": model.training_rows,

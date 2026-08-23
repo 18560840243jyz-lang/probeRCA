@@ -434,3 +434,44 @@ entities; experimental DNS workloads are not started. A later application
 runtime-identity change still
 invalidates an active collection; the installer rule is preparation, not an
 online repair that hides changes during an experiment.
+
+## Continuous fault-phase capture decision
+
+A formal fault trial uses one uninterrupted exact one-second acquisition axis
+for its pre-fault and fault windows. The data-plane collector emits an atomic
+marker immediately after the configured pre-fault boundary is captured; only
+then may the external orchestrator activate the fault. Acquisition continues
+without waiting for Prometheus range queries, aggregation, archive sealing, or
+signal qualification. The final marker deactivates the fault after the last
+required boundary has been captured.
+
+After the combined Normal/Burst capture is sealed and verified, the data-only
+orchestrator creates two immutable contiguous archive slices with new opaque
+Dataset IDs and sequences rebased to start at one. The slice boundary must be
+exactly contiguous in wall time, and Normal/Burst timestamps must remain equal.
+Fault labels remain only in the external experiment manifest and never enter
+metric records, Burst evidence, alerting, propagation, or FISTA. A trial with a
+time gap, overlapping phases, a missing lifecycle marker, or activation before
+the exact boundary fails closed. Separate collection commands for the two
+phases are not valid for formal RCA because their query/seal interval creates
+an unobserved gap and falsely makes non-adjacent samples appear adjacent to
+lagged models.
+
+## Incident-local resource residual decision
+
+Frozen Healthy Baseline and `A_v` remain unchanged after READY. Service and
+host resource alerts already compare the current standardized observation with
+a strictly prior rolling level so that a long-lived, pre-incident level shift
+does not itself seed a new incident. Root selection uses the same label-blind
+change semantics for those configured service/host resource coordinates: after
+subtracting frozen cross-metric `A_v`, subtract the median residual from the
+configured rolling window ending before the complete Soft run. The Soft windows
+themselves are never part of that reference.
+
+This is not baseline refitting, clipping, zero fill, or label use. The frozen
+Baseline, `A_s`, `A_v`, family scales, thresholds, raw archive, and Burst
+evidence remain unchanged. Directed TCP edge residuals and all non-resource
+coordinates keep the original frozen cross-metric residual exactly. If fewer
+than the frozen baseline minimum number of valid prior samples exist, the
+offset is not applied. Every applied offset and its sample count is recorded in
+the RCA model metadata.
