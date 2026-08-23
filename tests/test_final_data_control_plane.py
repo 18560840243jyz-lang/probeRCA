@@ -3838,8 +3838,8 @@ def test_formal_faults_act_on_real_paths_not_isolated_synthetic_signals(
     assert actors[0][1]["service"] == "recommendationservice"
     specs["service_lock"]["activate"](Context(), 60)
     assert Context.metadata["intervention_profile"] \
-        == "service-cgroup-futex-v5"
-    assert runner.SERVICE_LOCK_THREADS == 8
+        == "service-cgroup-futex-v6"
+    assert runner.SERVICE_LOCK_THREADS == 10
     assert runner.SERVICE_LOCK_HOLD_MS == 350.0
     assert runner.SERVICE_LOCK_WAITER_PAUSE_MS == 5.0
     assert actors[1][0] == ("futex",)
