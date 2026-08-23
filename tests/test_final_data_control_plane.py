@@ -3291,7 +3291,7 @@ def test_formal_fault_matrix_keeps_tcp_and_excludes_dns():
     assert any(item["fault_type"] == "tcp_edge" for item in specs)
     assert all(item["fault_type"] != "dns_edge" for item in specs)
     assert all(item["root_category"] != "DNS" for item in specs)
-    assert HOST_MEMORY_PILOT_BYTES == 4 * 1024 * 1024 * 1024
+    assert HOST_MEMORY_PILOT_BYTES == 3 * 1024 * 1024 * 1024
     assert HOST_MEMORY_HIGH_BYTES < HOST_MEMORY_PILOT_BYTES
     assert HOST_MEMORY_PILOT_BYTES < HOST_MEMORY_MAX_BYTES
 
@@ -3838,14 +3838,16 @@ def test_formal_faults_act_on_real_paths_not_isolated_synthetic_signals(
     assert actors[0][1]["service"] == "recommendationservice"
     specs["service_lock"]["activate"](Context(), 60)
     assert Context.metadata["intervention_profile"] \
-        == "service-cgroup-futex-v4"
+        == "service-cgroup-futex-v5"
     assert runner.SERVICE_LOCK_THREADS == 8
     assert runner.SERVICE_LOCK_HOLD_MS == 350.0
+    assert runner.SERVICE_LOCK_WAITER_PAUSE_MS == 5.0
     assert actors[1][0] == ("futex",)
     assert actors[1][1]["service"] == "cartservice"
     assert actors[1][1]["arguments"] == [
         "--threads", str(runner.SERVICE_LOCK_THREADS),
         "--hold-ms", str(runner.SERVICE_LOCK_HOLD_MS),
+        "--waiter-pause-ms", str(runner.SERVICE_LOCK_WAITER_PAUSE_MS),
     ]
 
     # IO actors are explicitly direct/synchronous in the formal spec.  This

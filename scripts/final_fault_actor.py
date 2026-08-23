@@ -159,7 +159,15 @@ def io_actor(
         os.close(descriptor)
 
 
-def futex_actor(thread_count: int, hold_ms: float, deadline: float) -> None:
+def futex_actor(
+    thread_count: int,
+    hold_ms: float,
+    deadline: float,
+    *,
+    waiter_pause_ms: float = 0.0,
+) -> None:
+    if thread_count <= 0 or hold_ms <= 0 or waiter_pause_ms < 0:
+        raise ValueError("invalid futex actor parameters")
     threading.stack_size(256 * 1024)
     mutex = threading.Lock()
 
@@ -176,6 +184,8 @@ def futex_actor(thread_count: int, hold_ms: float, deadline: float) -> None:
             if acquired:
                 increment("lock_acquires")
                 mutex.release()
+                if waiter_pause_ms > 0:
+                    STOP.wait(waiter_pause_ms / 1000.0)
 
     threads = [threading.Thread(target=holder, daemon=True)]
     threads.extend(
@@ -282,6 +292,7 @@ def main() -> int:
     parser.add_argument("--direct", action="store_true")
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--hold-ms", type=float, default=50.0)
+    parser.add_argument("--waiter-pause-ms", type=float, default=0.0)
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
     parser.add_argument("--interval", type=float, default=0.02)
@@ -330,7 +341,12 @@ def main() -> int:
                 direct=arguments.direct,
             )
         elif arguments.mode == "futex":
-            futex_actor(arguments.threads, arguments.hold_ms, deadline)
+            futex_actor(
+                arguments.threads,
+                arguments.hold_ms,
+                deadline,
+                waiter_pause_ms=arguments.waiter_pause_ms,
+            )
         elif arguments.mode == "localnet":
             localnet_actor(arguments.threads, deadline)
         elif arguments.mode == "tcp":

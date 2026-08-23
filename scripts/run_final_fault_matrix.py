@@ -80,6 +80,7 @@ SERVICE_IO_FILE_BYTES = 256 * 1024 * 1024
 SERVICE_IO_WRITE_BYTES_PER_SEC = 8 * 1024 * 1024
 SERVICE_LOCK_THREADS = 8
 SERVICE_LOCK_HOLD_MS = 350.0
+SERVICE_LOCK_WAITER_PAUSE_MS = 5.0
 SERVICE_LOCALNET_THREADS = 32
 
 
@@ -1455,7 +1456,8 @@ def service_lock(context: FaultContext, windows: int) -> None:
         "target_service": target_service,
         "threads": SERVICE_LOCK_THREADS,
         "hold_ms": SERVICE_LOCK_HOLD_MS,
-        "intervention_profile": "service-cgroup-futex-v4",
+        "waiter_pause_ms": SERVICE_LOCK_WAITER_PAUSE_MS,
+        "intervention_profile": "service-cgroup-futex-v5",
     })
     context.start_actor(
         "futex",
@@ -1464,6 +1466,7 @@ def service_lock(context: FaultContext, windows: int) -> None:
         arguments=[
             "--threads", str(SERVICE_LOCK_THREADS),
             "--hold-ms", str(SERVICE_LOCK_HOLD_MS),
+            "--waiter-pause-ms", str(SERVICE_LOCK_WAITER_PAUSE_MS),
         ],
         name="service-lock-futex",
     )
