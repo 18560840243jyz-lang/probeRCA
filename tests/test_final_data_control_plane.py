@@ -3119,6 +3119,8 @@ def test_out_of_scope_service_records_keep_diagnostic_scope_flags():
 
 def test_formal_fault_matrix_keeps_tcp_and_excludes_dns():
     from scripts.run_final_fault_matrix import (
+        HOST_MEMORY_HIGH_BYTES,
+        HOST_MEMORY_MAX_BYTES,
         HOST_MEMORY_PILOT_BYTES,
         experiment_specs,
     )
@@ -3127,7 +3129,9 @@ def test_formal_fault_matrix_keeps_tcp_and_excludes_dns():
     assert any(item["fault_type"] == "tcp_edge" for item in specs)
     assert all(item["fault_type"] != "dns_edge" for item in specs)
     assert all(item["root_category"] != "DNS" for item in specs)
-    assert HOST_MEMORY_PILOT_BYTES == 4 * 1024 * 1024 * 1024
+    assert HOST_MEMORY_PILOT_BYTES == 8 * 1024 * 1024 * 1024
+    assert HOST_MEMORY_HIGH_BYTES < HOST_MEMORY_PILOT_BYTES
+    assert HOST_MEMORY_PILOT_BYTES < HOST_MEMORY_MAX_BYTES
 
 
 def test_dns_anomaly_is_marked_excluded_and_cannot_alert():
@@ -3645,9 +3649,9 @@ def test_formal_faults_act_on_real_paths_not_isolated_synthetic_signals(
             actors.append(((), kwargs))
 
     monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(runner, "block_device_id", lambda _path: "253:0")
     specs["service_cpu"]["activate"](Context(), 60)
     specs["service_memory"]["activate"](Context(), 60)
-    specs["service_lock"]["activate"](Context(), 60)
 
     assert controls[0] == (
         "frontend", "cpu.max", runner.SERVICE_CPU_QUOTA,
@@ -3670,9 +3674,15 @@ def test_formal_faults_act_on_real_paths_not_isolated_synthetic_signals(
     assert Context.metadata["intervention_profile"] \
         == "service-memory-working-set-v2"
     assert actors[0][1]["service"] == "recommendationservice"
-    assert actors[1][1]["workload"] == "proberca-healthy-rpc-load"
-    assert actors[1][1]["container"] == "rpc-load"
-    assert "cartservice:7070" in actors[1][1]["program"]
+    specs["service_lock"]["activate"](Context(), 60)
+    assert Context.metadata["intervention_profile"] \
+        == "service-cgroup-futex-v1"
+    assert actors[1][0] == ("futex",)
+    assert actors[1][1]["service"] == "cartservice"
+    assert actors[1][1]["arguments"] == [
+        "--threads", str(runner.SERVICE_LOCK_THREADS),
+        "--hold-ms", str(runner.SERVICE_LOCK_HOLD_MS),
+    ]
 
     # IO actors are explicitly direct/synchronous in the formal spec.  This
     # checks the closure without duplicating implementation logic in a test.
@@ -3680,61 +3690,179 @@ def test_formal_faults_act_on_real_paths_not_isolated_synthetic_signals(
     service_io(Context(), 60)
     host_io = specs["host_io"]["activate"]
     host_io(Context(), 60)
+    assert controls[2] == (
+        "redis-cart", "io.max",
+        f"253:0 wbps={runner.SERVICE_IO_WRITE_BYTES_PER_SEC}",
+    )
+    assert controls[3] == ("redis-cart", "cpu.max", "max 100000")
     assert "--direct" in actors[-2][1]["arguments"]
     assert "--direct" in actors[-1][1]["arguments"]
 
 
-def test_service_localnet_fault_covers_formal_egress_and_cleans_up(
+def test_service_localnet_fault_targets_service_cgroup_and_network_namespace(
     monkeypatch,
 ):
     import scripts.run_final_fault_matrix as runner
 
-    commands = []
-    cleanups = []
+    actors = []
 
     class Context:
         metadata = {}
 
         @staticmethod
-        def add_cleanup(callback):
-            cleanups.append(callback)
-
-    identities = {
-        "frontend": {"pod_ip": "10.0.0.1"},
-        "alpha": {"pod_ip": "10.0.0.2"},
-        "beta": {"pod_ip": "10.0.0.3"},
-    }
-    monkeypatch.setattr(
-        runner, "formal_service_names",
-        lambda: ("frontend", "alpha", "beta"),
-    )
-    monkeypatch.setattr(
-        runner, "service_info", lambda service: identities[service],
-    )
-    monkeypatch.setattr(
-        runner, "add_iptables_rule",
-        lambda arguments: commands.append(("add", tuple(arguments))),
-    )
-    monkeypatch.setattr(
-        runner, "node_command",
-        lambda arguments, **_kwargs: commands.append(
-            ("delete", tuple(arguments))
-        ),
-    )
-    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+        def start_actor(*args, **kwargs):
+            actors.append((args, kwargs))
 
     runner.service_localnet(Context(), 60)
 
-    additions = [item for operation, item in commands if operation == "add"]
-    assert len(additions) == 2
-    assert all("10.0.0.1" in item for item in additions)
-    assert {item[item.index("-d") + 1] for item in additions} == {
-        "10.0.0.2", "10.0.0.3",
+    assert actors == [(('localnet',), {
+        "service": "frontend",
+        "network_namespace": True,
+        "duration": 60 + runner.FAULT_ACTOR_FAILSAFE_GRACE_SEC,
+        "arguments": ["--threads", str(runner.SERVICE_LOCALNET_THREADS)],
+        "name": "service-localnet-socket",
+    })]
+    assert Context.metadata["intervention_profile"] \
+        == "service-cgroup-local-socket-v1"
+
+
+def test_host_memory_fault_uses_bounded_reclaim_cgroup_and_churn():
+    import scripts.run_final_fault_matrix as runner
+
+    created = []
+    actors = []
+
+    class Context:
+        metadata = {}
+
+        @staticmethod
+        def create_host_cgroup(name, controls):
+            created.append((name, controls))
+            return Path("/sys/fs/cgroup/proberca-final-host-memory")
+
+        @staticmethod
+        def start_actor(*args, **kwargs):
+            actors.append((args, kwargs))
+
+    runner.host_memory(Context(), 60)
+
+    assert created == [(
+        runner.HOST_MEMORY_CGROUP_NAME,
+        {
+            "memory.high": str(runner.HOST_MEMORY_HIGH_BYTES),
+            "memory.max": str(runner.HOST_MEMORY_MAX_BYTES),
+        },
+    )]
+    assert actors[0][0] == ("memory",)
+    assert actors[0][1]["cgroup_path"] == Path(
+        "/sys/fs/cgroup/proberca-final-host-memory"
+    )
+    assert "--churn" in actors[0][1]["arguments"]
+    assert "--bulk-fill" in actors[0][1]["arguments"]
+
+
+def test_fault_signal_qualification_accepts_root_and_rejects_competitor(
+    monkeypatch,
+):
+    import scripts.run_final_fault_matrix as runner
+
+    values = {
+        ("normal", "io_psi"): [0.0] * 10,
+        ("abnormal", "io_psi"): [0.25] * 10,
+        ("normal", "cpu_throttle_ratio"): [0.0] * 10,
+        ("abnormal", "cpu_throttle_ratio"): [0.0] * 10,
     }
-    assert all("proberca-final-service-localnet" in item for item in additions)
-    assert len(cleanups) == 1
-    cleanups[0]()
-    assert len([item for operation, item in commands if operation == "delete"]) == 2
+
+    def metric_values(archive, selector):
+        return values[(str(archive), selector["metric_name"])], 10
+
+    monkeypatch.setattr(runner, "_metric_values", metric_values)
+    requirement = {
+        "metric_name": "io_psi",
+        "scope": "service",
+        "service_name": "redis-cart",
+        "minimum_abnormal_median": 0.05,
+        "minimum_median_lift": 0.04,
+        "competitors": [{
+            "metric_name": "cpu_throttle_ratio",
+            "scope": "service",
+            "service_name": "redis-cart",
+            "maximum_abnormal_median": 0.10,
+        }],
+    }
+
+    result = runner.qualify_fault_signal("normal", "abnormal", requirement)
+    assert result["accepted"] is True
+    assert result["median_lift"] == pytest.approx(0.25)
+
+    values[("abnormal", "cpu_throttle_ratio")] = []
+    result = runner.qualify_fault_signal("normal", "abnormal", requirement)
+    assert result["competitors"][0]["abnormal"] is None
+
+    values[("abnormal", "cpu_throttle_ratio")] = [0.8] * 10
+    with pytest.raises(
+        runner.ExperimentError, match="cpu_throttle_ratio.*dominates",
+    ):
+        runner.qualify_fault_signal("normal", "abnormal", requirement)
+
+
+def test_problem_fault_specs_freeze_declared_root_signal_gates():
+    import scripts.run_final_fault_matrix as runner
+
+    specs = {item["fault_type"]: item for item in runner.experiment_specs()}
+    assert {
+        name: specs[name]["signal"]["metric_name"]
+        for name in (
+            "service_io", "service_lock", "service_localnet", "host_memory",
+        )
+    } == {
+        "service_io": "io_psi",
+        "service_lock": "futex_wait_time_rate",
+        "service_localnet": "local_socket_failure_rate",
+        "host_memory": "memory_psi",
+    }
+    assert all(
+        specs[name]["signal"]["minimum_median_z"] == 5.0
+        for name in (
+            "service_io", "service_lock", "service_localnet", "host_memory",
+        )
+    )
+
+
+def test_fault_signal_gate_uses_frozen_baseline_scale(monkeypatch):
+    import scripts.run_final_fault_matrix as runner
+
+    values = {
+        "normal": [0.70] * 10,
+        "abnormal": [0.86] * 10,
+    }
+    monkeypatch.setattr(
+        runner, "_metric_values",
+        lambda archive, _selector: (values[str(archive)], 10),
+    )
+    coordinate = "cluster::ns::service::futex_wait_time_rate"
+    requirement = {
+        "metric_name": "futex_wait_time_rate",
+        "scope": "service",
+        "service_name": "service",
+        "root_coordinate": coordinate,
+        "minimum_median_z": 5.0,
+    }
+    scale = {
+        coordinate: {"center": 0.70, "final_scale": 0.02},
+    }
+
+    result = runner.qualify_fault_signal(
+        "normal", "abnormal", requirement, scale_snapshot=scale,
+    )
+    assert result["minimum_abnormal_median"] == pytest.approx(0.80)
+    assert result["minimum_median_lift"] == pytest.approx(0.10)
+
+    values["abnormal"] = [0.79] * 10
+    with pytest.raises(runner.ExperimentError, match="too small"):
+        runner.qualify_fault_signal(
+            "normal", "abnormal", requirement, scale_snapshot=scale,
+        )
 
 
 def test_fault_phase_callback_runs_before_archive_validation(

@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -58,7 +60,10 @@ STATE_SERVICES = (
 WINDOW_WALL_BUDGET_SEC = 10
 DATA_PLANE_READY_TIMEOUT_SEC = 90
 FAULT_ACTOR_FAILSAFE_GRACE_SEC = 30
-HOST_MEMORY_PILOT_BYTES = 4 * 1024 * 1024 * 1024
+HOST_MEMORY_PILOT_BYTES = 8 * 1024 * 1024 * 1024
+HOST_MEMORY_HIGH_BYTES = 4 * 1024 * 1024 * 1024
+HOST_MEMORY_MAX_BYTES = 10 * 1024 * 1024 * 1024
+HOST_MEMORY_CGROUP_NAME = "proberca-final-host-memory"
 HOST_NIC_DELAY_MS = 20
 HOST_NIC_LOSS_PERCENT = 3.0
 SERVICE_CPU_QUOTA = "25000 100000"
@@ -70,7 +75,11 @@ SERVICE_CPU_QUOTA = "25000 100000"
 SERVICE_MEMORY_ACTOR_BYTES = 192 * 1024 * 1024
 SERVICE_MEMORY_HIGH_HEADROOM_BYTES = 32 * 1024 * 1024
 SERVICE_MEMORY_HIGH_BYTES = 224 * 1024 * 1024
-SERVICE_LOCALNET_REJECT_PROBABILITY = 0.15
+SERVICE_IO_FILE_BYTES = 256 * 1024 * 1024
+SERVICE_IO_WRITE_BYTES_PER_SEC = 8 * 1024 * 1024
+SERVICE_LOCK_THREADS = 32
+SERVICE_LOCK_HOLD_MS = 100.0
+SERVICE_LOCALNET_THREADS = 32
 
 
 LOCK_STRESS_PROGRAM = r"""
@@ -130,6 +139,16 @@ def replace_text_file(path: Path, value: str) -> tuple[str, Callable[[], None]]:
     return original, restore
 
 
+def block_device_id(path: Path) -> str:
+    """Return the cgroup-v2 major:minor identity for a real filesystem."""
+    device_number = os.stat(path.resolve()).st_dev
+    major = os.major(device_number)
+    minor = os.minor(device_number)
+    if major <= 0:
+        raise ExperimentError(f"path has no throttleable block device: {path}")
+    return f"{major}:{minor}"
+
+
 def run(
     arguments: list[str],
     *,
@@ -156,6 +175,175 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _percentile(values: list[float], quantile: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        raise ExperimentError("cannot summarize an empty signal")
+    index = int(math.floor((len(ordered) - 1) * quantile))
+    return float(ordered[index])
+
+
+def _metric_values(
+    archive_root: str | Path, selector: dict[str, Any],
+) -> tuple[list[float], int]:
+    archive = CollectionArchive.load(archive_root)
+    values: list[float] = []
+    for window in archive.iter_windows():
+        matches = [
+            record for record in window.node_metrics
+            if record.metric_name == selector["metric_name"]
+            and record.scope == selector["scope"]
+            and (
+                selector["scope"] == "node"
+                or record.service_name == selector["service_name"]
+            )
+        ]
+        if len(matches) != 1:
+            raise ExperimentError(
+                "fault signal selector is missing or ambiguous: "
+                f"{selector}"
+            )
+        record = matches[0]
+        if record.valid:
+            values.append(float(record.value))
+    return values, archive.window_count
+
+
+def _signal_summary(values: list[float]) -> dict[str, float | int]:
+    return {
+        "valid_windows": len(values),
+        "nonzero_windows": sum(value > 0.0 for value in values),
+        "median": float(statistics.median(values)),
+        "p95": _percentile(values, 0.95),
+        "maximum": max(values),
+    }
+
+
+def qualify_fault_signal(
+    normal_archive: str | Path,
+    abnormal_archive: str | Path,
+    requirement: dict[str, Any],
+    *,
+    scale_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Reject a collected trial whose declared root was not observable."""
+    normal_values, normal_windows = _metric_values(
+        normal_archive, requirement,
+    )
+    abnormal_values, abnormal_windows = _metric_values(
+        abnormal_archive, requirement,
+    )
+    minimum_fraction = float(requirement.get("minimum_valid_fraction", 0.8))
+    for phase, values, windows in (
+        ("normal", normal_values, normal_windows),
+        ("abnormal", abnormal_values, abnormal_windows),
+    ):
+        if len(values) < math.ceil(windows * minimum_fraction):
+            raise ExperimentError(
+                f"{phase} root signal has insufficient valid windows"
+            )
+    normal = _signal_summary(normal_values)
+    abnormal = _signal_summary(abnormal_values)
+    median_lift = float(abnormal["median"]) - float(normal["median"])
+    minimum_abnormal_median = float(
+        requirement.get("minimum_abnormal_median", -math.inf)
+    )
+    minimum_median_lift = float(
+        requirement.get("minimum_median_lift", -math.inf)
+    )
+    if "minimum_median_z" in requirement:
+        if scale_snapshot is None:
+            raise ExperimentError(
+                "fault signal z gate requires the frozen scale snapshot"
+            )
+        coordinate = requirement["root_coordinate"]
+        if coordinate not in scale_snapshot:
+            raise ExperimentError(
+                f"fault root is absent from frozen scale snapshot: {coordinate}"
+            )
+        scale = scale_snapshot[coordinate]
+        required_delta = (
+            float(requirement["minimum_median_z"])
+            * float(scale["final_scale"])
+        )
+        minimum_abnormal_median = max(
+            minimum_abnormal_median,
+            float(scale["center"]) + required_delta,
+        )
+        minimum_median_lift = max(
+            minimum_median_lift, required_delta,
+        )
+    if float(abnormal["median"]) < minimum_abnormal_median:
+        raise ExperimentError("declared root signal is too small")
+    if median_lift < minimum_median_lift:
+        raise ExperimentError("declared root signal has insufficient lift")
+    minimum_nonzero_fraction = float(
+        requirement.get("minimum_nonzero_fraction", 0.0)
+    )
+    if int(abnormal["nonzero_windows"]) < math.ceil(
+        abnormal_windows * minimum_nonzero_fraction
+    ):
+        raise ExperimentError(
+            "declared root signal is not sufficiently persistent"
+        )
+
+    competitors: list[dict[str, Any]] = []
+    for competitor in requirement.get("competitors", []):
+        normal_competing, _ = _metric_values(normal_archive, competitor)
+        abnormal_competing, _ = _metric_values(abnormal_archive, competitor)
+        normal_summary = (
+            _signal_summary(normal_competing) if normal_competing else None
+        )
+        abnormal_summary = (
+            _signal_summary(abnormal_competing) if abnormal_competing else None
+        )
+        competing_lift = None
+        if normal_summary is not None and abnormal_summary is not None:
+            competing_lift = (
+                float(abnormal_summary["median"])
+                - float(normal_summary["median"])
+            )
+        if "maximum_abnormal_median" in competitor and float(
+            0.0 if abnormal_summary is None else abnormal_summary["median"]
+        ) > float(competitor["maximum_abnormal_median"]):
+            raise ExperimentError(
+                f"competing {competitor['metric_name']} signal dominates"
+            )
+        if "maximum_median_lift" in competitor:
+            if competing_lift is None:
+                raise ExperimentError(
+                    f"competing {competitor['metric_name']} signal is unavailable"
+                )
+            if competing_lift > float(competitor["maximum_median_lift"]):
+                raise ExperimentError(
+                    f"competing {competitor['metric_name']} lift dominates"
+                )
+        competitors.append({
+            "selector": {
+                key: competitor[key]
+                for key in ("metric_name", "scope", "service_name")
+                if key in competitor
+            },
+            "normal": normal_summary,
+            "abnormal": abnormal_summary,
+            "median_lift": competing_lift,
+        })
+    return {
+        "accepted": True,
+        "selector": {
+            key: requirement[key]
+            for key in ("metric_name", "scope", "service_name")
+            if key in requirement
+        },
+        "normal": normal,
+        "abnormal": abnormal,
+        "median_lift": median_lift,
+        "minimum_abnormal_median": minimum_abnormal_median,
+        "minimum_median_lift": minimum_median_lift,
+        "competitors": competitors,
+    }
 
 
 def atomic_json(path: Path, payload: Any) -> None:
@@ -909,22 +1097,82 @@ class FaultContext:
         self.processes: list[subprocess.Popen] = []
         self.logs: list[Any] = []
         self.cleanups: list[Callable[[], None]] = []
+        self.post_process_cleanups: list[Callable[[], None]] = []
         self.metadata: dict[str, Any] = {}
         self._cleaned = False
 
     def add_cleanup(self, callback: Callable[[], None]) -> None:
         self.cleanups.append(callback)
 
+    def add_post_process_cleanup(
+        self, callback: Callable[[], None],
+    ) -> None:
+        self.post_process_cleanups.append(callback)
+
+    def create_host_cgroup(
+        self, name: str, controls: dict[str, str],
+    ) -> Path:
+        root = Path("/sys/fs/cgroup").resolve()
+        target = (root / name).resolve()
+        if target.parent != root or target == root:
+            raise ExperimentError("unsafe host cgroup target")
+        if target.exists():
+            raise ExperimentError(f"stale host cgroup exists: {target}")
+        target.mkdir()
+        try:
+            for control, value in controls.items():
+                path = target / control
+                if not path.is_file():
+                    raise ExperimentError(
+                        f"host cgroup control is missing: {control}"
+                    )
+                path.write_text(f"{value}\n", encoding="ascii")
+        except Exception:
+            target.rmdir()
+            raise
+
+        def cleanup() -> None:
+            if target.exists():
+                target.rmdir()
+
+        self.add_post_process_cleanup(cleanup)
+        self.metadata.setdefault("host_cgroups", []).append({
+            "controls": dict(sorted(controls.items())),
+            "path": str(target),
+        })
+        return target
+
     def write_cgroup_control(
         self, service: str, control_name: str, value: str,
     ) -> None:
-        if control_name not in {"cpu.max", "memory.high"}:
+        if control_name not in {"cpu.max", "io.max", "memory.high"}:
             raise ExperimentError("unsupported cgroup control")
         identity = service_info(service)
         path = (identity["cgroup"] / control_name).resolve()
         if not path.is_relative_to(Path("/sys/fs/cgroup")):
             raise ExperimentError("unsafe cgroup control target")
-        original, restore = replace_text_file(path, value)
+        if control_name == "io.max":
+            original = path.read_text(encoding="ascii").strip()
+            device = value.split(maxsplit=1)[0]
+            path.write_text(f"{value}\n", encoding="ascii")
+            restored = False
+
+            def restore() -> None:
+                nonlocal restored
+                if restored:
+                    return
+                path.write_text(
+                    f"{device} rbps=max wbps=max riops=max wiops=max\n",
+                    encoding="ascii",
+                )
+                for line in original.splitlines():
+                    if line.strip():
+                        path.write_text(
+                            f"{line.strip()}\n", encoding="ascii",
+                        )
+                restored = True
+        else:
+            original, restore = replace_text_file(path, value)
         self.add_cleanup(restore)
         self.metadata.setdefault("cgroup_controls", []).append({
             "control": control_name,
@@ -981,6 +1229,7 @@ class FaultContext:
         mode: str,
         *,
         service: str | None = None,
+        cgroup_path: Path | None = None,
         network_namespace: bool = False,
         duration: float,
         arguments: list[str] | None = None,
@@ -991,6 +1240,10 @@ class FaultContext:
             "--mode", mode, "--duration", str(duration),
         ]
         actor_metadata: dict[str, Any] = {"mode": mode}
+        if service is not None and cgroup_path is not None:
+            raise ExperimentError(
+                "actor cannot use both service and explicit cgroup"
+            )
         if service:
             identity = service_info(service)
             command.extend(["--cgroup", str(identity["cgroup"])])
@@ -1003,6 +1256,12 @@ class FaultContext:
                     "nsenter", "-t", str(identity["pid"]), "-n",
                     *command,
                 ]
+        elif cgroup_path is not None:
+            resolved_cgroup = cgroup_path.resolve()
+            if not resolved_cgroup.is_relative_to(Path("/sys/fs/cgroup")):
+                raise ExperimentError("unsafe explicit actor cgroup")
+            command.extend(["--cgroup", str(resolved_cgroup)])
+            actor_metadata["cgroup"] = str(resolved_cgroup)
         command.extend(arguments or [])
         actor_name = name or mode
         log = (self.experiment_root / f"{actor_name}.log").open(
@@ -1064,6 +1323,11 @@ class FaultContext:
                 process.wait(timeout=3)
         for log in self.logs:
             log.close()
+        for callback in reversed(self.post_process_cleanups):
+            try:
+                callback()
+            except Exception as error:
+                errors.append(str(error))
         if errors:
             raise ExperimentError("; ".join(errors))
 
@@ -1123,65 +1387,111 @@ def service_cpu(context: FaultContext, _windows: int) -> None:
     time.sleep(2)
 
 
-def service_lock(context: FaultContext, windows: int) -> None:
-    # Drive the actual CartService RPC path with shared-key concurrency.  The
-    # old standalone futex actor contended only with its own threads and could
-    # not causally block the application.
-    target_service = "cartservice"
-    workers = 24
+def service_io(context: FaultContext, windows: int) -> None:
+    # Throttle the target's real block device so the actor waits on I/O rather
+    # than consuming a full CPU and being diagnosed as CPU throttling.
+    target_service = "redis-cart"
+    path = Path("/var/tmp/proberca-final-service-io.bin")
+    device = block_device_id(path.parent)
+    context.write_cgroup_control(
+        target_service,
+        "io.max",
+        f"{device} wbps={SERVICE_IO_WRITE_BYTES_PER_SEC}",
+    )
+    # The fault mechanism is I/O wait; remove the target's normal CPU quota
+    # for this bounded phase so quota pressure cannot become the dominant root.
+    context.write_cgroup_control(target_service, "cpu.max", "max 100000")
     context.metadata.update({
         "target_service": target_service,
-        "workers": workers,
-        "workload_semantics": "shared-cart real RPC contention",
+        "block_device": device,
+        "write_bytes_per_sec": SERVICE_IO_WRITE_BYTES_PER_SEC,
+        "intervention_profile": "service-io-throttled-direct-v1",
     })
-    context.start_kubernetes_actor(
-        workload="proberca-healthy-rpc-load",
-        container="rpc-load",
+    context.start_actor(
+        "io",
+        service=target_service,
         duration=windows + FAULT_ACTOR_FAILSAFE_GRACE_SEC,
-        program=LOCK_STRESS_PROGRAM,
-        arguments=[str(workers)],
-        name="service-lock-rpc",
+        arguments=[
+            "--file", str(path),
+            "--bytes", str(SERVICE_IO_FILE_BYTES),
+            "--direct",
+        ],
+        name="service-io",
     )
 
 
-def service_localnet(context: FaultContext, _windows: int) -> None:
-    # A LocalNet experiment must affect the service's real socket operations.
-    # Apply the same label-independent failure mechanism to all formal egress
-    # destinations; a single destination remains the separate TCP-edge case.
-    target_service = "frontend"
-    source = service_info(target_service)
-    destinations = [
-        service_info(service)["pod_ip"]
-        for service in formal_service_names()
-        if service != target_service
-    ]
-    rules = []
-    for destination in sorted(set(destinations)):
-        rule = [
-            "-I", "FORWARD", "1",
-            "-s", source["pod_ip"], "-d", destination,
-            "-p", "tcp",
-            "-m", "statistic", "--mode", "random",
-            "--probability", str(SERVICE_LOCALNET_REJECT_PROBABILITY),
-            "-m", "comment", "--comment",
-            "proberca-final-service-localnet",
-            "-j", "REJECT", "--reject-with", "tcp-reset",
-        ]
-        add_iptables_rule(rule)
-        rules.append(["-D", "FORWARD", *rule[3:]])
-
-    def cleanup() -> None:
-        for rule in rules:
-            node_command(["iptables", *rule], check=False)
-
-    context.add_cleanup(cleanup)
+def service_lock(context: FaultContext, windows: int) -> None:
+    # Attribute real futex contention to the target service cgroup.  External
+    # RPC concurrency did not raise the formal futex root coordinate and is
+    # therefore not a valid Lock intervention for this contract.
+    target_service = "cartservice"
     context.metadata.update({
-        "destination_count": len(rules),
-        "probability": SERVICE_LOCALNET_REJECT_PROBABILITY,
-        "scope": "all formal service egress",
         "target_service": target_service,
+        "threads": SERVICE_LOCK_THREADS,
+        "hold_ms": SERVICE_LOCK_HOLD_MS,
+        "intervention_profile": "service-cgroup-futex-v1",
     })
-    time.sleep(5)
+    context.start_actor(
+        "futex",
+        service=target_service,
+        duration=windows + FAULT_ACTOR_FAILSAFE_GRACE_SEC,
+        arguments=[
+            "--threads", str(SERVICE_LOCK_THREADS),
+            "--hold-ms", str(SERVICE_LOCK_HOLD_MS),
+        ],
+        name="service-lock-futex",
+    )
+
+
+def host_memory(context: FaultContext, windows: int) -> None:
+    # Keep the actor below a hard maximum while putting its working set above
+    # memory.high. Continuous page access forces real reclaim stalls and a
+    # measurable host memory PSI signal without consuming Pod memory limits.
+    cgroup = context.create_host_cgroup(
+        HOST_MEMORY_CGROUP_NAME,
+        {
+            "memory.high": str(HOST_MEMORY_HIGH_BYTES),
+            "memory.max": str(HOST_MEMORY_MAX_BYTES),
+        },
+    )
+    context.metadata.update({
+        "bytes_touched": HOST_MEMORY_PILOT_BYTES,
+        "memory_high_bytes": HOST_MEMORY_HIGH_BYTES,
+        "memory_max_bytes": HOST_MEMORY_MAX_BYTES,
+        "intervention_profile": "host-memory-reclaim-v1",
+    })
+    context.start_actor(
+        "memory",
+        service=None,
+        cgroup_path=cgroup,
+        duration=windows + FAULT_ACTOR_FAILSAFE_GRACE_SEC,
+        arguments=[
+            "--bytes", str(HOST_MEMORY_PILOT_BYTES),
+            "--churn",
+            "--bulk-fill",
+        ],
+        name="host-memory",
+    )
+
+
+def service_localnet(context: FaultContext, windows: int) -> None:
+    # A LocalNet root is a failure of socket operations owned by one service,
+    # not a collection of directed TCP-edge failures.  Run the generic socket
+    # backlog actor in both the target cgroup and network namespace.
+    target_service = "frontend"
+    context.metadata.update({
+        "target_service": target_service,
+        "threads": SERVICE_LOCALNET_THREADS,
+        "intervention_profile": "service-cgroup-local-socket-v1",
+    })
+    context.start_actor(
+        "localnet",
+        service=target_service,
+        network_namespace=True,
+        duration=windows + FAULT_ACTOR_FAILSAFE_GRACE_SEC,
+        arguments=["--threads", str(SERVICE_LOCALNET_THREADS)],
+        name="service-localnet-socket",
+    )
 
 
 def host_nic(context: FaultContext, _windows: int) -> None:
@@ -1352,14 +1662,30 @@ def experiment_specs() -> list[dict[str, Any]]:
             "fault_type": "service_io",
             "root_scope": "service",
             "root_category": "IO",
-            "activate": actor_fault(
-                "io", service="redis-cart",
-                arguments=[
-                    "--file", "/var/tmp/proberca-final-service-io.bin",
-                    "--bytes", str(64 * 1024 * 1024),
-                    "--direct",
+            "activate": service_io,
+            "signal": {
+                "metric_name": "io_psi",
+                "scope": "service",
+                "service_name": "redis-cart",
+                "root_coordinate": (
+                    "kind-proberca-ob::online-boutique::redis-cart::io_psi"
+                ),
+                "minimum_median_z": 5.0,
+                "competitors": [
+                    {
+                        "metric_name": "cpu_throttle_ratio",
+                        "scope": "service",
+                        "service_name": "redis-cart",
+                        "maximum_abnormal_median": 0.10,
+                    },
+                    {
+                        "metric_name": "cpu_usage_rate",
+                        "scope": "service",
+                        "service_name": "redis-cart",
+                        "maximum_median_lift": 0.40,
+                    },
                 ],
-            ),
+            },
             "temporary_files": ["/var/tmp/proberca-final-service-io.bin"],
         },
         {
@@ -1367,12 +1693,33 @@ def experiment_specs() -> list[dict[str, Any]]:
             "root_scope": "service",
             "root_category": "Lock",
             "activate": service_lock,
+            "signal": {
+                "metric_name": "futex_wait_time_rate",
+                "scope": "service",
+                "service_name": "cartservice",
+                "root_coordinate": (
+                    "kind-proberca-ob::online-boutique::cartservice::"
+                    "futex_wait_time_rate"
+                ),
+                "minimum_median_z": 5.0,
+            },
         },
         {
             "fault_type": "service_localnet",
             "root_scope": "service",
             "root_category": "LocalNet",
             "activate": service_localnet,
+            "signal": {
+                "metric_name": "local_socket_failure_rate",
+                "scope": "service",
+                "service_name": "frontend",
+                "root_coordinate": (
+                    "kind-proberca-ob::online-boutique::frontend::"
+                    "local_socket_failure_rate"
+                ),
+                "minimum_median_z": 5.0,
+                "minimum_nonzero_fraction": 0.5,
+            },
         },
         {
             "fault_type": "host_cpu",
@@ -1386,13 +1733,17 @@ def experiment_specs() -> list[dict[str, Any]]:
             "fault_type": "host_memory",
             "root_scope": "host",
             "root_category": "Memory",
-            "activate": actor_fault(
-                "memory", service=None,
-                # Six GiB still caused probe-driven container restarts on the
-                # frozen 16-GiB VM, changing runtime identity instead of
-                # producing a stable host-memory-pressure interval.
-                arguments=["--bytes", str(HOST_MEMORY_PILOT_BYTES)],
-            ),
+            "activate": host_memory,
+            "signal": {
+                "metric_name": "memory_psi",
+                "scope": "node",
+                "root_coordinate": (
+                    "kind-proberca-ob::host::proberca-ob-control-plane::"
+                    "memory_psi"
+                ),
+                "minimum_median_z": 5.0,
+                "minimum_nonzero_fraction": 0.5,
+            },
         },
         {
             "fault_type": "host_io",
@@ -1696,6 +2047,13 @@ def main() -> int:
                 arguments.abnormal_windows,
                 on_capture_complete=deactivate_after_capture,
             )
+            if spec.get("signal") is not None:
+                record["signal_qualification"] = qualify_fault_signal(
+                    record["normal"]["normal_archive"],
+                    record["abnormal"]["normal_archive"],
+                    spec["signal"],
+                    scale_snapshot=readiness["scale_snapshot"],
+                )
             if (
                 record["normal"]["topology_fingerprint"]
                 != record["abnormal"]["topology_fingerprint"]

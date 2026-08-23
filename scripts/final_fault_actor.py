@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import mmap
 import os
@@ -44,11 +45,31 @@ def wait_until(deadline: float) -> None:
         STOP.wait(min(0.25, max(0.0, deadline - time.monotonic())))
 
 
-def memory_actor(byte_count: int, deadline: float) -> None:
+def memory_actor(
+    byte_count: int,
+    deadline: float,
+    *,
+    churn: bool = False,
+    bulk_fill: bool = False,
+) -> None:
     region = mmap.mmap(-1, byte_count)
-    for offset in range(0, byte_count, 4096):
-        region[offset:offset + 1] = b"x"
-        if STOP.is_set():
+    pass_index = 0
+    while not STOP.is_set() and time.monotonic() < deadline:
+        if bulk_fill:
+            # libc performs the page faults in native code.  The ordinary
+            # per-page loop remains the default for service-memory trials;
+            # host-memory pressure needs to establish its working set before
+            # most of a short fault window has elapsed.
+            address = ctypes.addressof(ctypes.c_char.from_buffer(region))
+            ctypes.memset(address, pass_index & 0xFF, byte_count)
+        else:
+            for offset in range(0, byte_count, 4096):
+                region[offset] = (pass_index + offset) & 0xFF
+                if STOP.is_set() or time.monotonic() >= deadline:
+                    break
+        pass_index += 1
+        increment("memory_scan_passes")
+        if not churn:
             break
     increment("bytes_touched", byte_count)
     wait_until(deadline)
@@ -207,6 +228,8 @@ def main() -> int:
     parser.add_argument("--duration", type=float, required=True)
     parser.add_argument("--cgroup")
     parser.add_argument("--bytes", type=int, default=64 * 1024 * 1024)
+    parser.add_argument("--churn", action="store_true")
+    parser.add_argument("--bulk-fill", action="store_true")
     parser.add_argument("--file", type=Path)
     parser.add_argument("--direct", action="store_true")
     parser.add_argument("--threads", type=int, default=16)
@@ -234,7 +257,12 @@ def main() -> int:
     }, sort_keys=True), flush=True)
     try:
         if arguments.mode == "memory":
-            memory_actor(arguments.bytes, deadline)
+            memory_actor(
+                arguments.bytes,
+                deadline,
+                churn=arguments.churn,
+                bulk_fill=arguments.bulk_fill,
+            )
         elif arguments.mode == "io":
             if arguments.file is None:
                 raise RuntimeError("io actor requires --file")
