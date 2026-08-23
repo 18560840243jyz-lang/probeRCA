@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -3922,9 +3923,50 @@ def test_host_memory_fault_uses_bounded_reclaim_cgroup_and_churn():
     )
     assert "--churn" in actors[0][1]["arguments"]
     assert "--bulk-fill" in actors[0][1]["arguments"]
+    assert actors[0][1]["arguments"][-2:] == [
+        "--ready-after-bytes", str(runner.HOST_MEMORY_READY_BYTES),
+    ]
+    assert runner.HOST_MEMORY_HIGH_BYTES \
+        < runner.HOST_MEMORY_READY_BYTES \
+        < runner.HOST_MEMORY_PILOT_BYTES
     assert actors[0][1]["ready_event"] == "memory_working_set_ready"
     assert Context.metadata["intervention_profile"] \
-        == "host-memory-reclaim-v2"
+        == "host-memory-reclaim-v3"
+
+
+def test_memory_actor_reports_readiness_after_real_chunk_threshold(
+    monkeypatch,
+):
+    import scripts.final_fault_actor as actor
+
+    actor.STOP.clear()
+    actor.COUNTERS.clear()
+    monkeypatch.setattr(actor, "MEMORY_BULK_FILL_CHUNK_BYTES", 4096)
+    real_memset = actor.ctypes.memset
+    fills = []
+    ready_after_fill = []
+
+    def counted_memset(address, value, length):
+        fills.append(length)
+        return real_memset(address, value, length)
+
+    monkeypatch.setattr(actor.ctypes, "memset", counted_memset)
+    actor.memory_actor(
+        3 * 4096,
+        time.monotonic() + 0.02,
+        bulk_fill=True,
+        ready_after_bytes=2 * 4096,
+        ready_callback=lambda: ready_after_fill.append(len(fills)),
+    )
+
+    assert fills == [4096, 4096, 4096]
+    assert ready_after_fill == [2]
+    with pytest.raises(ValueError, match="readiness threshold"):
+        actor.memory_actor(
+            4096,
+            time.monotonic(),
+            ready_after_bytes=8192,
+        )
 
 
 def test_fault_signal_qualification_accepts_root_and_rejects_competitor(

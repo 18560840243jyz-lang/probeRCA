@@ -19,6 +19,7 @@ from pathlib import Path
 
 STOP = threading.Event()
 COUNTERS: dict[str, int] = {}
+MEMORY_BULK_FILL_CHUNK_BYTES = 64 * 1024 * 1024
 
 
 def increment(name: str, value: int = 1) -> None:
@@ -51,27 +52,64 @@ def memory_actor(
     *,
     churn: bool = False,
     bulk_fill: bool = False,
+    ready_after_bytes: int | None = None,
     ready_callback=None,
 ) -> None:
+    if byte_count <= 0:
+        raise ValueError("memory byte count must be positive")
+    ready_threshold = byte_count if ready_after_bytes is None \
+        else int(ready_after_bytes)
+    if ready_threshold <= 0 or ready_threshold > byte_count:
+        raise ValueError("memory readiness threshold is outside the working set")
     region = mmap.mmap(-1, byte_count)
     pass_index = 0
+    ready_emitted = False
     while not STOP.is_set() and time.monotonic() < deadline:
         if bulk_fill:
             # libc performs the page faults in native code.  The ordinary
             # per-page loop remains the default for service-memory trials;
-            # host-memory pressure needs to establish its working set before
-            # most of a short fault window has elapsed.
+            # host-memory pressure is filled in bounded chunks so readiness can
+            # be reported after a real pressure boundary is crossed, without
+            # pretending that the full working set was established instantly.
             address = ctypes.addressof(ctypes.c_char.from_buffer(region))
-            ctypes.memset(address, pass_index & 0xFF, byte_count)
+            touched = 0
+            while touched < byte_count:
+                length = min(
+                    MEMORY_BULK_FILL_CHUNK_BYTES, byte_count - touched,
+                )
+                ctypes.memset(
+                    address + touched, pass_index & 0xFF, length,
+                )
+                touched += length
+                if (
+                    not ready_emitted
+                    and touched >= ready_threshold
+                    and ready_callback is not None
+                ):
+                    ready_callback()
+                    ready_emitted = True
+                if STOP.is_set() or time.monotonic() >= deadline:
+                    break
         else:
+            touched = 0
             for offset in range(0, byte_count, 4096):
                 region[offset] = (pass_index + offset) & 0xFF
+                touched = min(byte_count, offset + 4096)
+                if (
+                    not ready_emitted
+                    and touched >= ready_threshold
+                    and ready_callback is not None
+                ):
+                    ready_callback()
+                    ready_emitted = True
                 if STOP.is_set() or time.monotonic() >= deadline:
                     break
         pass_index += 1
         increment("memory_scan_passes")
-        if pass_index == 1 and ready_callback is not None:
+        if not ready_emitted and touched >= byte_count \
+                and ready_callback is not None:
             ready_callback()
+            ready_emitted = True
         if not churn:
             break
     increment("bytes_touched", byte_count)
@@ -233,6 +271,7 @@ def main() -> int:
     parser.add_argument("--bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--churn", action="store_true")
     parser.add_argument("--bulk-fill", action="store_true")
+    parser.add_argument("--ready-after-bytes", type=int)
     parser.add_argument("--file", type=Path)
     parser.add_argument("--direct", action="store_true")
     parser.add_argument("--threads", type=int, default=16)
@@ -265,6 +304,7 @@ def main() -> int:
                 deadline,
                 churn=arguments.churn,
                 bulk_fill=arguments.bulk_fill,
+                ready_after_bytes=arguments.ready_after_bytes,
                 ready_callback=lambda: print(json.dumps({
                     "event": "memory_working_set_ready",
                     "timestamp_ns": time.time_ns(),

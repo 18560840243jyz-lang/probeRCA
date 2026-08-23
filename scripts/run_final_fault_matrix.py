@@ -63,6 +63,7 @@ FAULT_ACTOR_FAILSAFE_GRACE_SEC = 30
 HOST_MEMORY_PILOT_BYTES = 4 * 1024 * 1024 * 1024
 HOST_MEMORY_HIGH_BYTES = 2 * 1024 * 1024 * 1024
 HOST_MEMORY_MAX_BYTES = 6 * 1024 * 1024 * 1024
+HOST_MEMORY_READY_BYTES = HOST_MEMORY_HIGH_BYTES + 64 * 1024 * 1024
 HOST_MEMORY_CGROUP_NAME = "proberca-final-host-memory"
 HOST_NIC_DELAY_MS = 20
 HOST_NIC_LOSS_PERCENT = 3.0
@@ -1483,7 +1484,8 @@ def host_memory(context: FaultContext, windows: int) -> None:
         "bytes_touched": HOST_MEMORY_PILOT_BYTES,
         "memory_high_bytes": HOST_MEMORY_HIGH_BYTES,
         "memory_max_bytes": HOST_MEMORY_MAX_BYTES,
-        "intervention_profile": "host-memory-reclaim-v2",
+        "memory_ready_bytes": HOST_MEMORY_READY_BYTES,
+        "intervention_profile": "host-memory-reclaim-v3",
     })
     context.start_actor(
         "memory",
@@ -1494,6 +1496,7 @@ def host_memory(context: FaultContext, windows: int) -> None:
             "--bytes", str(HOST_MEMORY_PILOT_BYTES),
             "--churn",
             "--bulk-fill",
+            "--ready-after-bytes", str(HOST_MEMORY_READY_BYTES),
         ],
         name="host-memory",
         ready_event="memory_working_set_ready",
