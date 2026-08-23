@@ -60,9 +60,9 @@ STATE_SERVICES = (
 WINDOW_WALL_BUDGET_SEC = 10
 DATA_PLANE_READY_TIMEOUT_SEC = 90
 FAULT_ACTOR_FAILSAFE_GRACE_SEC = 30
-HOST_MEMORY_PILOT_BYTES = 4 * 1024 * 1024 * 1024
-HOST_MEMORY_HIGH_BYTES = 2 * 1024 * 1024 * 1024
-HOST_MEMORY_MAX_BYTES = 6 * 1024 * 1024 * 1024
+HOST_MEMORY_PILOT_BYTES = 3 * 1024 * 1024 * 1024
+HOST_MEMORY_HIGH_BYTES = 1 * 1024 * 1024 * 1024
+HOST_MEMORY_MAX_BYTES = 4 * 1024 * 1024 * 1024
 HOST_MEMORY_READY_BYTES = HOST_MEMORY_HIGH_BYTES + 64 * 1024 * 1024
 HOST_MEMORY_CGROUP_NAME = "proberca-final-host-memory"
 HOST_NIC_DELAY_MS = 20
@@ -1485,7 +1485,7 @@ def host_memory(context: FaultContext, windows: int) -> None:
         "memory_high_bytes": HOST_MEMORY_HIGH_BYTES,
         "memory_max_bytes": HOST_MEMORY_MAX_BYTES,
         "memory_ready_bytes": HOST_MEMORY_READY_BYTES,
-        "intervention_profile": "host-memory-reclaim-v3",
+        "intervention_profile": "host-memory-reclaim-v4",
     })
     context.start_actor(
         "memory",

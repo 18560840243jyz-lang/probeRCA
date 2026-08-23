@@ -3929,9 +3929,12 @@ def test_host_memory_fault_uses_bounded_reclaim_cgroup_and_churn():
     assert runner.HOST_MEMORY_HIGH_BYTES \
         < runner.HOST_MEMORY_READY_BYTES \
         < runner.HOST_MEMORY_PILOT_BYTES
+    assert runner.HOST_MEMORY_PILOT_BYTES == 3 * 1024 * 1024 * 1024
+    assert runner.HOST_MEMORY_HIGH_BYTES == 1024 * 1024 * 1024
+    assert runner.HOST_MEMORY_MAX_BYTES == 4 * 1024 * 1024 * 1024
     assert actors[0][1]["ready_event"] == "memory_working_set_ready"
     assert Context.metadata["intervention_profile"] \
-        == "host-memory-reclaim-v3"
+        == "host-memory-reclaim-v4"
 
 
 def test_memory_actor_reports_readiness_after_real_chunk_threshold(
@@ -3944,6 +3947,7 @@ def test_memory_actor_reports_readiness_after_real_chunk_threshold(
     monkeypatch.setattr(actor, "MEMORY_BULK_FILL_CHUNK_BYTES", 4096)
     real_memset = actor.ctypes.memset
     fills = []
+    progress = []
     ready_after_fill = []
 
     def counted_memset(address, value, length):
@@ -3957,10 +3961,19 @@ def test_memory_actor_reports_readiness_after_real_chunk_threshold(
         bulk_fill=True,
         ready_after_bytes=2 * 4096,
         ready_callback=lambda: ready_after_fill.append(len(fills)),
+        progress_callback=lambda touched, total: progress.append(
+            (touched, total)
+        ),
     )
 
     assert fills == [4096, 4096, 4096]
     assert ready_after_fill == [2]
+    assert progress == [
+        (4096, 3 * 4096),
+        (2 * 4096, 3 * 4096),
+        (3 * 4096, 3 * 4096),
+    ]
+    assert actor.COUNTERS["bytes_touched"] == 3 * 4096
     with pytest.raises(ValueError, match="readiness threshold"):
         actor.memory_actor(
             4096,

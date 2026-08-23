@@ -54,6 +54,7 @@ def memory_actor(
     bulk_fill: bool = False,
     ready_after_bytes: int | None = None,
     ready_callback=None,
+    progress_callback=None,
 ) -> None:
     if byte_count <= 0:
         raise ValueError("memory byte count must be positive")
@@ -64,6 +65,7 @@ def memory_actor(
     region = mmap.mmap(-1, byte_count)
     pass_index = 0
     ready_emitted = False
+    maximum_touched = 0
     while not STOP.is_set() and time.monotonic() < deadline:
         if bulk_fill:
             # libc performs the page faults in native code.  The ordinary
@@ -81,6 +83,9 @@ def memory_actor(
                     address + touched, pass_index & 0xFF, length,
                 )
                 touched += length
+                maximum_touched = max(maximum_touched, touched)
+                if progress_callback is not None:
+                    progress_callback(touched, byte_count)
                 if (
                     not ready_emitted
                     and touched >= ready_threshold
@@ -95,6 +100,7 @@ def memory_actor(
             for offset in range(0, byte_count, 4096):
                 region[offset] = (pass_index + offset) & 0xFF
                 touched = min(byte_count, offset + 4096)
+                maximum_touched = max(maximum_touched, touched)
                 if (
                     not ready_emitted
                     and touched >= ready_threshold
@@ -112,7 +118,7 @@ def memory_actor(
             ready_emitted = True
         if not churn:
             break
-    increment("bytes_touched", byte_count)
+    increment("bytes_touched", maximum_touched)
     wait_until(deadline)
     region.close()
 
@@ -308,6 +314,12 @@ def main() -> int:
                 ready_callback=lambda: print(json.dumps({
                     "event": "memory_working_set_ready",
                     "timestamp_ns": time.time_ns(),
+                }, sort_keys=True), flush=True),
+                progress_callback=lambda touched, total: print(json.dumps({
+                    "event": "memory_touch_progress",
+                    "timestamp_ns": time.time_ns(),
+                    "touched_bytes": touched,
+                    "total_bytes": total,
                 }, sort_keys=True), flush=True),
             )
         elif arguments.mode == "io":
