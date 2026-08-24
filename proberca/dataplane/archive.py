@@ -24,6 +24,9 @@ from .contracts import (
 MANIFEST_NAME = "collection-manifest.json"
 WINDOWS_NAME = "collected-windows.jsonl"
 COLLECTION_ARCHIVE_SCHEMA_VERSION = "probeRCA-dataplane-archive-v3"
+PROJECTED_COLLECTION_ARCHIVE_SCHEMA_VERSION = (
+    "probeRCA-dataplane-archive-v4"
+)
 LEGACY_COLLECTION_ARCHIVE_SCHEMA_VERSION = "probeRCA-dataplane-archive-v2"
 
 
@@ -72,6 +75,11 @@ _WINDOW_METADATA_FIELDS = frozenset({
     "burst_config_fingerprint",
 })
 _HEX = frozenset("0123456789abcdef")
+_PROJECTION_FIELDS = frozenset({
+    "schema_version", "owner", "node_name", "service_entity_ids",
+    "tcp_edge_entity_ids", "formal_service_entity_ids",
+    "topology_tcp_edge_entity_ids", "projection_fingerprint",
+})
 _FINAL_AGGREGATIONS = frozenset({
     "counter_delta_then_cross_series_sum_rate",
     "counter_delta_then_cross_series_sum_ratio",
@@ -86,6 +94,43 @@ def _require_sha256(name: str, value: Any) -> None:
     if not isinstance(value, str) or len(value) != 64 \
             or any(character not in _HEX for character in value):
         raise CollectionArchiveError(f"{name} must be an opaque lowercase SHA-256")
+
+
+def _validate_worker_projection(projection: dict[str, Any]) -> None:
+    if not isinstance(projection, dict) or set(projection) != _PROJECTION_FIELDS:
+        raise CollectionArchiveError("worker projection fields mismatch")
+    if projection["schema_version"] != "probeRCA-worker-projection-v1":
+        raise CollectionArchiveError("unsupported worker projection schema")
+    for field_name in ("owner", "node_name"):
+        if not isinstance(projection[field_name], str) or not projection[field_name]:
+            raise CollectionArchiveError(
+                f"worker projection {field_name} is required"
+            )
+    for field_name in (
+        "service_entity_ids", "tcp_edge_entity_ids",
+        "formal_service_entity_ids", "topology_tcp_edge_entity_ids",
+    ):
+        values = projection[field_name]
+        if not isinstance(values, list) \
+                or values != sorted(set(values)):
+            raise CollectionArchiveError(
+                f"worker projection {field_name} must be sorted and unique"
+            )
+    if not projection["service_entity_ids"] \
+            or not projection["formal_service_entity_ids"] \
+            or not projection["topology_tcp_edge_entity_ids"]:
+        raise CollectionArchiveError("worker projection scope is incomplete")
+    if not set(projection["service_entity_ids"]) <= set(
+        projection["formal_service_entity_ids"]
+    ) or not set(projection["tcp_edge_entity_ids"]) <= set(
+        projection["topology_tcp_edge_entity_ids"]
+    ):
+        raise CollectionArchiveError("worker projection exceeds formal scope")
+    unsigned = dict(projection)
+    supplied = unsigned.pop("projection_fingerprint")
+    _require_sha256("worker projection fingerprint", supplied)
+    if supplied != fingerprint(unsigned):
+        raise CollectionArchiveError("worker projection fingerprint mismatch")
 
 
 def _validate_collection_contract(contract: dict[str, Any]) -> None:
@@ -513,6 +558,63 @@ def _validate_topology_snapshot_coverage(
             )
 
 
+def _validate_worker_projection_coverage(
+    window: CollectedWindow, snapshot, projection: dict[str, Any],
+) -> None:
+    expected_services = set(projection["service_entity_ids"])
+    expected_hosts = {
+        f"{snapshot.cluster_id}::host::{projection['node_name']}"
+    }
+    expected_edges = set(projection["tcp_edge_entity_ids"])
+    if set(projection["formal_service_entity_ids"]) != {
+        f"{snapshot.cluster_id}::{item}" for item in snapshot.services
+    }:
+        raise CollectionArchiveError(
+            "worker projection formal services disagree with topology"
+        )
+    topology_edges = set()
+    for edge in snapshot.call_edges:
+        if edge.relation_type != "call" or (edge.protocol or "tcp") != "tcp":
+            continue
+        source = _topology_endpoint(
+            snapshot, edge.src_namespace, edge.src_service,
+        )
+        _topology_endpoint(snapshot, edge.dst_namespace, edge.dst_service)
+        namespace = edge.src_namespace or source.split("::", 2)[1]
+        topology_edges.add(
+            f"{snapshot.cluster_id}::{namespace}::"
+            f"{edge.src_service}->{edge.dst_service}::tcp"
+        )
+    if topology_edges != set(projection["topology_tcp_edge_entity_ids"]):
+        raise CollectionArchiveError(
+            "worker projection global TCP scope disagrees with topology"
+        )
+    observed_services = {
+        f"{item.cluster_id}::{item.namespace}::{item.service_name}"
+        for item in window.node_metrics if item.scope == "service"
+    }
+    observed_hosts = {
+        f"{item.cluster_id}::host::{item.node_name}"
+        for item in window.node_metrics if item.scope == "node"
+    }
+    observed_edges = {
+        f"{item.cluster_id}::{item.namespace}::"
+        f"{item.src_service}->{item.dst_service}::{item.protocol}"
+        for item in window.edge_metrics if item.protocol == "tcp"
+    }
+    for name, expected, observed in (
+        ("service", expected_services, observed_services),
+        ("host", expected_hosts, observed_hosts),
+        ("directed edge", expected_edges, observed_edges),
+    ):
+        if expected != observed:
+            raise CollectionArchiveError(
+                f"worker projection {name} metric coverage mismatch; "
+                f"missing={sorted(expected - observed) or '-'}; "
+                f"extra={sorted(observed - expected) or '-'}"
+            )
+
+
 def _validate_topology_snapshot(snapshot) -> None:
     _require_sha256("topology snapshot_id", snapshot.snapshot_id)
     _require_sha256(
@@ -652,6 +754,7 @@ class CollectionArchive:
     created_at_ns: int
     sealed: bool
     manifest_fingerprint: str
+    projection: dict[str, Any] | None
     root: Path
 
     @classmethod
@@ -666,7 +769,11 @@ class CollectionArchive:
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise CollectionArchiveIntegrityError("cannot read collection manifest") from error
+        schema_version = payload.get("schema_version") \
+            if isinstance(payload, dict) else None
         expected = set(cls.__dataclass_fields__) - {"root"}
+        if schema_version != PROJECTED_COLLECTION_ARCHIVE_SCHEMA_VERSION:
+            expected.remove("projection")
         if not isinstance(payload, dict) or set(payload) != expected:
             raise CollectionArchiveIntegrityError("collection manifest fields mismatch")
         supplied = payload.pop("manifest_fingerprint")
@@ -676,6 +783,8 @@ class CollectionArchive:
         if not isinstance(namespaces, list):
             raise CollectionArchiveIntegrityError("collection namespaces must be a list")
         payload["namespaces"] = tuple(namespaces)
+        if schema_version != PROJECTED_COLLECTION_ARCHIVE_SCHEMA_VERSION:
+            payload["projection"] = None
         archive = cls(**payload, manifest_fingerprint=supplied, root=directory)
         archive.validate()
         return archive
@@ -683,6 +792,7 @@ class CollectionArchive:
     def validate(self) -> None:
         if self.schema_version not in {
             COLLECTION_ARCHIVE_SCHEMA_VERSION,
+            PROJECTED_COLLECTION_ARCHIVE_SCHEMA_VERSION,
             LEGACY_COLLECTION_ARCHIVE_SCHEMA_VERSION,
         }:
             raise CollectionArchiveError("unsupported collection archive schema")
@@ -720,6 +830,12 @@ class CollectionArchive:
                 or self.collection_metadata["burst_config_fingerprint"] \
                 != self.collection_contract["burst_config_fingerprint"]:
             raise CollectionArchiveError("archive collection configuration mismatch")
+        if self.schema_version == PROJECTED_COLLECTION_ARCHIVE_SCHEMA_VERSION:
+            _validate_worker_projection(self.projection)
+        elif self.projection is not None:
+            raise CollectionArchiveError(
+                "non-projected archive contains a worker projection"
+            )
 
     def iter_windows(self) -> Iterator[CollectedWindow]:
         previous_sequence = 0
@@ -742,7 +858,10 @@ class CollectionArchive:
                     ) from error
                 expected_window_schema = (
                     COLLECTED_WINDOW_SCHEMA_VERSION
-                    if self.schema_version == COLLECTION_ARCHIVE_SCHEMA_VERSION
+                    if self.schema_version in {
+                        COLLECTION_ARCHIVE_SCHEMA_VERSION,
+                        PROJECTED_COLLECTION_ARCHIVE_SCHEMA_VERSION,
+                    }
                     else LEGACY_COLLECTED_WINDOW_SCHEMA_VERSION
                 )
                 if window.schema_version != expected_window_schema:
@@ -765,9 +884,14 @@ class CollectionArchive:
                 active_topology = topology_tracker.active_for(
                     window, additions,
                 )
-                _validate_topology_snapshot_coverage(
-                    window, active_topology, self.collection_contract,
-                )
+                if self.projection is None:
+                    _validate_topology_snapshot_coverage(
+                        window, active_topology, self.collection_contract,
+                    )
+                else:
+                    _validate_worker_projection_coverage(
+                        window, active_topology, self.projection,
+                    )
                 topology_tracker.commit(additions)
                 current_normal = {
                     *window.residual_source_record_ids,
@@ -802,6 +926,7 @@ class CollectionArchiveWriter:
         collection_contract: dict[str, Any],
         source_description: str,
         collection_metadata: dict[str, Any] | None = None,
+        projection: dict[str, Any] | None = None,
         clock_ns=time.time_ns,
     ) -> None:
         self.root = Path(root).resolve()
@@ -809,6 +934,7 @@ class CollectionArchiveWriter:
         self.collection_contract = dict(collection_contract)
         self.source_description = source_description
         self.collection_metadata = dict(collection_metadata or {})
+        self.projection = dict(projection) if projection is not None else None
         self.clock_ns = clock_ns
         self._count = 0
         self._first: CollectedWindow | None = None
@@ -836,6 +962,8 @@ class CollectionArchiveWriter:
                 or self.collection_metadata["burst_config_fingerprint"] \
                 != self.collection_contract["burst_config_fingerprint"]:
             raise CollectionArchiveError("archive collection configuration mismatch")
+        if self.projection is not None:
+            _validate_worker_projection(self.projection)
         self.root.mkdir(parents=True, exist_ok=False)
         self.windows_path = self.root / WINDOWS_NAME
         self._handle = self.windows_path.open(
@@ -873,9 +1001,14 @@ class CollectionArchiveWriter:
         active_topology = self._topology_tracker.active_for(
             window, topology_additions,
         )
-        _validate_topology_snapshot_coverage(
-            window, active_topology, self.collection_contract,
-        )
+        if self.projection is None:
+            _validate_topology_snapshot_coverage(
+                window, active_topology, self.collection_contract,
+            )
+        else:
+            _validate_worker_projection_coverage(
+                window, active_topology, self.projection,
+            )
         current_normal = {
             *window.residual_source_record_ids,
         }
@@ -938,7 +1071,11 @@ class CollectionArchiveWriter:
         if first is None or last is None:
             raise AssertionError("non-empty archive lacks boundary windows")
         payload = {
-            "schema_version": COLLECTION_ARCHIVE_SCHEMA_VERSION,
+            "schema_version": (
+                PROJECTED_COLLECTION_ARCHIVE_SCHEMA_VERSION
+                if self.projection is not None
+                else COLLECTION_ARCHIVE_SCHEMA_VERSION
+            ),
             "dataset_id": self.dataset_id,
             "cluster_id": first.cluster_id,
             "namespaces": sorted(self._namespaces),
@@ -959,6 +1096,8 @@ class CollectionArchiveWriter:
             "created_at_ns": int(self.clock_ns()),
             "sealed": True,
         }
+        if self.projection is not None:
+            payload["projection"] = self.projection
         payload["manifest_fingerprint"] = fingerprint(payload)
         manifest_temporary = (
             self.root / f".{MANIFEST_NAME}.{os.getpid()}.tmp"

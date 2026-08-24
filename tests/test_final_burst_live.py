@@ -288,6 +288,63 @@ def test_live_burst_maps_all_29_frozen_channels(
     assert samples["dns.query_latency_p95"].value == 700
 
 
+def test_capture_audit_preserves_formal_events_and_checkpoints_for_reaggregation(
+    tmp_path, monkeypatch,
+):
+    cgroup = _filesystem(tmp_path)
+    cgroup_id = cgroup.stat().st_ino
+    initial = [{
+        "record_type": "checkpoint", "schema_version": 1,
+        "timestamp_ns": START, "monotonic_ns": 0,
+        "emitted": 0, "reserve_failed": 0,
+        "program_count": 31, "sampling_profile": "low",
+    }]
+    event_log = Path(_config(tmp_path).event_log_path)
+    event_log.write_text(
+        "".join(json.dumps(item) + "\n" for item in initial),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "proberca.dataplane.burst_live.runtime_identities",
+        lambda revision: (_identity(),),
+    )
+    source = FinalLiveBurstSource(
+        _config(tmp_path),
+        burst_config_fingerprint=fingerprint({"burst": "contract"}),
+    )
+    audit_root = tmp_path / "raw-events"
+    source.configure_capture_audit(audit_root)
+    source.begin_capture(_inventory())
+    source.capture_boundary(START, _inventory())
+    final = {
+        "record_type": "checkpoint", "schema_version": 1,
+        "timestamp_ns": END, "monotonic_ns": END - START,
+        "emitted": 2, "reserve_failed": 0,
+        "program_count": 31, "sampling_profile": "low",
+    }
+    with event_log.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_event(1, cgroup_id)) + "\n")
+        handle.write(json.dumps(_event(18, cgroup_id)) + "\n")
+        handle.write(json.dumps(final) + "\n")
+    source.capture_boundary(END, _inventory())
+    source.collect_window(
+        sequence=1, window_start_ns=START, window_end_ns=END,
+        inventory_revision=_inventory(), normal_raw_window=_normal_raw_window(),
+    )
+    manifest = source.finalize_capture_audit()
+    events = [json.loads(item) for item in (
+        audit_root / "filtered-ebpf-events.jsonl"
+    ).read_text(encoding="utf-8").splitlines()]
+    checkpoints = [json.loads(item) for item in (
+        audit_root / "checkpoints.jsonl"
+    ).read_text(encoding="utf-8").splitlines()]
+    assert [item["event_type"] for item in events] == [1]
+    assert [item["timestamp_ns"] for item in checkpoints] == [START, END]
+    assert manifest["event_count"] == 1
+    assert manifest["checkpoint_count"] == 2
+    assert manifest["boundary_count"] == 2
+
+
 def test_continuous_counters_use_exact_captured_window_boundaries(
     tmp_path, monkeypatch,
 ):

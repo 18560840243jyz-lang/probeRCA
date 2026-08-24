@@ -35,6 +35,9 @@ from .sources import PrimitiveSource, PrometheusSourceConfig
 
 
 COLLECTOR_CONFIG_SCHEMA_VERSION = "probeRCA-final-live-collector-v2"
+MULTINODE_COLLECTOR_CONFIG_SCHEMA_VERSION = (
+    "probeRCA-final-live-collector-v3"
+)
 
 
 class RawBurstWindowSource(Protocol):
@@ -76,19 +79,38 @@ class FinalLiveCollectorConfig:
     formal_tcp_edge_entity_ids: tuple[str, ...]
     kubernetes: KubernetesConfig
     prometheus: PrometheusSourceConfig
+    projection_mode: str = "formal-complete"
+    projection_owner: str = ""
+    projection_node_name: str = ""
+    projection_service_entity_ids: tuple[str, ...] = ()
+    formal_service_entity_ids: tuple[str, ...] = ()
+    topology_tcp_edge_entity_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "FinalLiveCollectorConfig":
+        schema_version = payload.get("schema_version") \
+            if isinstance(payload, dict) else None
+        multinode_fields = {
+            "projection_mode", "projection_owner", "projection_node_name",
+            "projection_service_entity_ids", "formal_service_entity_ids",
+            "topology_tcp_edge_entity_ids",
+        }
         expected = set(cls.__dataclass_fields__)
+        if schema_version == COLLECTOR_CONFIG_SCHEMA_VERSION:
+            expected -= multinode_fields
         if not isinstance(payload, dict) or set(payload) != expected:
             raise RawCollectionError("live collector config fields mismatch")
         values = dict(payload)
-        formal_edges = values["formal_tcp_edge_entity_ids"]
-        if not isinstance(formal_edges, list):
-            raise RawCollectionError(
-                "formal_tcp_edge_entity_ids must be a list"
-            )
-        values["formal_tcp_edge_entity_ids"] = tuple(formal_edges)
+        for field_name in (
+            "formal_tcp_edge_entity_ids", "projection_service_entity_ids",
+            "formal_service_entity_ids", "topology_tcp_edge_entity_ids",
+        ):
+            if field_name not in values:
+                continue
+            field_values = values[field_name]
+            if not isinstance(field_values, list):
+                raise RawCollectionError(f"{field_name} must be a list")
+            values[field_name] = tuple(field_values)
         values["kubernetes"] = KubernetesConfig.from_dict(values["kubernetes"])
         values["prometheus"] = PrometheusSourceConfig.from_dict(
             values["prometheus"]
@@ -98,7 +120,10 @@ class FinalLiveCollectorConfig:
         return result
 
     def validate(self) -> None:
-        if self.schema_version != COLLECTOR_CONFIG_SCHEMA_VERSION:
+        if self.schema_version not in {
+            COLLECTOR_CONFIG_SCHEMA_VERSION,
+            MULTINODE_COLLECTOR_CONFIG_SCHEMA_VERSION,
+        }:
             raise RawCollectionError("unsupported live collector config")
         if not isinstance(self.cluster_id, str) or not self.cluster_id:
             raise RawCollectionError("collector cluster_id is required")
@@ -115,10 +140,15 @@ class FinalLiveCollectorConfig:
             raise RawCollectionError("Kubernetes discovery must be enabled")
         if self.kubernetes.cluster_id != self.cluster_id:
             raise RawCollectionError("Kubernetes cluster identity mismatch")
+        if len(self.formal_tcp_edge_entity_ids) != len(set(
+            self.formal_tcp_edge_entity_ids
+        )):
+            raise RawCollectionError(
+                "formal TCP edge scope must be unique"
+            )
         if (
-            not self.formal_tcp_edge_entity_ids
-            or len(self.formal_tcp_edge_entity_ids)
-            != len(set(self.formal_tcp_edge_entity_ids))
+            self.schema_version == COLLECTOR_CONFIG_SCHEMA_VERSION
+            and not self.formal_tcp_edge_entity_ids
         ):
             raise RawCollectionError(
                 "formal TCP edge scope must be non-empty and unique"
@@ -134,11 +164,89 @@ class FinalLiveCollectorConfig:
                 raise RawCollectionError(
                     "formal TCP edge identity is invalid"
                 )
+        if self.schema_version == COLLECTOR_CONFIG_SCHEMA_VERSION:
+            if (
+                self.projection_mode != "formal-complete"
+                or self.projection_owner
+                or self.projection_node_name
+                or self.projection_service_entity_ids
+                or self.formal_service_entity_ids
+                or self.topology_tcp_edge_entity_ids
+            ):
+                raise RawCollectionError(
+                    "v2 live collector cannot define a worker projection"
+                )
+            return
+        if self.projection_mode != "worker-local":
+            raise RawCollectionError(
+                "multinode live collector requires worker-local projection"
+            )
+        if not self.projection_owner or not self.projection_node_name:
+            raise RawCollectionError(
+                "multinode projection owner and node name are required"
+            )
+        service_sets = (
+            self.projection_service_entity_ids,
+            self.formal_service_entity_ids,
+        )
+        if any(
+            not values or len(values) != len(set(values))
+            for values in service_sets
+        ):
+            raise RawCollectionError(
+                "multinode service scopes must be non-empty and unique"
+            )
+        for entity_id in self.formal_service_entity_ids:
+            parts = entity_id.split("::")
+            if len(parts) != 3 or parts[0] != self.cluster_id \
+                    or any(not part for part in parts):
+                raise RawCollectionError(
+                    "formal service identity is invalid"
+                )
+        if not set(self.projection_service_entity_ids) <= set(
+            self.formal_service_entity_ids
+        ):
+            raise RawCollectionError(
+                "worker service projection is outside formal scope"
+            )
+        if (
+            not self.topology_tcp_edge_entity_ids
+            or len(self.topology_tcp_edge_entity_ids) != len(set(
+                self.topology_tcp_edge_entity_ids
+            ))
+        ):
+            raise RawCollectionError(
+                "multinode topology TCP edge scope must be non-empty and unique"
+            )
+        topology_edges = set(self.topology_tcp_edge_entity_ids)
+        if not set(self.formal_tcp_edge_entity_ids) <= topology_edges:
+            raise RawCollectionError(
+                "worker TCP edge projection is outside topology scope"
+            )
+        formal_services = set(self.formal_service_entity_ids)
+        local_services = set(self.projection_service_entity_ids)
+        for entity_id in self.topology_tcp_edge_entity_ids:
+            source_id, destination_id = _edge_service_ids(entity_id)
+            if source_id not in formal_services \
+                    or destination_id not in formal_services:
+                raise RawCollectionError(
+                    "topology TCP edge endpoint is outside formal services"
+                )
+        for entity_id in self.formal_tcp_edge_entity_ids:
+            source_id, _destination_id = _edge_service_ids(entity_id)
+            if source_id not in local_services:
+                raise RawCollectionError(
+                    "worker TCP edge projection is not caller-owned"
+                )
+
+    @property
+    def is_worker_projection(self) -> bool:
+        return self.schema_version == MULTINODE_COLLECTOR_CONFIG_SCHEMA_VERSION
 
     @property
     def public_fingerprint(self) -> str:
         self.validate()
-        return fingerprint({
+        payload = {
             "schema_version": self.schema_version,
             "cluster_id": self.cluster_id,
             "window_sec": self.window_sec,
@@ -151,7 +259,23 @@ class FinalLiveCollectorConfig:
             "prometheus": {
                 "config_fingerprint": self.prometheus.config_fingerprint,
             },
-        })
+        }
+        if self.is_worker_projection:
+            payload.update({
+                "projection_mode": self.projection_mode,
+                "projection_owner": self.projection_owner,
+                "projection_node_name": self.projection_node_name,
+                "projection_service_entity_ids": list(
+                    self.projection_service_entity_ids
+                ),
+                "formal_service_entity_ids": list(
+                    self.formal_service_entity_ids
+                ),
+                "topology_tcp_edge_entity_ids": list(
+                    self.topology_tcp_edge_entity_ids
+                ),
+            })
+        return fingerprint(payload)
 
 
 def collector_build_fingerprint(
@@ -168,6 +292,34 @@ def collector_build_fingerprint(
 
 def _service_id(cluster_id: str, namespace: str, service: str) -> str:
     return f"{cluster_id}::{namespace}::{service}"
+
+
+def _edge_service_ids(entity_id: str) -> tuple[str, str]:
+    try:
+        cluster_id, namespace, relation, protocol = entity_id.split("::")
+        source, destination = relation.split("->")
+    except ValueError as error:
+        raise RawCollectionError(
+            "formal TCP edge identity is invalid"
+        ) from error
+    if protocol != "tcp" or not all(
+        (cluster_id, namespace, source, destination)
+    ):
+        raise RawCollectionError("formal TCP edge identity is invalid")
+    return (
+        _service_id(cluster_id, namespace, source),
+        _service_id(cluster_id, namespace, destination),
+    )
+
+
+def _topology_edge(entity_id: str) -> TopologyEdge:
+    source_id, destination_id = _edge_service_ids(entity_id)
+    _cluster, source_namespace, source = source_id.split("::")
+    _cluster, destination_namespace, destination = destination_id.split("::")
+    return TopologyEdge(
+        source, destination, "call", source_namespace,
+        destination_namespace, "tcp", directed=True,
+    )
 
 
 def _edge_destination_namespaces(
@@ -351,6 +503,10 @@ def build_topology_snapshot(
     raw_window: RawCollectionWindow,
     aggregation: FinalAggregationResult,
     inventory_revision,
+    formal_service_entity_ids: Iterable[str] = (),
+    topology_tcp_edge_entity_ids: Iterable[str] = (),
+    projection_service_entity_ids: Iterable[str] = (),
+    projection_node_name: str = "",
 ) -> TopologySnapshot:
     """Build the exact topology covered by final output metrics."""
     if not inventory_revision.ready:
@@ -363,15 +519,23 @@ def build_topology_snapshot(
         raise RawCollectionError(
             "Kubernetes inventory contains unresolved structural issues"
         )
-    monitored = {
+    metric_services = {
         _service_id(
             item.cluster_id, item.namespace, item.service_name
         )
         for item in aggregation.node_metrics
         if item.scope == "service"
     }
-    if not monitored:
+    if not metric_services:
         raise RawCollectionError("topology has no monitored services")
+    formal_services = set(formal_service_entity_ids)
+    local_services = set(projection_service_entity_ids)
+    partial_projection = bool(formal_services)
+    monitored = formal_services if partial_projection else metric_services
+    if partial_projection and metric_services != local_services:
+        raise RawCollectionError(
+            "worker metrics do not match the declared service projection"
+        )
     known = {
         _service_id(
             inventory_revision.cluster_id,
@@ -386,36 +550,45 @@ def build_topology_snapshot(
         raise RawCollectionError(
             "normal metrics reference unknown Kubernetes Services"
         )
-    destination_namespaces = _edge_destination_namespaces(raw_window)
     call_edges = []
-    for item in aggregation.edge_metrics:
-        key = (
-            item.namespace, item.src_service, item.dst_service, item.protocol,
-        )
-        destination_namespace = destination_namespaces.get(key)
-        if destination_namespace is None:
+    if partial_projection:
+        declared_edges = tuple(topology_tcp_edge_entity_ids)
+        if not declared_edges:
             raise RawCollectionError(
-                "final edge lacks raw destination namespace identity"
+                "worker projection lacks the formal topology edge scope"
             )
-        source_id = _service_id(
-            item.cluster_id, item.namespace, item.src_service
-        )
-        destination_id = _service_id(
-            item.cluster_id, destination_namespace, item.dst_service
-        )
-        if source_id not in monitored or destination_id not in monitored:
-            raise RawCollectionError(
-                "active edge endpoint lacks its complete 9-metric service set"
+        call_edges.extend(_topology_edge(item) for item in declared_edges)
+    else:
+        destination_namespaces = _edge_destination_namespaces(raw_window)
+        for item in aggregation.edge_metrics:
+            key = (
+                item.namespace, item.src_service, item.dst_service,
+                item.protocol,
             )
-        call_edges.append(TopologyEdge(
-            item.src_service,
-            item.dst_service,
-            "call",
-            item.namespace,
-            destination_namespace,
-            item.protocol,
-            directed=True,
-        ))
+            destination_namespace = destination_namespaces.get(key)
+            if destination_namespace is None:
+                raise RawCollectionError(
+                    "final edge lacks raw destination namespace identity"
+                )
+            source_id = _service_id(
+                item.cluster_id, item.namespace, item.src_service
+            )
+            destination_id = _service_id(
+                item.cluster_id, destination_namespace, item.dst_service
+            )
+            if source_id not in monitored or destination_id not in monitored:
+                raise RawCollectionError(
+                    "active edge endpoint lacks its complete 9-metric service set"
+                )
+            call_edges.append(TopologyEdge(
+                item.src_service,
+                item.dst_service,
+                "call",
+                item.namespace,
+                destination_namespace,
+                item.protocol,
+                directed=True,
+            ))
     call_edges = tuple(sorted(set(call_edges), key=lambda item: (
         item.src_namespace or "", item.src_service,
         item.dst_namespace or "", item.dst_service,
@@ -427,7 +600,22 @@ def build_topology_snapshot(
         item.node_name for item in aggregation.node_metrics
         if item.scope == "node"
     }
-    if observed_hosts != expected_hosts:
+    if partial_projection:
+        if observed_hosts != {projection_node_name}:
+            raise RawCollectionError(
+                "worker host metric does not match its projection node"
+            )
+        local_placement_nodes = {
+            item.node_name for item in placements
+            if _service_id(
+                raw_window.cluster_id, item.namespace, item.service_name
+            ) in local_services
+        }
+        if local_placement_nodes != {projection_node_name}:
+            raise RawCollectionError(
+                "worker service projection does not match Kubernetes placement"
+            )
+    elif observed_hosts != expected_hosts:
         raise RawCollectionError(
             "host metric coverage does not match monitored service placement"
         )
@@ -519,6 +707,11 @@ class FinalDataPlaneCollector:
         collection_contract: dict[str, Any],
         collector_build_id: str,
         formal_tcp_edge_entity_ids: Iterable[str] = (),
+        strict_formal_tcp_edge_scope: bool = False,
+        formal_service_entity_ids: Iterable[str] = (),
+        topology_tcp_edge_entity_ids: Iterable[str] = (),
+        projection_service_entity_ids: Iterable[str] = (),
+        projection_node_name: str = "",
     ):
         if not isinstance(collector_build_id, str) \
                 or len(collector_build_id) != 64 \
@@ -529,9 +722,18 @@ class FinalDataPlaneCollector:
             )
         self.collection_contract = dict(collection_contract)
         self.collector_build_id = collector_build_id
+        self.formal_service_entity_ids = tuple(formal_service_entity_ids)
+        self.topology_tcp_edge_entity_ids = tuple(
+            topology_tcp_edge_entity_ids
+        )
+        self.projection_service_entity_ids = tuple(
+            projection_service_entity_ids
+        )
+        self.projection_node_name = projection_node_name
         self.aggregator = FinalWindowAggregator(
             self.collection_contract,
             formal_tcp_edge_entity_ids=formal_tcp_edge_entity_ids,
+            strict_formal_tcp_edge_scope=strict_formal_tcp_edge_scope,
         )
 
     def assemble(
@@ -547,11 +749,27 @@ class FinalDataPlaneCollector:
             raw_window=raw_window,
             aggregation=aggregation,
             inventory_revision=inventory_at_start,
+            formal_service_entity_ids=self.formal_service_entity_ids,
+            topology_tcp_edge_entity_ids=(
+                self.topology_tcp_edge_entity_ids
+            ),
+            projection_service_entity_ids=(
+                self.projection_service_entity_ids
+            ),
+            projection_node_name=self.projection_node_name,
         )
         end_topology = build_topology_snapshot(
             raw_window=raw_window,
             aggregation=aggregation,
             inventory_revision=inventory_at_end,
+            formal_service_entity_ids=self.formal_service_entity_ids,
+            topology_tcp_edge_entity_ids=(
+                self.topology_tcp_edge_entity_ids
+            ),
+            projection_service_entity_ids=(
+                self.projection_service_entity_ids
+            ),
+            projection_node_name=self.projection_node_name,
         )
         if start_topology.structure_fingerprint \
                 != end_topology.structure_fingerprint \
@@ -634,6 +852,15 @@ class FinalLiveCollectionRunner:
             formal_tcp_edge_entity_ids=(
                 config.formal_tcp_edge_entity_ids
             ),
+            strict_formal_tcp_edge_scope=config.is_worker_projection,
+            formal_service_entity_ids=config.formal_service_entity_ids,
+            topology_tcp_edge_entity_ids=(
+                config.topology_tcp_edge_entity_ids
+            ),
+            projection_service_entity_ids=(
+                config.projection_service_entity_ids
+            ),
+            projection_node_name=config.projection_node_name,
         )
 
     def _wait_until(self, timestamp_ns: int) -> None:
@@ -714,6 +941,8 @@ class FinalLiveCollectionRunner:
         window_count: int,
         capture_complete_callback: Callable[[int], None] | None = None,
         boundary_callback: Callable[[int, int], None] | None = None,
+        first_window_start_ns: int | None = None,
+        raw_window_callback: Callable[[RawCollectionWindow], None] | None = None,
     ):
         """Yield fully validated Normal/Burst pairs one sequence at a time."""
 
@@ -725,10 +954,23 @@ class FinalLiveCollectionRunner:
         ).freeze(self.wall_clock_ns())
         lead_ns = int(self.config.window_lead_sec * 1_000_000_000)
         window_ns = self.config.window_sec * 1_000_000_000
-        now = self.wall_clock_ns() + lead_ns
-        first_start_ns = (
-            (now + window_ns - 1) // window_ns
-        ) * window_ns
+        if first_window_start_ns is None:
+            now = self.wall_clock_ns() + lead_ns
+            first_start_ns = (
+                (now + window_ns - 1) // window_ns
+            ) * window_ns
+        else:
+            if isinstance(first_window_start_ns, bool) or not isinstance(
+                first_window_start_ns, int
+            ) or first_window_start_ns <= self.wall_clock_ns() + lead_ns:
+                raise RawCollectionError(
+                    "first_window_start_ns must be an integer after the collection lead"
+                )
+            if first_window_start_ns % window_ns:
+                raise RawCollectionError(
+                    "first_window_start_ns must be aligned to the one-second epoch"
+                )
+            first_start_ns = first_window_start_ns
         bounds = tuple(
             (
                 first_start_ns + index * window_ns,
@@ -872,6 +1114,8 @@ class FinalLiveCollectionRunner:
                     raise RawCollectionError(
                         "Normal/Burst window alignment mismatch"
                     )
+                if raw_window_callback is not None:
+                    raw_window_callback(raw_window)
                 yield window, raw_burst_window
         if sequence != len(bounds):
             raise RawCollectionError(

@@ -457,6 +457,70 @@ phases are not valid for formal RCA because their query/seal interval creates
 an unobserved gap and falsely makes non-adjacent samples appear adjacent to
 lagged models.
 
+## One-time multi-node evidence-acquisition decision
+
+The rented four-node campaign is an evidence acquisition run, not an online
+accuracy gate. Load qualification and each episode are accepted only by
+objective data-plane integrity, capacity, coverage, direct intervention evidence,
+identity stability, cleanup, and archive SHA checks. Current Soft, Hard, READY,
+`A_s`/`A_v`, FISTA rank, and RCA correctness are recorded but cannot stop the
+campaign. This exception does not relax READY for ordinary online RCA operation
+or bounded algorithm smoke tests; it keeps collection and later analysis separate.
+
+The frozen configuration is `configs/final_multinode_campaign.yaml`. With a
+supported Host NIC intervention it generates 3 Healthy datasets, 12 injector
+Pilots, 111 formal fault episodes, and 9 controls: 135 core datasets. The 37
+concrete coordinates each have three independent repeats. A fixed seed randomly
+assigns one repeat to Validation and two to Test and creates a non-adjacent fixed
+order. If and only if Host NIC is proven unsupported before the formal manifest
+is generated, that coordinate and its Pilot are removed, producing 131 core
+datasets; TCP loss is never relabeled as Host NIC.
+
+The multi-node formal scope is 11 services, 3 workers, and 15 directed TCP edges.
+It therefore has 108 theoretical root coordinates and 156 formal records per
+one-second window under the unchanged `9/4/3` contract. Four overhead runs are
+outside the 135/131 core count. Synthetic data are generated later, locally, and
+are not substitutes for these real episodes.
+
+Test fault and control episodes use opaque IDs. Their target, mechanism, repeat,
+injector/effectiveness metadata, and labels are absent from the public manifest.
+The private manifest is streamed directly from memory into OpenSSL CMS public-key
+encryption; the private key remains off the rented cluster. Public commitments
+use HMAC-SHA256 with an off-cluster secret. Code and configuration are frozen,
+all Test predictions are sealed once, and only then may labels be decrypted and
+scored.
+
+Phase labels use actual lifecycle timestamps, not the plan alone. Windows fully
+inside effect-confirmed through cleanup-start are `FAULT_ACTIVE`; application and
+cleanup boundary windows are transitions and are excluded from primary accuracy.
+Campaign resume is bound to the public manifest fingerprint and immutable order;
+a failed case may retry only under the same case ID with a new attempt number.
+
+The four-node implementation uses Worker-local primitive exporter, Beyla,
+eBPF/Burst, and node exporter processes. S0 Prometheus scrapes all three Workers;
+the Workers start from one future epoch boundary and their archives are merged
+only after all three seal successfully. In addition to merged Normal/Burst, each
+dataset preserves per-Worker cumulative primitive boundaries and filtered raw
+eBPF event/checkpoint streams. This is the minimum evidence needed to change
+offline aggregation after the rented machines are released; it does not change
+the formal 9/4/3 feature contract.
+
+The pre-rental and physical gates are intentionally distinct. A local/VM report
+may set `pre_rent_code_ready=true` after tests, deterministic generation, CMS,
+resume, fake-target, upload/readback, and restore rehearsal. It may never claim
+cloud NIC feasibility or real Pilot effectiveness. Only the rented environment
+can freeze the highest objectively qualified 25/40/55 load profile, run all 12
+real direct-evidence Pilots, verify exact image/placement and node capacity, and
+produce `formal_campaign_go=true`.
+
+TCP delay/loss injection is implemented as a selective prio+netem child qdisc in
+the caller Pod network namespace, with a destination IP/TCP-port flower filter
+and exact qdisc cleanup. The old `tc action netem` construction is invalid and is
+not part of the formal implementation. Host NIC netem is allowed only when the
+Pilot proves the host interface qdisc is safely replaceable and the formal NIC
+drop/error coordinate rises; otherwise Host NIC is removed before manifest
+generation without TCP substitution.
+
 ## Incident-local resource residual decision
 
 Frozen Healthy Baseline and `A_v` remain unchanged after READY. Service and

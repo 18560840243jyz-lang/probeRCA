@@ -1,0 +1,20 @@
+schema_version: probeRCA-multinode-image-lock-v1
+online_boutique_source:
+  release: v0.10.5
+  upstream_git_sha: 5096a85b2f3bf41bef53363cfe5478d5b86ac701
+  manifest_path: deploy/multinode-campaign/online-boutique-v0.10.5.yaml
+  manifest_sha256: 3e4d7b4764a14bcf1b67251c044cdc2c72464548362413ed89c2a8613b43521f
+images:
+  adservice: us-central1-docker.pkg.dev/google-samples/microservices-demo/adservice@sha256:2abbc0505d527711ff8ba233aaf6e0590f72acd86c016332ea3a5f2595ea70a8
+  cartservice: us-central1-docker.pkg.dev/google-samples/microservices-demo/cartservice@sha256:85c4fee0ddb6eada076003abcbff17ac3daf8e18dde68c7bde03b15fc8e17417
+  checkoutservice: us-central1-docker.pkg.dev/google-samples/microservices-demo/checkoutservice@sha256:403f4056479bcf2d36a865bf037ba2de0f84a60408519cee1b80e705e99f622a
+  currencyservice: us-central1-docker.pkg.dev/google-samples/microservices-demo/currencyservice@sha256:1ced46aa236c5093a3cc6642f67edf50e0deccdc07262871ffacf6173fc8c6fa
+  emailservice: us-central1-docker.pkg.dev/google-samples/microservices-demo/emailservice@sha256:c6de94237cad0708ec674085a54a52d9856be37d9bf2d6ec2ddfe7b725d02bb2
+  frontend: us-central1-docker.pkg.dev/google-samples/microservices-demo/frontend@sha256:50ca57c513de1ef22a97b6ef76989a73878d4a3873f85b5314bfc207853d5475
+  paymentservice: us-central1-docker.pkg.dev/google-samples/microservices-demo/paymentservice@sha256:d9bc5e83c671660ce825420fea552b0ab067f441e6387607091fa35b15dc1e1f
+  productcatalogservice: us-central1-docker.pkg.dev/google-samples/microservices-demo/productcatalogservice@sha256:6e0d2218e0edecf671230d54cbbb565209d3a7592215d9167aca918dcb251e14
+  recommendationservice: us-central1-docker.pkg.dev/google-samples/microservices-demo/recommendationservice@sha256:969f8f14ee769da1df9b831a4aa0c5e30a4d43a231a887d04fa3019c2b78548b
+  redis-cart: docker.io/library/redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005
+  shippingservice: us-central1-docker.pkg.dev/google-samples/microservices-demo/shippingservice@sha256:0d2be86f0280a0a5594de9593eecd47ca2380e90946a3434b30d956373599b44
+  campaign_load: us-central1-docker.pkg.dev/google-samples/microservices-demo/loadgenerator@sha256:3e5cf93c21e6b7d1e8bb8713aa02c7912d4c9f90fd02d477b3d911bd02a292fb
+  beyla: grafana/beyla:3.15.0@sha256:162aac58cdb2245e5c948878473a1d4a9e197af4ec389450d3aa5b6d3fd80dc9

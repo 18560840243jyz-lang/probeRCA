@@ -1,0 +1,75 @@
+schema_version: probeRCA-multinode-injector-registry-v1
+status: candidate
+profiles:
+- profile_id: service-cpu-v1
+  mechanism: service_cpu
+  intensity: {actor_workers: 2, target_cgroup: application}
+  cleanup: {action: terminate_actor, require_cgroup_empty: true}
+  effectiveness_criterion: {metric: cpu_usage_rate, direct_counter_lift_required: true}
+  contamination_checks: [cpu_throttle_ratio, pod_restart]
+- profile_id: service-cpu-throttle-v1
+  mechanism: service_cpu_throttle
+  intensity: {cpu_max_quota_us: 25000, cpu_max_period_us: 100000}
+  cleanup: {action: restore_exact_cpu_max}
+  effectiveness_criterion: {metric: cpu_throttle_ratio, nr_throttled_delta_min: 1}
+  contamination_checks: [pod_restart]
+- profile_id: service-memory-v1
+  mechanism: service_memory
+  intensity: {working_set_fraction_of_limit: 0.35, memory_high_fraction_of_limit: 0.60}
+  cleanup: {action: terminate_actor_and_restore_memory_high}
+  effectiveness_criterion: {metric: memory_working_set_ratio, direct_counter_lift_required: true}
+  contamination_checks: [oom, oom_kill, pod_restart]
+- profile_id: service-io-v1
+  mechanism: service_io
+  intensity: {write_bytes_per_sec: 16777216, file_bytes: 134217728, fsync_each_block: true}
+  cleanup: {action: terminate_actor_restore_io_max_remove_file}
+  effectiveness_criterion: {metric: io_psi, direct_psi_lift_required: true}
+  contamination_checks: [cpu_throttle_ratio, pod_restart]
+- profile_id: service-futex-v1
+  mechanism: service_futex
+  intensity: {threads: 16, continuous_hold: true}
+  cleanup: {action: terminate_actor}
+  effectiveness_criterion: {metric: futex_wait_time_rate, direct_counter_lift_required: true}
+  contamination_checks: [pod_restart]
+- profile_id: service-local-socket-v1
+  mechanism: service_local_socket
+  intensity: {threads: 16, network_namespace: target}
+  cleanup: {action: terminate_actor}
+  effectiveness_criterion: {metric: local_socket_failure_rate, meaningful_operation_delta_min: 1}
+  contamination_checks: [tcp_edge_failure_rate, pod_restart]
+- profile_id: host-cpu-v1
+  mechanism: host_cpu
+  intensity: {actor_workers: 6, isolated_cgroup: true}
+  cleanup: {action: terminate_actor_remove_cgroup}
+  effectiveness_criterion: {metric: cpu_psi, direct_psi_lift_required: true}
+  contamination_checks: [pod_restart]
+- profile_id: host-memory-v1
+  mechanism: host_memory
+  intensity: {working_set_bytes: 4294967296, memory_high_bytes: 3221225472, isolated_cgroup: true}
+  cleanup: {action: terminate_actor_remove_cgroup}
+  effectiveness_criterion: {metric: memory_psi, direct_psi_lift_required: true}
+  contamination_checks: [oom, pod_restart]
+- profile_id: host-io-v1
+  mechanism: host_io
+  intensity: {file_bytes: 1073741824, fsync_each_block: true, isolated_cgroup: true}
+  cleanup: {action: terminate_actor_remove_file_remove_cgroup}
+  effectiveness_criterion: {metric: io_psi, direct_psi_lift_required: true}
+  contamination_checks: [pod_restart]
+- profile_id: host-nic-v1
+  mechanism: host_nic
+  intensity: {drop_percent: 5, direction: egress, interface: pilot_discovered}
+  cleanup: {action: restore_exact_qdisc_and_filters}
+  effectiveness_criterion: {metric: nic_drop_error_rate, direct_drop_counter_delta_min: 1}
+  contamination_checks: [non_target_worker_nic, pod_restart]
+- profile_id: tcp-latency-v1
+  mechanism: tcp_latency
+  intensity: {delay_ms: 100, direction: caller_to_callee}
+  cleanup: {action: restore_exact_qdisc_and_filters}
+  effectiveness_criterion: {metric: edge_latency_p95, filter_hit_and_latency_lift_required: true}
+  contamination_checks: [reverse_direction, non_target_edge, packet_loss]
+- profile_id: tcp-failure-v1
+  mechanism: tcp_failure
+  intensity: {loss_percent: 10, direction: caller_to_callee}
+  cleanup: {action: restore_exact_qdisc_and_filters}
+  effectiveness_criterion: {metric: edge_failure_rate, filter_hit_and_failure_lift_required: true}
+  contamination_checks: [reverse_direction, non_target_edge, added_delay]

@@ -1499,6 +1499,10 @@ class FinalControlPlane:
         if not isinstance(archive, CollectionArchive):
             raise TypeError("control plane requires a loaded CollectionArchive")
         archive.validate()
+        if archive.projection is not None:
+            raise CollectionContractMismatchError(
+                "worker projection archives must be merged before control analysis"
+            )
         try:
             formal_archive_contract = self.config.project_collection_contract(
                 archive.collection_contract

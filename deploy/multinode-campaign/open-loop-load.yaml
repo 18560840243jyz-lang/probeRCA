@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proberca-multinode-open-loop-load
+  labels:
+    app.kubernetes.io/name: proberca-multinode-open-loop-load
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: proberca-multinode-open-loop-load
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: proberca-multinode-open-loop-load
+        proberca.io/formal-scope: excluded
+    spec:
+      nodeSelector:
+        proberca.io/node-role: control
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: load
+        image: us-central1-docker.pkg.dev/google-samples/microservices-demo/loadgenerator@sha256:3e5cf93c21e6b7d1e8bb8713aa02c7912d4c9f90fd02d477b3d911bd02a292fb
+        command: [python, -u, /opt/proberca-load/multinode_open_loop_load.py]
+        env:
+        - {name: TARGET_BASE_URL, value: "http://frontend.online-boutique.svc.cluster.local:80"}
+        - {name: TARGET_ARRIVAL_RATE_RPS, value: "25"}
+        - {name: WORKERS, value: "8"}
+        - {name: MAXIMUM_PENDING, value: "64"}
+        - {name: REQUEST_TIMEOUT_SEC, value: "10"}
+        - {name: LOAD_SEED, value: "20260824"}
+        - name: BEHAVIOR_WEIGHTS_JSON
+          value: '{"browse_search_list":40,"detail_recommendation_ad_currency":25,"cart":20,"checkout":15}'
+        volumeMounts:
+        - {name: script, mountPath: /opt/proberca-load, readOnly: true}
+        resources:
+          requests: {cpu: 500m, memory: 256Mi}
+          limits: {cpu: "2", memory: 1Gi}
+      volumes:
+      - name: script
+        configMap:
+          name: proberca-multinode-open-loop-load

@@ -1,0 +1,55 @@
+schema_version: probeRCA-multinode-node-inventory-v1
+known_hosts_file: /home/ubuntu/.ssh/proberca_known_hosts
+agent_path: /opt/proberca/current/scripts/multinode_fault_agent.py
+kubernetes_context: proberca-multinode-formal
+readonly_kubeconfig_path: /etc/proberca/readonly-kubeconfig
+prometheus_base_url: http://10.0.0.10:9090
+nodes:
+- node_id: s0
+  role: controller
+  host: 10.0.0.10
+  user: ubuntu
+  port: 22
+  identity_file: /home/ubuntu/.ssh/proberca_campaign
+  kubernetes_node_name: s0
+  required_free_bytes: 322122547200
+  required_logical_cpu_count: 8
+  required_memory_bytes: 17179869184
+- node_id: worker-1
+  role: worker
+  host: 10.0.0.11
+  user: ubuntu
+  port: 22
+  identity_file: /home/ubuntu/.ssh/proberca_campaign
+  kubernetes_node_name: worker-1
+  fault_interface: CHANGE_ME_PRIMARY_INTERFACE
+  required_free_bytes: 107374182400
+  required_logical_cpu_count: 8
+  required_memory_bytes: 17179869184
+- node_id: worker-2
+  role: worker
+  host: 10.0.0.12
+  user: ubuntu
+  port: 22
+  identity_file: /home/ubuntu/.ssh/proberca_campaign
+  kubernetes_node_name: worker-2
+  fault_interface: CHANGE_ME_PRIMARY_INTERFACE
+  required_free_bytes: 107374182400
+  required_logical_cpu_count: 8
+  required_memory_bytes: 17179869184
+- node_id: worker-3
+  role: worker
+  host: 10.0.0.13
+  user: ubuntu
+  port: 22
+  identity_file: /home/ubuntu/.ssh/proberca_campaign
+  kubernetes_node_name: worker-3
+  fault_interface: CHANGE_ME_PRIMARY_INTERFACE
+  required_free_bytes: 107374182400
+  required_logical_cpu_count: 8
+  required_memory_bytes: 17179869184
+
+object_store:
+  adapter: rclone
+  remote_prefix: proberca-archive:formal-multinode-campaign
+  required_capacity_bytes: 536870912000

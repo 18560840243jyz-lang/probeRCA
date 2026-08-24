@@ -49,6 +49,9 @@ from .raw import RawCollectionError
 FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION = (
     "probeRCA-final-primitive-exporter-v5"
 )
+MULTINODE_PRIMITIVE_EXPORTER_SCHEMA_VERSION = (
+    "probeRCA-final-primitive-exporter-v6"
+)
 DNS_BUCKETS_MS = (
     0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0,
     50.0, 100.0, 250.0, 500.0, 1000.0, 2000.0, 5000.0,
@@ -166,6 +169,10 @@ class FinalPrimitiveExporterConfig:
     publish_queue_max_pending: int = 4
     publish_visibility_sec: float = 0.75
     experimental_dns_enabled: bool = False
+    runtime_mode: str = "kind_container"
+    monitored_node_name: str | None = None
+    local_services: tuple[str, ...] = ()
+    host_cgroup_root: str = "/sys/fs/cgroup"
 
     @classmethod
     def from_dict(
@@ -179,11 +186,15 @@ class FinalPrimitiveExporterConfig:
         normalized.setdefault("raw_acquisition_workers", 24)
         normalized.setdefault("publish_queue_max_pending", 4)
         normalized.setdefault("publish_visibility_sec", 0.75)
+        normalized.setdefault("runtime_mode", "kind_container")
+        normalized.setdefault("monitored_node_name", None)
+        normalized.setdefault("local_services", normalized.get("include_services", ()))
+        normalized.setdefault("host_cgroup_root", "/sys/fs/cgroup")
         values = _strict_mapping(
             normalized, set(cls.__dataclass_fields__),
             "final primitive exporter config",
         )
-        for name in ("namespaces", "include_services"):
+        for name in ("namespaces", "include_services", "local_services"):
             if not isinstance(values[name], list):
                 raise RawCollectionError(f"{name} must be a list")
             values[name] = tuple(values[name])
@@ -192,17 +203,31 @@ class FinalPrimitiveExporterConfig:
         return result
 
     def validate(self) -> None:
-        if self.schema_version != FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION:
+        if self.schema_version not in {
+            FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION,
+            MULTINODE_PRIMITIVE_EXPORTER_SCHEMA_VERSION,
+        }:
             raise RawCollectionError(
                 "unsupported final primitive exporter schema"
             )
         for name in (
             "cluster_id", "kubeconfig_path", "kubernetes_context",
-            "kind_node_container", "node_exporter_url",
+            "node_exporter_url",
             "bpf_loader_path", "bpf_map_directory",
             "listen_host",
         ):
             _nonempty(name, getattr(self, name))
+        if self.runtime_mode not in {"kind_container", "host"}:
+            raise RawCollectionError("runtime_mode must be kind_container or host")
+        if self.runtime_mode == "kind_container":
+            _nonempty("kind_node_container", self.kind_node_container)
+        else:
+            if self.schema_version != MULTINODE_PRIMITIVE_EXPORTER_SCHEMA_VERSION:
+                raise RawCollectionError("host runtime mode requires exporter schema v6")
+            _nonempty("monitored_node_name", self.monitored_node_name)
+            root = Path(self.host_cgroup_root)
+            if not root.is_absolute():
+                raise RawCollectionError("host_cgroup_root must be absolute")
         if type(self.experimental_dns_enabled) is not bool:
             raise RawCollectionError(
                 "experimental_dns_enabled must be boolean"
@@ -237,6 +262,14 @@ class FinalPrimitiveExporterConfig:
         } <= set(self.namespaces):
             raise RawCollectionError(
                 "included service references an unlisted namespace"
+            )
+        if (
+            not self.local_services
+            or len(self.local_services) != len(set(self.local_services))
+            or not set(self.local_services) <= set(self.include_services)
+        ):
+            raise RawCollectionError(
+                "local_services must be a non-empty subset of include_services"
             )
         for name, minimum, maximum in (
             ("beyla_port", 1, 65535),
@@ -663,7 +696,7 @@ class FinalPrimitiveExporter:
             context=self.config.kubernetes_context,
         )
         self.core = client.CoreV1Api()
-        self._node_cgroup_root = self._resolve_kind_node_cgroup()
+        self._node_cgroup_root = self._resolve_node_cgroup()
         self._kind_node_pid: int | None = None
         try:
             initial_inventory = self._inventory_refresh_executor.submit(
@@ -706,6 +739,14 @@ class FinalPrimitiveExporter:
         ) / f"docker-{container_id}.scope"
         if not path.is_dir():
             raise RawCollectionError("kind node cgroup root is unavailable")
+        return path
+
+    def _resolve_node_cgroup(self) -> Path:
+        if getattr(self.config, "runtime_mode", "kind_container") == "kind_container":
+            return self._resolve_kind_node_cgroup()
+        path = Path(self.config.host_cgroup_root).resolve()
+        if not path.is_dir() or not (path / "cgroup.controllers").is_file():
+            raise RawCollectionError("host cgroup v2 root is unavailable")
         return path
 
     def _resolve_kind_node_pid(self) -> int:
@@ -765,6 +806,10 @@ class FinalPrimitiveExporter:
             tuple(item.split("/", 1))
             for item in self.config.include_services
         }
+        local_included = {
+            tuple(item.split("/", 1))
+            for item in self.config.local_services
+        }
         pods = []
         services = []
         for namespace in self.config.namespaces:
@@ -783,8 +828,11 @@ class FinalPrimitiveExporter:
             )
         containers = []
         for pod in pods:
+            if self.config.runtime_mode == "host" \
+                    and pod.spec.node_name != self.config.monitored_node_name:
+                continue
             matched_services = self._pod_services(
-                pod, services, included
+                pod, services, local_included
             )
             if not matched_services:
                 continue
@@ -840,9 +888,9 @@ class FinalPrimitiveExporter:
         covered = {
             (item.namespace, item.service) for item in containers
         }
-        if covered != included:
+        if covered != local_included:
             raise RawCollectionError(
-                "configured services lack ready container identities"
+                "local services lack ready container identities on the monitored node"
             )
         node_items = self.core.list_node().items
         node_names = tuple(sorted(
@@ -2221,13 +2269,13 @@ class FinalPrimitiveExporter:
 
     def _read_qdisc_transmit_drops(self) -> tuple[tuple[str, float], ...]:
         """Read one immutable qdisc counter snapshot without rebasing it."""
-        if self._kind_node_pid is None:
-            self._kind_node_pid = self._resolve_kind_node_pid()
+        prefix: list[str] = []
+        if getattr(self.config, "runtime_mode", "kind_container") == "kind_container":
+            if self._kind_node_pid is None:
+                self._kind_node_pid = self._resolve_kind_node_pid()
+            prefix = ["nsenter", "-t", str(self._kind_node_pid), "-n"]
         result = subprocess.run(
-            [
-                "nsenter", "-t", str(self._kind_node_pid), "-n",
-                "tc", "-j", "-s", "qdisc", "show",
-            ],
+            prefix + ["tc", "-j", "-s", "qdisc", "show"],
             check=False,
             capture_output=True,
             text=True,

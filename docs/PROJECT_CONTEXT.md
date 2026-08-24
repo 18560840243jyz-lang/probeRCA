@@ -32,7 +32,8 @@ path
 
 ## Current Environment
 
-当前环境是单机虚拟机。
+当前开发环境是本机代码副本；历史工程验证环境是单机虚拟机。下一阶段是在租机前
+完成四机campaign编排、Test隔离、故障注入器和离线恢复预检，通过后才租用服务器。
 
 single VM
 中文解释：单台虚拟机。
@@ -69,4 +70,10 @@ P0 通过后再做 P1。
 
 P1 通过后再接真实观测系统。
 
-单机验证通过后，再租服务器跑真实分布式实验。
+单机验证通过后，先通过`docs/IMPLEMENTATION_PLAN.md`中的租机前Go/No-Go；只有
+campaign manifest、注入器Pilot、断点续采、Test盲测协议和离线回读均通过，才租
+服务器跑一次性真实分布式证据采集。
+
+四机实采的唯一操作顺序见`docs/MULTINODE_CAMPAIGN_RUNBOOK.md`。Worker先生成
+8/7/0条caller归属边的投影archive，必须完成三Worker严格合并后才允许进入控制面；
+投影archive本身不是正式完整数据集。

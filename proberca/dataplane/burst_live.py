@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import hashlib
 import json
 import math
 import os
@@ -221,6 +222,7 @@ class FinalLiveBurstSource:
         *,
         burst_config_fingerprint: str,
         formal_tcp_edge_entity_ids: Iterable[str] = (),
+        strict_formal_tcp_edge_scope: bool = False,
     ):
         config.validate()
         self.config = config
@@ -242,13 +244,17 @@ class FinalLiveBurstSource:
                 "formal Burst TCP edge identity is invalid"
             )
         self._formal_tcp_edge_entity_ids = frozenset(formal_tcp_edges)
-        self.event_source_fingerprint = fingerprint({
+        self._strict_formal_tcp_edge_scope = strict_formal_tcp_edge_scope
+        source_identity = {
             "implementation": "final-burst-ring-v1",
             "config": config.public_fingerprint,
             "formal_tcp_edge_entity_ids": sorted(
                 self._formal_tcp_edge_entity_ids
             ),
-        })
+        }
+        if self._strict_formal_tcp_edge_scope:
+            source_identity["strict_formal_tcp_edge_scope"] = True
+        self.event_source_fingerprint = fingerprint(source_identity)
         self._offset: int | None = None
         self._pending_line = ""
         self._events: deque[dict[str, Any]] = deque()
@@ -267,6 +273,11 @@ class FinalLiveBurstSource:
         self._boundary_runtime_paths: dict[int, Path] = {}
         self._boundary_runtime_inodes: dict[Path, int] = {}
         self._nic_counter_paths: tuple[Path, ...] | None = None
+        self._audit_output_root: Path | None = None
+        self._audit_event_handle = None
+        self._audit_checkpoint_handle = None
+        self._audit_event_count = 0
+        self._audit_checkpoint_count = 0
 
     @property
     def source_record_ids(self) -> tuple[str, ...]:
@@ -285,6 +296,7 @@ class FinalLiveBurstSource:
         self._boundary_memory = {}
         self._boundary_nic = {}
         self._prime_log_cursor()
+        self._open_capture_audit()
         paths = self._runtime_counter_paths(revision)
         self._boundary_revision_token = self._revision_token(revision)
         self._boundary_runtime_paths = dict(paths)
@@ -292,6 +304,91 @@ class FinalLiveBurstSource:
             path: cgroup_id for cgroup_id, path in paths.items()
         }
         self._nic_counter_paths = self._resolve_nic_counter_paths()
+
+    def configure_capture_audit(self, output_root: Path) -> None:
+        """Enable write-once, label-free raw event/checkpoint preservation."""
+        if self._boundary_capture_enabled or self._audit_output_root is not None:
+            raise RawCollectionError("Burst capture audit was already configured")
+        self._audit_output_root = Path(output_root)
+
+    def _open_capture_audit(self) -> None:
+        if self._audit_output_root is None:
+            return
+        root = self._audit_output_root
+        root.mkdir(parents=True, exist_ok=False)
+        self._audit_event_handle = (root / "filtered-ebpf-events.jsonl").open(
+            "x", encoding="utf-8",
+        )
+        self._audit_checkpoint_handle = (root / "checkpoints.jsonl").open(
+            "x", encoding="utf-8",
+        )
+        self._audit_event_count = 0
+        self._audit_checkpoint_count = 0
+        if self._checkpoints:
+            self._write_audit_record(self._checkpoints[-1])
+
+    def _write_audit_record(self, record: dict[str, Any]) -> None:
+        record_type = record.get("record_type")
+        handle = None
+        if record_type == "checkpoint":
+            handle = self._audit_checkpoint_handle
+            self._audit_checkpoint_count += int(handle is not None)
+        elif record_type == "event" and int(record.get("event_type", -1)) not in {
+            EVENT_DNS_QUERY, EVENT_DNS_RESPONSE, EVENT_DNS_TIMEOUT,
+        }:
+            handle = self._audit_event_handle
+            self._audit_event_count += int(handle is not None)
+        if handle is not None:
+            handle.write(json.dumps(
+                record, sort_keys=True, separators=(",", ":"),
+            ) + "\n")
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def finalize_capture_audit(self) -> dict[str, Any] | None:
+        """Close raw evidence and seal a range-bound audit manifest."""
+        if self._audit_output_root is None:
+            return None
+        if self._audit_event_handle is None and self._audit_checkpoint_handle is None:
+            return None
+        if self._audit_event_handle is None or self._audit_checkpoint_handle is None:
+            raise RawCollectionError("Burst capture audit was not opened")
+        for handle in (self._audit_event_handle, self._audit_checkpoint_handle):
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+        self._audit_event_handle = None
+        self._audit_checkpoint_handle = None
+        boundaries = sorted(self._boundary_memory)
+        if len(boundaries) < 2:
+            raise RawCollectionError("Burst capture audit has no complete window range")
+        root = self._audit_output_root
+        core = {
+            "schema_version": "probeRCA-filtered-burst-raw-events-v1",
+            "event_source_fingerprint": self.event_source_fingerprint,
+            "burst_config_fingerprint": self.burst_config_fingerprint,
+            "start_ns": boundaries[0],
+            "end_ns": boundaries[-1],
+            "boundary_count": len(boundaries),
+            "event_count": self._audit_event_count,
+            "checkpoint_count": self._audit_checkpoint_count,
+            "events_sha256": self._file_sha256(
+                root / "filtered-ebpf-events.jsonl"
+            ),
+            "checkpoints_sha256": self._file_sha256(root / "checkpoints.jsonl"),
+        }
+        manifest = {**core, "manifest_fingerprint": fingerprint(core)}
+        (root / "raw-event-manifest.json").write_text(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        return manifest
 
     def _runtime_counter_paths(self, revision) -> dict[int, Path]:
         identities = tuple(runtime_identities(revision))
@@ -489,6 +586,7 @@ class FinalLiveBurstSource:
         return record
 
     def _ingest_log_record(self, record: dict[str, Any]) -> None:
+        self._write_audit_record(record)
         record_type = record.get("record_type")
         if record_type == "event":
             divisor = record.setdefault("sampling_divisor", 1)
@@ -912,14 +1010,20 @@ class FinalLiveBurstSource:
             if sample.protocol == "tcp":
                 observed_tcp_edges.add(entity)
                 if (
-                    self._formal_tcp_edge_entity_ids
+                    (
+                        self._strict_formal_tcp_edge_scope
+                        or self._formal_tcp_edge_entity_ids
+                    )
                     and entity not in self._formal_tcp_edge_entity_ids
                 ):
                     continue
             known_edges[sample.protocol].add(entity)
             target = tcp if sample.protocol == "tcp" else dns
             target[entity]["namespace"] = [sample.namespace]
-        if self._formal_tcp_edge_entity_ids:
+        if (
+            self._strict_formal_tcp_edge_scope
+            or self._formal_tcp_edge_entity_ids
+        ):
             missing = (
                 self._formal_tcp_edge_entity_ids - observed_tcp_edges
             )

@@ -315,11 +315,13 @@ class FinalWindowAggregator:
         collection_contract: dict,
         *,
         formal_tcp_edge_entity_ids: Iterable[str] = (),
+        strict_formal_tcp_edge_scope: bool = False,
     ):
         self.contract = dict(collection_contract)
         self._formal_tcp_edge_entity_ids = frozenset(
             formal_tcp_edge_entity_ids
         )
+        self._strict_formal_tcp_edge_scope = strict_formal_tcp_edge_scope
         if self.contract.get("aggregation_output_source") != FINAL_OUTPUT_SOURCE:
             raise RawCollectionError("final aggregation output source mismatch")
         if self.contract.get("window_sec") != 1:
@@ -337,7 +339,8 @@ class FinalWindowAggregator:
 
     def _in_formal_projection(self, sample: RawMetricSample) -> bool:
         if (
-            not self._formal_tcp_edge_entity_ids
+            not self._strict_formal_tcp_edge_scope
+            and not self._formal_tcp_edge_entity_ids
             or sample.entity_type != "edge"
             or sample.protocol != "tcp"
         ):
@@ -390,7 +393,10 @@ class FinalWindowAggregator:
             used_objects.update(objects)
         if not nodes:
             raise RawCollectionError("final window has no service/host metrics")
-        if self._formal_tcp_edge_entity_ids:
+        if (
+            self._strict_formal_tcp_edge_scope
+            or self._formal_tcp_edge_entity_ids
+        ):
             observed_edges = {
                 item.stable_id.rsplit("::", 1)[0]
                 for item in edges if item.protocol == "tcp"

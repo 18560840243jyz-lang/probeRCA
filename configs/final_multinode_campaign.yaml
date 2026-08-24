@@ -1,0 +1,185 @@
+schema_version: probeRCA-multinode-campaign-v1
+master_seed: 20260824
+
+formal_scope:
+  cluster_id: proberca-multinode-formal
+  namespace: online-boutique
+  service_count: 11
+  worker_count: 3
+  tcp_edge_count: 15
+  theoretical_root_coordinates: 108
+  expected_records_per_window: 156
+  metric_contract: {service: 9, host: 4, tcp_edge: 3}
+  dns_formal_enabled: false
+
+formal_tcp_edges:
+- {src: cartservice, dst: redis-cart}
+- {src: checkoutservice, dst: cartservice}
+- {src: checkoutservice, dst: currencyservice}
+- {src: checkoutservice, dst: emailservice}
+- {src: checkoutservice, dst: paymentservice}
+- {src: checkoutservice, dst: productcatalogservice}
+- {src: checkoutservice, dst: shippingservice}
+- {src: frontend, dst: adservice}
+- {src: frontend, dst: cartservice}
+- {src: frontend, dst: checkoutservice}
+- {src: frontend, dst: currencyservice}
+- {src: frontend, dst: productcatalogservice}
+- {src: frontend, dst: recommendationservice}
+- {src: frontend, dst: shippingservice}
+- {src: recommendationservice, dst: productcatalogservice}
+
+workers: [worker-1, worker-2, worker-3]
+placement:
+  worker-1: [frontend, cartservice, shippingservice, emailservice]
+  worker-2: [checkoutservice, currencyservice, paymentservice, recommendationservice]
+  worker-3: [productcatalogservice, adservice, redis-cart]
+
+selected_tcp_fault_edges:
+- {src: frontend, dst: cartservice, placement: same-node}
+- {src: checkoutservice, dst: paymentservice, placement: same-node}
+- {src: frontend, dst: productcatalogservice, placement: cross-node}
+- {src: recommendationservice, dst: productcatalogservice, placement: cross-node}
+
+timing:
+  healthy_seconds: 1800
+  episode_seconds: 180
+  healthy_pre_seconds: 60
+  planned_fault_seconds: 60
+  planned_recovery_seconds: 60
+  minimum_cooldown_seconds: 60
+  maximum_recovery_wait_seconds: 180
+
+load_qualification:
+  duration_seconds_per_profile: 300
+  cooldown_seconds: 60
+  selected_profile_stability_seconds: 600
+  selection: highest-qualified
+  control_plane_results_are_gates: false
+  profiles:
+  - profile_id: multi-node-open-loop-25
+    scale_percent: 25
+    target_arrival_rate_rps: 25
+    workers: 8
+    behavior_weights: {browse_search_list: 40, detail_recommendation_ad_currency: 25, cart: 20, checkout: 15}
+  - profile_id: multi-node-open-loop-40
+    scale_percent: 40
+    target_arrival_rate_rps: 40
+    workers: 8
+    behavior_weights: {browse_search_list: 40, detail_recommendation_ad_currency: 25, cart: 20, checkout: 15}
+  - profile_id: multi-node-open-loop-55
+    scale_percent: 55
+    target_arrival_rate_rps: 55
+    workers: 8
+    behavior_weights: {browse_search_list: 40, detail_recommendation_ad_currency: 25, cart: 20, checkout: 15}
+  objective_gates:
+    maximum_business_error_rate: 0.001
+    maximum_worker_cpu_p95: 0.70
+    maximum_worker_memory_p95: 0.80
+    minimum_achieved_rps_ratio: 0.90
+    require_all_tcp_edge_counts: true
+    require_projected_model_rows: true
+
+host_nic:
+  # This flag may change only before the formal manifest is generated. A TCP
+  # failure is never accepted as a substitute for this host coordinate.
+  supported: true
+  unsupported_action: remove-coordinate-before-manifest-generation
+
+formal_fault_matrix:
+  repeats: 3
+  service:
+  - metric: cpu_usage_rate
+    mechanism: service_cpu
+    injector_profile_id: service-cpu-v1
+    targets: [frontend, cartservice, shippingservice, emailservice, checkoutservice, currencyservice, paymentservice, recommendationservice, productcatalogservice, adservice, redis-cart]
+  - metric: cpu_throttle_ratio
+    mechanism: service_cpu_throttle
+    injector_profile_id: service-cpu-throttle-v1
+    targets: [frontend, checkoutservice]
+  - metric: memory_working_set_ratio
+    mechanism: service_memory
+    injector_profile_id: service-memory-v1
+    targets: [cartservice, recommendationservice]
+  - metric: io_psi
+    mechanism: service_io
+    injector_profile_id: service-io-v1
+    targets: [redis-cart, productcatalogservice]
+  - metric: futex_wait_time_rate
+    mechanism: service_futex
+    injector_profile_id: service-futex-v1
+    targets: [checkoutservice, paymentservice]
+  - metric: local_socket_failure_rate
+    mechanism: service_local_socket
+    injector_profile_id: service-local-socket-v1
+    targets: [frontend, checkoutservice]
+  host:
+  - metric: cpu_psi
+    mechanism: host_cpu
+    injector_profile_id: host-cpu-v1
+    targets: [worker-1, worker-2, worker-3]
+  - metric: memory_psi
+    mechanism: host_memory
+    injector_profile_id: host-memory-v1
+    targets: [worker-1, worker-2]
+  - metric: io_psi
+    mechanism: host_io
+    injector_profile_id: host-io-v1
+    targets: [worker-2, worker-3]
+  - metric: nic_drop_error_rate
+    mechanism: host_nic
+    injector_profile_id: host-nic-v1
+    targets: [worker-1]
+  tcp:
+  - metric: edge_latency_p95
+    mechanism: tcp_latency
+    injector_profile_id: tcp-latency-v1
+    targets:
+    - {src: frontend, dst: cartservice}
+    - {src: checkoutservice, dst: paymentservice}
+    - {src: frontend, dst: productcatalogservice}
+    - {src: recommendationservice, dst: productcatalogservice}
+  - metric: edge_failure_rate
+    mechanism: tcp_failure
+    injector_profile_id: tcp-failure-v1
+    targets:
+    - {src: frontend, dst: cartservice}
+    - {src: checkoutservice, dst: paymentservice}
+    - {src: frontend, dst: productcatalogservice}
+    - {src: recommendationservice, dst: productcatalogservice}
+
+pilot_matrix:
+- {entity_kind: service, entity_id: frontend, metric: cpu_usage_rate, mechanism: service_cpu, injector_profile_id: service-cpu-v1}
+- {entity_kind: service, entity_id: checkoutservice, metric: cpu_throttle_ratio, mechanism: service_cpu_throttle, injector_profile_id: service-cpu-throttle-v1}
+- {entity_kind: service, entity_id: cartservice, metric: memory_working_set_ratio, mechanism: service_memory, injector_profile_id: service-memory-v1}
+- {entity_kind: service, entity_id: redis-cart, metric: io_psi, mechanism: service_io, injector_profile_id: service-io-v1}
+- {entity_kind: service, entity_id: paymentservice, metric: futex_wait_time_rate, mechanism: service_futex, injector_profile_id: service-futex-v1}
+- {entity_kind: service, entity_id: frontend, metric: local_socket_failure_rate, mechanism: service_local_socket, injector_profile_id: service-local-socket-v1}
+- {entity_kind: host, entity_id: worker-1, metric: cpu_psi, mechanism: host_cpu, injector_profile_id: host-cpu-v1}
+- {entity_kind: host, entity_id: worker-1, metric: memory_psi, mechanism: host_memory, injector_profile_id: host-memory-v1}
+- {entity_kind: host, entity_id: worker-2, metric: io_psi, mechanism: host_io, injector_profile_id: host-io-v1}
+- {entity_kind: host, entity_id: worker-1, metric: nic_drop_error_rate, mechanism: host_nic, injector_profile_id: host-nic-v1}
+- {entity_kind: tcp_edge, entity_id: frontend->cartservice, metric: edge_latency_p95, mechanism: tcp_latency, injector_profile_id: tcp-latency-v1}
+- {entity_kind: tcp_edge, entity_id: frontend->productcatalogservice, metric: edge_failure_rate, mechanism: tcp_failure, injector_profile_id: tcp-failure-v1}
+
+overhead_experiments:
+- {experiment_id: O0, mode: application-only}
+- {experiment_id: O1, mode: normal-only}
+- {experiment_id: O2, mode: normal-plus-burst}
+- {experiment_id: O3, mode: full-proberca}
+
+synthetic:
+  group_count: 120
+  graph_sizes: [25, 50, 100, 250, 500]
+  topology_densities: [sparse, dense]
+  noise_levels: [low, high]
+  missingness_levels: [low, high]
+  seeds: [1, 2, 3]
+
+test_isolation:
+  opaque_case_ids: true
+  private_manifest_format: openssl-cms-der
+  encryption: aes-256-gcm
+  public_commitment: hmac-sha256
+  private_key_must_remain_off_cluster: true
+  freeze_predictions_before_decryption: true

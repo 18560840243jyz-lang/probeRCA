@@ -6,10 +6,12 @@ description: "Enforce the final frozen ProbeRCA-BPF two-plane online RCA scheme 
 # Final ProbeRCA-BPF Scheme
 
 > This is the only active project scheme skill. The former P/B-stage skill is retired.
-> Keep data and control planes separate. Do not inject faults before the current
-> load profile has an exact READY handshake. After READY, fault injection is an
-> explicit data-plane experiment and must never feed its manifest or labels into
-> inference. Do not restore a composite relation-strength variable or add
+> Keep data and control planes separate. Online RCA qualification and bounded
+> algorithm smoke tests require the current load profile's exact READY handshake.
+> The separately frozen one-time multi-node evidence-acquisition campaign is gated
+> by data integrity and intervention effectiveness, not by the current algorithm's
+> Soft/Hard/READY result. In both workflows, fault manifests and labels must never
+> feed inference. Do not restore a composite relation-strength variable or add
 > counterfactual repeated solves.
 
 下面给出最终定稿版 ProbeRCA-BPF 在线根因定位方案。这一版严格按照我们最后商议的结果组织，不再引入额外的综合关系强度变量，也暂不加入反事实重复求解。
@@ -2331,8 +2333,10 @@ TCP边独立告警
   配置profile各运行300个健康窗口，即使低档失败也必须独立完成其余档位。
 - 每个正式坐标按其300窗实际有效样本率或`A_v`有效训练行率投影到600窗，并与
   该坐标的精确Baseline/`A_v`最低要求的2倍比较；禁止使用统一固定覆盖窗数。
-- Confirmed Hard、拓扑/运行身份变化、Pod新增重启或正式坐标投影不足会使profile
-  失败；Soft和Hard Candidate只作为诊断。
+- 单机在线RCA资格仍按本节历史冻结规则处理。一次性多机证据campaign使用独立
+  `probeRCA-multinode-campaign-v1`规则：资格验证只以数据完整性、资源容量、业务
+  错误率、实际到达率、正式边覆盖和投影训练行作为门禁；当前Soft、Hard、READY、
+  FISTA或RCA排名只记录，不阻止租机期间的数据采集。
 - 从通过的profile中选择负载最高者，冻结全部请求参数与fingerprint。当前正式
   单机profile是`single-vm-qualified-55`，fingerprint为
   `d3f0bffc6c26cb4d3f837d66eb62b5e377bae78b97522c5cefa75f3f0c2ee848`。
@@ -2447,3 +2451,58 @@ TCP边独立告警
 - Missing markers, phase gaps, overlapping windows, runtime/topology changes,
   or activation before the boundary fail closed. Never hide them with copied
   windows, timestamp rewriting, zero fill, interpolation, or model changes.
+
+## One-time multi-node evidence campaign
+
+- 租机前必须用`configs/final_multinode_campaign.yaml`生成并冻结campaign。Host NIC
+  支持时核心数据集为135个：3段1800窗Healthy、12个Pilot、111个正式故障和9个无故障
+  对照；Host NIC在Pilot前证明不支持时，只允许在生成正式manifest前删除该坐标，核心
+  数据集变为131个。禁止用TCP loss替代Host NIC后仍声称主机NIC根因。
+- 正式范围为11个Service-backed业务服务、3个Worker和15条有向TCP边，理论根因坐标
+  `11*6+3*4+15*2=108`，每窗正式记录`11*9+3*4+15*3=156`。这些数量由scope/config
+  推导，不得在RCA算法中硬编码。
+- 37个可注入具体坐标各重复3次；每个坐标用固定master seed随机选择1次Validation、
+  其余2次Test，再以固定随机顺序执行，禁止同坐标连续注入。Host NIC删除分支相应为
+  36个坐标、36个Validation和72个Test故障。
+- Test的故障与无故障对照都只使用不透明ID。目标、机制、repeat、注入参数、effectiveness
+  和真实标签属于完整私有元数据；必须在内存中生成后用离线持有私钥的公钥证书加密，
+  服务器和算法工作区不得保存明文。公开manifest只保留HMAC-SHA256承诺，不得使用可
+  穷举的普通SHA标签承诺。
+- Test流程严格单向：冻结Git SHA和配置 -> 对全部不透明Test数据只推断一次 -> 原子封存
+  predictions -> 才允许解密标签 -> 评分。禁止解密后重跑或挑选参数。
+- 每个故障必须记录`planned_start_ns`、`apply_command_start_ns`、`effect_confirmed_ns`、
+  `planned_end_ns`、`cleanup_command_start_ns`和`cleanup_confirmed_ns`。只有完整落在
+  effect-confirmed与cleanup-start之间的窗口属于`FAULT_ACTIVE`；跨边界窗口标记为
+  `TRANSITION_APPLY`或`TRANSITION_CLEANUP`并从主要准确率分母排除。
+- 在线campaign只因Normal/Burst错位、窗口/时间戳损坏、Pod重启、意外拓扑/运行身份变化、
+  注入无直接证据、非目标污染、清理失败、SHA失败、存储不足或采集服务退出而作废重采。
+  当前Soft/Hard/READY、A_s/A_v状态、FISTA排名和RCA正确性不是采集停止条件。
+- Campaign状态绑定不可变manifest fingerprint和顺序。失败只允许同一case ID增加attempt
+  后重采，不允许跳到后续case、重新随机或覆盖已封存Dataset ID/SHA。
+- 四机正式数据面必须是Worker本地primitive exporter、Beyla、eBPF/Burst和node exporter，
+  S0上的Prometheus只负责以250 ms抓取3个Worker exporter并以1秒抓取3个node exporter。
+  三个Worker使用同一未来整秒边界采集。Worker按caller归属分别投影8/7/0条TCP边，
+  各自保存全局拓扑但只输出本地服务、单个本地主机和本地caller边指标；投影archive不得
+  直接进入控制面。回传后必须验证每个服务/主机/边恰有一个owner，再合并为每窗156条正式
+  记录；任何Worker缺窗、错位、重复、owner冲突或身份不一致均失败关闭。
+- 每个数据集必须同时保存合并Normal/Burst、3份每秒原始累计primitive边界、3份过滤后
+  eBPF事件和checkpoint、topology/runtime身份、配置、manifest与SHA。过滤事件仅用于
+  关机后的Burst重聚合，不能直接进入RCA或携带故障标签。
+- Online Boutique上游manifest SHA、11个业务镜像digest、Beyla digest、固定placement、
+  emailservice探针和单一开放环负载源必须由image lock和正式渲染器生成。默认
+  loadgenerator必须删除，禁止叠加历史定向负载或DNS实验负载。
+- Load Qualification必须完整运行25/40/55三个300窗profile，只使用Normal/Burst完整性、
+  数据源缺口、Pod重启、topology/runtime、业务错误、Worker CPU/内存、15条TCP边覆盖和
+  投影建模行数作为门禁。Soft、Hard、READY、FISTA和RCA结果不得进入资格报告。选择
+  所有合格档中RPS最高者并冻结profile fingerprint。
+- Qualification的Baseline坐标集合由108个正式根因及其`A_v`语义父指标动态推导，不能把
+  156条物理记录错误当成Baseline固定分母；每个profile必须用自动生成的多机control config
+  和封存archive计算逐坐标投影行数，禁止人工拼接或省略稀疏坐标。
+- 注入器candidate的每个字段必须被allow-listed执行器实际消费。12个真实Pilot必须用
+  独立数据证据证明effectiveness、非目标污染为零和精确cleanup；模拟Pilot永远不能冻结
+  注册表。TCP使用Pod netns内按目标方向匹配的qdisc/filter；Host NIC若云网卡qdisc不能
+  安全替换或正式drop/error指标不能上升，就在正式manifest生成前删除该坐标。
+- `pre_rent_code_ready=true`只证明代码、确定性manifest、CMS、断点恢复、假目标演练、
+  archive上传/回读和离线恢复通过。租机后仍必须完成四节点规格/时钟/磁盘/Worker数据源、
+  精确镜像与placement、对象存储独立回读、三个Load Qualification和12个真实Pilot；只有
+  `formal_campaign_go=true`才允许开始135/131个核心数据集campaign。

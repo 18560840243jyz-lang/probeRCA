@@ -54,6 +54,14 @@ from proberca.dataplane.raw import (
     RawCollectionWindow,
     RawMetricSample,
 )
+from proberca.dataplane.raw_archive import (
+    RawPrimitiveArchive,
+    RawPrimitiveArchiveWriter,
+)
+from proberca.campaign.dataset_package import (
+    DatasetPackageError,
+    seal_dataset_directory,
+)
 from proberca.dataplane.sources import (
     PrometheusPrimitiveQuery,
     PrometheusPrimitiveSource,
@@ -1264,6 +1272,108 @@ def test_aligned_incremental_success_seals_matching_archives(
         (item.sequence, item.window_start_ns, item.window_end_ns)
         for item in burst.iter_windows()
     ]
+
+
+def test_raw_primitive_archive_round_trip_is_write_once_and_content_verified(
+    tmp_path,
+):
+    dataset_id = fingerprint({"dataset": "raw-primitives"})
+    source_fingerprint = fingerprint({"source": "worker-1-prometheus"})
+    writer = RawPrimitiveArchiveWriter(
+        tmp_path / "raw",
+        dataset_id=dataset_id,
+        source_fingerprint=source_fingerprint,
+    )
+    raw = _raw_window(include_dns=False)
+    writer.append(raw)
+    manifest = writer.seal()
+    archive = RawPrimitiveArchive(tmp_path / "raw")
+    assert archive.manifest == manifest
+    assert tuple(item.to_dict() for item in archive.iter_windows()) == (
+        raw.to_dict(),
+    )
+    with pytest.raises(RawCollectionError, match="lowercase SHA-256"):
+        RawPrimitiveArchiveWriter(
+            tmp_path / "bad-id",
+            dataset_id="G" * 64,
+            source_fingerprint=source_fingerprint,
+        )
+    windows_path = tmp_path / "raw" / "raw-primitive-windows.jsonl"
+    windows_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(RawCollectionError, match="integrity"):
+        RawPrimitiveArchive(tmp_path / "raw")
+
+
+def test_campaign_dataset_package_requires_three_aligned_raw_worker_archives(
+    contract, tmp_path,
+):
+    normal_window, burst_window = _aligned_test_pair(contract, 1)
+    normal_writer, burst_writer = _aligned_test_writers(
+        contract, tmp_path, normal_window.collection_metadata,
+    )
+    normal_writer.append(normal_window)
+    burst_writer.append(burst_window)
+    normal = normal_writer.seal()
+    burst_writer.seal()
+    raw = _raw_window(include_dns=False)
+    for worker in ("worker-1", "worker-2", "worker-3"):
+        writer = RawPrimitiveArchiveWriter(
+            tmp_path / "primitives" / worker,
+            dataset_id=normal.dataset_id,
+            source_fingerprint=fingerprint({"source": worker}),
+        )
+        writer.append(raw)
+        writer.seal()
+        audit = tmp_path / "raw-events" / worker
+        audit.mkdir(parents=True)
+        events = audit / "filtered-ebpf-events.jsonl"
+        checkpoints = audit / "checkpoints.jsonl"
+        events.write_text("", encoding="utf-8")
+        checkpoints.write_text("", encoding="utf-8")
+        event_core = {
+            "schema_version": "probeRCA-filtered-burst-raw-events-v1",
+            "event_source_fingerprint": fingerprint({"events": worker}),
+            "burst_config_fingerprint": contract["burst_config_fingerprint"],
+            "start_ns": normal.start_ns,
+            "end_ns": normal.end_ns,
+            "boundary_count": normal.window_count + 1,
+            "event_count": 0,
+            "checkpoint_count": 0,
+            "events_sha256": hashlib.sha256(b"").hexdigest(),
+            "checkpoints_sha256": hashlib.sha256(b"").hexdigest(),
+        }
+        (audit / "raw-event-manifest.json").write_text(
+            canonical_json({
+                **event_core,
+                "manifest_fingerprint": fingerprint(event_core),
+            }) + "\n",
+            encoding="utf-8",
+        )
+    result = seal_dataset_directory(tmp_path, {
+        "dataset_id": normal.dataset_id,
+        "case_id": "H-DEV",
+        "git_sha": "a" * 40,
+        "load_profile_id": "multi-node-open-loop-40",
+        "load_profile_fingerprint": "b" * 64,
+        "public_manifest_fingerprint": "c" * 64,
+        "campaign_config_fingerprint": "d" * 64,
+    })
+    assert result["sealed"] is True
+    assert (tmp_path / "dataset-manifest.json").is_file()
+    sums = (tmp_path / "SHA256SUMS").read_text(encoding="utf-8")
+    assert "normal/collection-manifest.json" in sums
+    assert "burst/burst-manifest.json" in sums
+    assert sums.count("raw-primitive-manifest.json") == 3
+    assert sums.count("raw-event-manifest.json") == 3
+    with pytest.raises(DatasetPackageError, match="already sealed"):
+        seal_dataset_directory(tmp_path, {
+            "dataset_id": normal.dataset_id, "case_id": "H-DEV",
+            "git_sha": "a" * 40,
+            "load_profile_id": "multi-node-open-loop-40",
+            "load_profile_fingerprint": "b" * 64,
+            "public_manifest_fingerprint": "c" * 64,
+            "campaign_config_fingerprint": "d" * 64,
+        })
 
 
 def test_global_resource_watermark_change_does_not_fake_layout_change(

@@ -22,6 +22,7 @@ from proberca.dataplane.collector import (
 )
 from proberca.dataplane.contracts import canonical_json, fingerprint
 from proberca.dataplane.sources import PrometheusPrimitiveSource
+from proberca.dataplane.raw_archive import RawPrimitiveArchiveWriter
 
 
 def _mapping(path: Path) -> dict:
@@ -45,6 +46,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--burst-config", type=Path, required=True)
     parser.add_argument("--burst-output", type=Path, required=True)
     parser.add_argument("--windows", type=int, required=True)
+    parser.add_argument(
+        "--raw-primitives-output", type=Path,
+        help="write raw cumulative counter boundaries for offline reaggregation",
+    )
+    parser.add_argument(
+        "--raw-events-output", type=Path,
+        help="preserve filtered formal eBPF events and loss checkpoints",
+    )
+    parser.add_argument(
+        "--dataset-id",
+        help="precommitted SHA-256 shared by all distributed worker collectors",
+    )
+    parser.add_argument(
+        "--first-window-start-ns", type=int,
+        help="shared, future, epoch-aligned first boundary for distributed capture",
+    )
     parser.add_argument(
         "--capture-complete-marker", type=Path,
         help="atomically record completion of exact boundary capture",
@@ -101,6 +118,8 @@ def _write_aligned_windows(
     capture_complete_marker: Path | None = None,
     phase_boundary_window: int | None = None,
     phase_boundary_marker: Path | None = None,
+    first_window_start_ns: int | None = None,
+    raw_writer: RawPrimitiveArchiveWriter | None = None,
 ) -> None:
     try:
         if normal_writer.dataset_id != burst_writer.dataset_id:
@@ -122,15 +141,26 @@ def _write_aligned_windows(
                     )
                     if sequence == phase_boundary_window else None
                 )
-            )
+                )
+        if first_window_start_ns is not None:
+            iterator_kwargs["first_window_start_ns"] = first_window_start_ns
+        pending_raw = []
+        if raw_writer is not None:
+            iterator_kwargs["raw_window_callback"] = pending_raw.append
         for normal_window, burst_window in runner.iter_collect_aligned(
             window_count, **iterator_kwargs,
         ):
+            if raw_writer is not None:
+                if len(pending_raw) != 1:
+                    raise ValueError("runner did not provide exactly one aligned raw window")
+                raw_writer.append(pending_raw.pop())
             normal_writer.append(normal_window)
             burst_writer.append(burst_window)
     except Exception:
         normal_writer.close_partial()
         burst_writer.close_partial()
+        if raw_writer is not None:
+            raw_writer.close_partial()
         aligned = (
             normal_writer.window_count == burst_writer.window_count
         )
@@ -178,7 +208,7 @@ def main(argv=None) -> int:
         raise ValueError("normal and Burst cluster identities differ")
     primitive_source = PrometheusPrimitiveSource(source_config.prometheus)
     started_at_ns = time.time_ns()
-    dataset_id = fingerprint({
+    generated_dataset_id = fingerprint({
         "cluster_id": source_config.cluster_id,
         "source_config_fingerprint": source_config.public_fingerprint,
         "burst_source_config_fingerprint": burst_config.public_fingerprint,
@@ -186,12 +216,23 @@ def main(argv=None) -> int:
         "requested_window_count": args.windows,
         "started_at_ns": started_at_ns,
     })
+    dataset_id = args.dataset_id or generated_dataset_id
+    if (
+        not isinstance(dataset_id, str) or len(dataset_id) != 64
+        or any(character not in "0123456789abcdef" for character in dataset_id)
+    ):
+        raise ValueError("dataset ID must be a lowercase SHA-256")
+    if (args.dataset_id is None) != (args.first_window_start_ns is None):
+        raise ValueError(
+            "distributed collection requires both dataset ID and first boundary"
+        )
     burst_source = FinalLiveBurstSource(
         burst_config,
         burst_config_fingerprint=contract["burst_config_fingerprint"],
         formal_tcp_edge_entity_ids=(
             source_config.formal_tcp_edge_entity_ids
         ),
+        strict_formal_tcp_edge_scope=source_config.is_worker_projection,
     )
     burst_writer = BurstArchiveWriter(
         args.burst_output,
@@ -217,24 +258,61 @@ def main(argv=None) -> int:
             "burst_config_fingerprint"
         ],
     }
+    projection = None
+    if source_config.is_worker_projection:
+        projection = {
+            "schema_version": "probeRCA-worker-projection-v1",
+            "owner": source_config.projection_owner,
+            "node_name": source_config.projection_node_name,
+            "service_entity_ids": sorted(
+                source_config.projection_service_entity_ids
+            ),
+            "tcp_edge_entity_ids": sorted(
+                source_config.formal_tcp_edge_entity_ids
+            ),
+            "formal_service_entity_ids": sorted(
+                source_config.formal_service_entity_ids
+            ),
+            "topology_tcp_edge_entity_ids": sorted(
+                source_config.topology_tcp_edge_entity_ids
+            ),
+        }
+        projection["projection_fingerprint"] = fingerprint(projection)
     writer = CollectionArchiveWriter(
         args.output,
         dataset_id=dataset_id,
         collection_contract=contract,
         source_description=contract["source_description"],
         collection_metadata=metadata,
+        projection=projection,
     )
-    _write_aligned_windows(
-        runner=runner,
-        normal_writer=writer,
-        burst_writer=burst_writer,
-        window_count=args.windows,
-        capture_complete_marker=args.capture_complete_marker,
-        phase_boundary_window=args.phase_boundary_window,
-        phase_boundary_marker=args.phase_boundary_marker,
+    if args.raw_events_output is not None:
+        burst_source.configure_capture_audit(args.raw_events_output)
+    raw_writer = (
+        RawPrimitiveArchiveWriter(
+            args.raw_primitives_output,
+            dataset_id=dataset_id,
+            source_fingerprint=source_config.public_fingerprint,
+        )
+        if args.raw_primitives_output is not None else None
     )
+    try:
+        _write_aligned_windows(
+            runner=runner,
+            normal_writer=writer,
+            burst_writer=burst_writer,
+            window_count=args.windows,
+            capture_complete_marker=args.capture_complete_marker,
+            phase_boundary_window=args.phase_boundary_window,
+            phase_boundary_marker=args.phase_boundary_marker,
+            first_window_start_ns=args.first_window_start_ns,
+            raw_writer=raw_writer,
+        )
+    finally:
+        burst_source.finalize_capture_audit()
     archive = writer.seal()
     burst_archive = burst_writer.seal()
+    raw_archive = raw_writer.seal() if raw_writer is not None else None
     print(canonical_json({
         "burst_manifest_fingerprint": (
             burst_archive.manifest_fingerprint
@@ -246,6 +324,9 @@ def main(argv=None) -> int:
         "phase": "collection_sealed",
         "prometheus_range_query_stats": (
             primitive_source.last_range_query_stats
+        ),
+        "raw_primitives_manifest_fingerprint": (
+            raw_archive["manifest_fingerprint"] if raw_archive else None
         ),
         "window_count": archive.window_count,
     }))
