@@ -1468,6 +1468,20 @@ def test_multinode_dataplane_render_is_worker_local_and_formally_complete(tmp_pa
         assert len(source_config.projection_service_entity_ids) == expected_count
         assert len(source_config.formal_service_entity_ids) == 11
         assert len(source_config.formal_tcp_edge_entity_ids) == expected_edge_count
+        edge_query_components = {
+            item.component for item in source_config.prometheus.queries
+            if item.component.startswith("edge_")
+        }
+        if expected_edge_count:
+            assert edge_query_components == {
+                "edge_request_total",
+                "edge_latency_observation_total",
+                "edge_error_total",
+                "edge_timeout_total",
+                "edge_latency_histogram",
+            }
+        else:
+            assert edge_query_components == set()
         assert len(source_config.topology_tcp_edge_entity_ids) == 15
         assert all(
             item.split("::")[2].split("->", 1)[0]

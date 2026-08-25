@@ -124,6 +124,11 @@ def render(
             "namespaces": ["online-boutique"],
         })
         source["prometheus"]["base_url"] = nodes["prometheus_base_url"]
+        if not local_edge_ids:
+            source["prometheus"]["queries"] = [
+                query for query in source["prometheus"]["queries"]
+                if not query["component"].startswith("edge_")
+            ]
         for query in source["prometheus"]["queries"]:
             query["promql"] = _promql_worker(query["promql"], worker)
             optional = list(query.get("optional_labels", ()))
