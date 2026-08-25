@@ -897,6 +897,115 @@ def test_service_rpc_rows_merge_concrete_and_wildcard_business_buckets():
     }
 
 
+def test_rpc_edge_destination_prefers_canonical_method_over_wrong_address():
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    inventory = SimpleNamespace(
+        services=frozenset({
+            ("online-boutique", "frontend"),
+            ("online-boutique", "adservice"),
+            ("online-boutique", "cartservice"),
+            ("online-boutique", "checkoutservice"),
+            ("online-boutique", "emailservice"),
+            ("online-boutique", "paymentservice"),
+            ("online-boutique", "shippingservice"),
+        }),
+        service_cluster_ips={},
+    )
+
+    def family(source_service, method, wrong_address, count):
+        labels = {
+            "k8s_namespace_name": "online-boutique",
+            "service_name": source_service,
+            "k8s_pod_name": f"{source_service}-pod",
+            "k8s_container_name": "server",
+            "rpc_method": method,
+            "rpc_grpc_status_code": "0",
+            "server_address": wrong_address,
+        }
+        return (
+            PrometheusSample.create(
+                "rpc_client_duration_seconds_count", labels, count,
+            ),
+            PrometheusSample.create(
+                "rpc_client_duration_seconds_bucket",
+                {**labels, "le": "0.01"}, count,
+            ),
+            PrometheusSample.create(
+                "rpc_client_duration_seconds_bucket",
+                {**labels, "le": "+Inf"}, count,
+            ),
+        )
+
+    samples = (
+        *family(
+            "checkoutservice",
+            "/hipstershop.EmailService/SendOrderConfirmation",
+            "cartservice", 7,
+        ),
+        *family(
+            "checkoutservice", "/hipstershop.PaymentService/Charge",
+            "cartservice", 9,
+        ),
+        *family(
+            "frontend", "/hipstershop.CheckoutService/PlaceOrder",
+            "adservice", 11,
+        ),
+        *family(
+            "frontend", "/hipstershop.ShippingService/GetQuote",
+            "cartservice", 13,
+        ),
+    )
+    rows = exporter._request_rows(samples, inventory, edge=True)
+
+    assert {
+        (row.service, row.destination_service, row.count.value)
+        for row in rows
+    } == {
+        ("checkoutservice", "emailservice", 7),
+        ("checkoutservice", "paymentservice", 9),
+        ("frontend", "checkoutservice", 11),
+        ("frontend", "shippingservice", 13),
+    }
+
+
+def test_rpc_edge_destination_keeps_address_fallback_for_wildcard_method():
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    inventory = SimpleNamespace(
+        services=frozenset({
+            ("online-boutique", "recommendationservice"),
+            ("online-boutique", "productcatalogservice"),
+        }),
+        service_cluster_ips={},
+    )
+    labels = {
+        "k8s_namespace_name": "online-boutique",
+        "service_name": "recommendationservice",
+        "k8s_pod_name": "recommendation-pod",
+        "k8s_container_name": "server",
+        "rpc_method": "*",
+        "rpc_grpc_status_code": "0",
+        "server_address": "productcatalogservice",
+    }
+    samples = (
+        PrometheusSample.create(
+            "rpc_client_duration_seconds_count", labels, 12,
+        ),
+        PrometheusSample.create(
+            "rpc_client_duration_seconds_bucket",
+            {**labels, "le": "0.01"}, 12,
+        ),
+        PrometheusSample.create(
+            "rpc_client_duration_seconds_bucket",
+            {**labels, "le": "+Inf"}, 12,
+        ),
+    )
+
+    rows = exporter._request_rows(samples, inventory, edge=True)
+
+    assert len(rows) == 1
+    assert rows[0].destination_service == "productcatalogservice"
+
+
 def test_exporter_uses_persistent_source_workers_and_slow_stage_logging():
     source = Path(
         "proberca/dataplane/primitive_exporter.py"

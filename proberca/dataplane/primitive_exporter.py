@@ -644,6 +644,45 @@ def _resolve_destination(
     return candidate if candidate in inventory.services else None
 
 
+def _resolve_rpc_method_destination(
+    method: str,
+    *,
+    caller_namespace: str,
+    inventory: Inventory,
+) -> tuple[str, str] | None:
+    """Resolve a gRPC destination from its fully-qualified service name.
+
+    Beyla can occasionally associate a client span with the server address of
+    another long-lived gRPC connection in the same process.  The canonical
+    ``/package.Service/Method`` identity is emitted by the RPC runtime and is
+    therefore the stronger destination signal when it maps unambiguously to a
+    Service in the frozen inventory.  Wildcard/unknown methods deliberately
+    return ``None`` so callers can retain the existing address fallback.
+    """
+
+    if not _RPC_METHOD_ROUTE.fullmatch(method):
+        return None
+    service_descriptor = method.rsplit("/", 1)[0].lstrip("/")
+    rpc_service = service_descriptor.rsplit(".", 1)[-1]
+    normalized_rpc_service = re.sub(
+        r"[^a-z0-9]", "", rpc_service.lower()
+    )
+    if not normalized_rpc_service:
+        return None
+    matches = sorted(
+        candidate
+        for candidate in inventory.services
+        if candidate[0] == caller_namespace
+        and re.sub(r"[^a-z0-9]", "", candidate[1].lower())
+        == normalized_rpc_service
+    )
+    if len(matches) > 1:
+        raise RawCollectionError(
+            "gRPC method destination is ambiguous in frozen inventory"
+        )
+    return matches[0] if matches else None
+
+
 class FinalPrimitiveExporter:
     """Collect source primitives and expose an aligned immutable snapshot."""
 
@@ -1523,11 +1562,20 @@ class FinalPrimitiveExporter:
                 if (namespace, service) not in inventory.services:
                     continue
                 if edge:
-                    destination = _resolve_destination(
-                        labels.get("server_address", ""),
-                        caller_namespace=namespace,
-                        inventory=inventory,
+                    destination = (
+                        _resolve_rpc_method_destination(
+                            labels.get("rpc_method", ""),
+                            caller_namespace=namespace,
+                            inventory=inventory,
+                        )
+                        if protocol == "rpc" else None
                     )
+                    if destination is None:
+                        destination = _resolve_destination(
+                            labels.get("server_address", ""),
+                            caller_namespace=namespace,
+                            inventory=inventory,
+                        )
                     if destination is None or destination == (namespace, service):
                         continue
                     destination_namespace, destination_service = destination
