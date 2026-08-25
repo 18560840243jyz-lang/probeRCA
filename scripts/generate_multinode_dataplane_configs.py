@@ -61,8 +61,19 @@ def render(
         node = worker_nodes[worker]
         root = output / worker
         root.mkdir()
+        local_service_names = set(campaign["placement"][worker])
+        local_service_ids = [
+            f"{cluster_id}::online-boutique::{service}"
+            for service in campaign["placement"][worker]
+        ]
+        local_edge_ids = [
+            entity_id for entity_id, edge in zip(
+                edge_ids, campaign["formal_tcp_edges"], strict=True,
+            )
+            if edge["src"] in local_service_names
+        ]
         exporter = {
-            "schema_version": "probeRCA-final-primitive-exporter-v6",
+            "schema_version": "probeRCA-final-primitive-exporter-v7",
             "cluster_id": cluster_id,
             "kubeconfig_path": nodes["readonly_kubeconfig_path"],
             "kubernetes_context": nodes["kubernetes_context"],
@@ -92,20 +103,10 @@ def render(
                 f"online-boutique/{service}"
                 for service in campaign["placement"][worker]
             ],
+            "formal_tcp_edge_entity_ids": local_edge_ids,
             "host_cgroup_root": "/sys/fs/cgroup",
         }
         source = copy.deepcopy(base_source)
-        local_service_names = set(campaign["placement"][worker])
-        local_service_ids = [
-            f"{cluster_id}::online-boutique::{service}"
-            for service in campaign["placement"][worker]
-        ]
-        local_edge_ids = [
-            entity_id for entity_id, edge in zip(
-                edge_ids, campaign["formal_tcp_edges"], strict=True,
-            )
-            if edge["src"] in local_service_names
-        ]
         source["schema_version"] = "probeRCA-final-live-collector-v3"
         source["cluster_id"] = cluster_id
         source["formal_tcp_edge_entity_ids"] = local_edge_ids

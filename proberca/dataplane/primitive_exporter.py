@@ -50,7 +50,7 @@ FINAL_PRIMITIVE_EXPORTER_SCHEMA_VERSION = (
     "probeRCA-final-primitive-exporter-v5"
 )
 MULTINODE_PRIMITIVE_EXPORTER_SCHEMA_VERSION = (
-    "probeRCA-final-primitive-exporter-v6"
+    "probeRCA-final-primitive-exporter-v7"
 )
 DNS_BUCKETS_MS = (
     0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0,
@@ -112,6 +112,22 @@ def _local_service_coordinates(
 
     return frozenset(
         (item.namespace, item.service) for item in inventory.containers
+    )
+
+
+def _missing_required_tcp_edge_samples(
+    formal_tcp_edge_entity_ids: tuple[str, ...],
+    samples: Iterable[PrometheusSample],
+    *,
+    projection_is_explicit: bool = True,
+) -> bool:
+    """Return whether a non-empty frozen worker edge projection is absent."""
+
+    edge_samples_required = (
+        bool(formal_tcp_edge_entity_ids) if projection_is_explicit else True
+    )
+    return edge_samples_required and not any(
+        item.name == "proberca_tcp_edge_request_total" for item in samples
     )
 
 
@@ -182,6 +198,7 @@ class FinalPrimitiveExporterConfig:
     runtime_mode: str = "kind_container"
     monitored_node_name: str | None = None
     local_services: tuple[str, ...] = ()
+    formal_tcp_edge_entity_ids: tuple[str, ...] = ()
     host_cgroup_root: str = "/sys/fs/cgroup"
 
     @classmethod
@@ -199,12 +216,16 @@ class FinalPrimitiveExporterConfig:
         normalized.setdefault("runtime_mode", "kind_container")
         normalized.setdefault("monitored_node_name", None)
         normalized.setdefault("local_services", normalized.get("include_services", ()))
+        normalized.setdefault("formal_tcp_edge_entity_ids", [])
         normalized.setdefault("host_cgroup_root", "/sys/fs/cgroup")
         values = _strict_mapping(
             normalized, set(cls.__dataclass_fields__),
             "final primitive exporter config",
         )
-        for name in ("namespaces", "include_services", "local_services"):
+        for name in (
+            "namespaces", "include_services", "local_services",
+            "formal_tcp_edge_entity_ids",
+        ):
             if not isinstance(values[name], list):
                 raise RawCollectionError(f"{name} must be a list")
             values[name] = tuple(values[name])
@@ -238,6 +259,19 @@ class FinalPrimitiveExporterConfig:
             root = Path(self.host_cgroup_root)
             if not root.is_absolute():
                 raise RawCollectionError("host_cgroup_root must be absolute")
+            if (
+                len(self.formal_tcp_edge_entity_ids)
+                != len(set(self.formal_tcp_edge_entity_ids))
+                or any(
+                    not isinstance(item, str)
+                    or not item.endswith("::tcp")
+                    or "->" not in item
+                    for item in self.formal_tcp_edge_entity_ids
+                )
+            ):
+                raise RawCollectionError(
+                    "formal_tcp_edge_entity_ids must contain unique TCP edge identities"
+                )
         if type(self.experimental_dns_enabled) is not bool:
             raise RawCollectionError(
                 "experimental_dns_enabled must be boolean"
@@ -2774,9 +2808,12 @@ class FinalPrimitiveExporter:
                 {"cluster_id": self.config.cluster_id}, 1.0,
             ),
         ]
-        if not any(
-            item.name == "proberca_tcp_edge_request_total"
-            for item in samples
+        if _missing_required_tcp_edge_samples(
+            self.config.formal_tcp_edge_entity_ids, samples,
+            projection_is_explicit=(
+                self.config.schema_version
+                == MULTINODE_PRIMITIVE_EXPORTER_SCHEMA_VERSION
+            ),
         ):
             raise RawCollectionError("Beyla returned no directed TCP edges")
         if self.config.experimental_dns_enabled and not any(

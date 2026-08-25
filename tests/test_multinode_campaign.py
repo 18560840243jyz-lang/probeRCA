@@ -1447,6 +1447,7 @@ def test_multinode_dataplane_render_is_worker_local_and_formally_complete(tmp_pa
         assert config.monitored_node_name == worker
         assert len(config.local_services) == expected_count
         assert len(config.include_services) == 11
+        assert len(config.formal_tcp_edge_entity_ids) == expected_edge_count
         union.update(config.local_services)
         source = yaml.safe_load((
             output / worker / "live-collector.yaml"

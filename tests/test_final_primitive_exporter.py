@@ -306,6 +306,36 @@ def test_multinode_request_coverage_requires_only_worker_local_services():
     }
 
 
+def test_multinode_tcp_edge_presence_gate_follows_frozen_worker_projection():
+    samples = (
+        PrometheusSample.create(
+            "proberca_final_primitive_exporter_ready",
+            {"cluster_id": "cluster"}, 1.0,
+        ),
+    )
+
+    assert not primitive_module._missing_required_tcp_edge_samples((), samples)
+    assert primitive_module._missing_required_tcp_edge_samples(
+        (), samples, projection_is_explicit=False,
+    )
+    assert primitive_module._missing_required_tcp_edge_samples(
+        ("cluster::online-boutique::frontend->cartservice::tcp",), samples,
+    )
+    assert not primitive_module._missing_required_tcp_edge_samples(
+        ("cluster::online-boutique::frontend->cartservice::tcp",),
+        (*samples, PrometheusSample.create(
+            "proberca_tcp_edge_request_total",
+            {
+                "namespace": "online-boutique",
+                "src_service": "frontend",
+                "dst_namespace": "online-boutique",
+                "dst_service": "cartservice",
+                "protocol": "tcp",
+            }, 1.0,
+        )),
+    )
+
+
 def test_final_bpf_normal_path_is_map_aggregated_and_window_safe():
     bpf = Path(
         "bpf/final_normal/final_normal.bpf.c"
