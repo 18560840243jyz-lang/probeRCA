@@ -105,6 +105,16 @@ def _is_transient_snapshot_error(error: Exception) -> bool:
     )
 
 
+def _local_service_coordinates(
+    inventory: "Inventory",
+) -> frozenset[tuple[str, str]]:
+    """Return services whose containers belong to this exporter worker."""
+
+    return frozenset(
+        (item.namespace, item.service) for item in inventory.containers
+    )
+
+
 def _select_metric_lines(
     text: str, metric_names: frozenset[str],
 ) -> str:
@@ -2729,10 +2739,13 @@ class FinalPrimitiveExporter:
             for item in service_samples
             if item.name == "proberca_service_request_total"
         }
-        if covered_services != set(inventory.services):
-            missing = sorted(set(inventory.services) - covered_services)
+        expected_services = _local_service_coordinates(inventory)
+        if covered_services != expected_services:
+            missing = sorted(expected_services - covered_services)
+            unexpected = sorted(covered_services - expected_services)
             raise RawCollectionError(
-                f"Beyla/CoreDNS request coverage is incomplete: {missing}"
+                "Beyla/CoreDNS request coverage is incomplete: "
+                f"missing={missing}, unexpected={unexpected}"
             )
         dns_samples = (
             self._dns_samples(inventory, raw.bpf, cgroup_identity)

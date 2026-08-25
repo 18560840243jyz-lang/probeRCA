@@ -286,6 +286,25 @@ def test_host_exporter_fails_closed_when_monitored_node_is_absent():
         exporter._beyla(inventory)
 
 
+def test_multinode_request_coverage_requires_only_worker_local_services():
+    inventory = SimpleNamespace(
+        services=frozenset({
+            ("online-boutique", "frontend"),
+            ("online-boutique", "checkoutservice"),
+            ("online-boutique", "productcatalogservice"),
+        }),
+        containers=(
+            SimpleNamespace(
+                namespace="online-boutique", service="checkoutservice",
+            ),
+        ),
+    )
+
+    assert primitive_module._local_service_coordinates(inventory) == {
+        ("online-boutique", "checkoutservice"),
+    }
+
+
 def test_final_bpf_normal_path_is_map_aggregated_and_window_safe():
     bpf = Path(
         "bpf/final_normal/final_normal.bpf.c"
