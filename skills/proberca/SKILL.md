@@ -2502,6 +2502,12 @@ TCP边独立告警
   独立数据证据证明effectiveness、非目标污染为零和精确cleanup；模拟Pilot永远不能冻结
   注册表。TCP使用Pod netns内按目标方向匹配的qdisc/filter；Host NIC若云网卡qdisc不能
   安全替换或正式drop/error指标不能上升，就在正式manifest生成前删除该坐标。
+- 单根因Pilot由唯一直接干预定义，不能因为一个孤立的次级资源症状自动改判为多根因。
+  `service_cpu`的`cpu_throttle_ratio`污染必须由封存Pilot自身`HEALTHY_PRE`段建立稳健上界，
+  再用逐窗`nr_throttled/nr_periods`直接计数自动复核；禁止使用人工布尔值或尚未建立的最终
+  Healthy控制面模型。直接修改`cpu.max`、故障期中位数越界、连续3窗越界或故障期相对健康期
+  越界比例增加超过5个百分点仍判污染；未达到这些条件的1至2个孤立窗口标记为
+  `PASS_WITH_INCIDENTAL_SECONDARY_SIGNAL`并完整保留证据，不降低CPU usage effectiveness门禁。
 - `pre_rent_code_ready=true`只证明代码、确定性manifest、CMS、断点恢复、假目标演练、
   archive上传/回读和离线恢复通过。租机后仍必须完成四节点规格/时钟/磁盘/Worker数据源、
   精确镜像与placement、对象存储独立回读、三个Load Qualification和12个真实Pilot；只有

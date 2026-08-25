@@ -41,6 +41,22 @@ _INTENSITY_FIELDS = {
     "tcp_failure": frozenset({"loss_percent", "direction"}),
 }
 
+_DIRECT_MUTATION_CONTROLS = {
+    "service_cpu": frozenset(),
+    "service_cpu_throttle": frozenset({"cpu.max"}),
+    "service_memory": frozenset({"memory.high"}),
+    "host_memory": frozenset({"memory.high"}),
+    "host_nic": frozenset({"traffic_control"}),
+    "tcp_latency": frozenset({"traffic_control"}),
+    "tcp_failure": frozenset({"traffic_control"}),
+}
+
+_SECONDARY_SIGNAL_POLICY_FIELDS = frozenset({
+    "metric", "reference_phase", "robust_scale_multiplier",
+    "max_consecutive_excess_windows", "max_excess_fraction_lift",
+    "forbidden_direct_controls", "incidental_status",
+})
+
 
 def load_injector_registry(path: Path, *, require_frozen: bool) -> dict[str, Any]:
     payload = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
@@ -76,6 +92,46 @@ def load_injector_registry(path: Path, *, require_frozen: bool) -> dict[str, Any
             raise InjectorRegistryError(
                 f"injector intensity fields mismatch for {item['profile_id']}"
             )
+        declared_controls = item.get("direct_mutation_controls")
+        if declared_controls is not None:
+            if not isinstance(declared_controls, list) or any(
+                not isinstance(value, str) or not value for value in declared_controls
+            ):
+                raise InjectorRegistryError("direct mutation controls are invalid")
+            expected = _DIRECT_MUTATION_CONTROLS.get(mechanism, frozenset())
+            if frozenset(declared_controls) != expected:
+                raise InjectorRegistryError(
+                    f"direct mutation contract mismatch for {item['profile_id']}"
+                )
+        policy = item.get("secondary_signal_policy")
+        if policy is not None:
+            if not isinstance(policy, dict) or set(policy) != \
+                    _SECONDARY_SIGNAL_POLICY_FIELDS:
+                raise InjectorRegistryError(
+                    f"secondary signal policy fields mismatch for {item['profile_id']}"
+                )
+            if declared_controls is None:
+                raise InjectorRegistryError(
+                    "secondary signal policy requires a direct mutation contract"
+                )
+            if policy["metric"] not in item["contamination_checks"]:
+                raise InjectorRegistryError(
+                    "secondary signal policy metric must be a contamination check"
+                )
+            if policy["reference_phase"] != "HEALTHY_PRE" \
+                    or float(policy["robust_scale_multiplier"]) <= 0 \
+                    or int(policy["max_consecutive_excess_windows"]) < 0 \
+                    or not 0.0 <= float(policy["max_excess_fraction_lift"]) <= 1.0 \
+                    or policy["incidental_status"] != \
+                    "PASS_WITH_INCIDENTAL_SECONDARY_SIGNAL":
+                raise InjectorRegistryError("secondary signal policy is invalid")
+            forbidden = policy["forbidden_direct_controls"]
+            if not isinstance(forbidden, list) or any(
+                not isinstance(value, str) or not value for value in forbidden
+            ):
+                raise InjectorRegistryError(
+                    "secondary signal forbidden controls are invalid"
+                )
         if status == "frozen" and not item.get("pilot_evidence"):
             raise InjectorRegistryError(
                 f"frozen injector lacks Pilot evidence: {item['profile_id']}"

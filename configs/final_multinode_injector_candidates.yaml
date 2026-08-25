@@ -4,9 +4,18 @@ profiles:
 - profile_id: service-cpu-v1
   mechanism: service_cpu
   intensity: {actor_workers: 1, duty_cycle: 0.3, target_cgroup: application}
+  direct_mutation_controls: []
   cleanup: {action: terminate_actor, require_cgroup_empty: true}
   effectiveness_criterion: {metric: cpu_usage_rate, direct_counter_lift_required: true}
   contamination_checks: [cpu_throttle_ratio, pod_restart]
+  secondary_signal_policy:
+    metric: cpu_throttle_ratio
+    reference_phase: HEALTHY_PRE
+    robust_scale_multiplier: 3.0
+    max_consecutive_excess_windows: 2
+    max_excess_fraction_lift: 0.05
+    forbidden_direct_controls: [cpu.max]
+    incidental_status: PASS_WITH_INCIDENTAL_SECONDARY_SIGNAL
 - profile_id: service-cpu-throttle-v1
   mechanism: service_cpu_throttle
   intensity: {cpu_max_quota_us: 25000, cpu_max_period_us: 100000}

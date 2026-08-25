@@ -20,6 +20,7 @@ class EffectivenessError(RuntimeError):
 
 _COUNTER_COMPONENTS = {
     "nr_throttled": ("cpu_nr_throttled_total",),
+    "nr_periods": ("cpu_nr_periods_total",),
     "meaningful_operation": ("socket_ops_total",),
     "direct_drop_counter": (
         "node_nic_rx_drop_total", "node_nic_tx_drop_total",
@@ -29,9 +30,11 @@ _COUNTER_COMPONENTS = {
 }
 
 
-def _record_matches(record: Any, coordinate: dict[str, Any]) -> bool:
+def _record_matches(
+    record: Any, coordinate: dict[str, Any], *, metric_name: str | None = None,
+) -> bool:
     kind = coordinate["entity_kind"]
-    if record.metric_name != coordinate["metric"]:
+    if record.metric_name != (metric_name or coordinate["metric"]):
         return False
     if kind == "service":
         return getattr(record, "service_name", None) == coordinate["entity_id"] \
@@ -81,6 +84,124 @@ def _lifecycle(session: dict[str, Any]) -> FaultLifecycle:
     )
 
 
+def _quantile(values: list[float], fraction: float) -> float:
+    """Return a deterministic linearly interpolated empirical quantile."""
+
+    ordered = sorted(values)
+    if not ordered:
+        raise EffectivenessError("secondary signal reference is empty")
+    if len(ordered) == 1:
+        return ordered[0]
+    position = fraction * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _robust_upper_bound(
+    values: list[float], *, scale_multiplier: float,
+) -> tuple[float, float, float, float]:
+    median = statistics.median(values)
+    mad_scale = 1.4826 * statistics.median(
+        abs(value - median) for value in values
+    )
+    iqr_scale = (_quantile(values, 0.75) - _quantile(values, 0.25)) / 1.349
+    robust_scale = max(mad_scale, iqr_scale)
+    return median + scale_multiplier * robust_scale, median, mad_scale, iqr_scale
+
+
+def _longest_consecutive(sequences: list[int]) -> int:
+    longest = current = 0
+    previous = None
+    for sequence in sorted(sequences):
+        current = current + 1 if previous is not None and sequence == previous + 1 else 1
+        longest = max(longest, current)
+        previous = sequence
+    return longest
+
+
+def _evaluate_secondary_signal(
+    *,
+    policy: dict[str, Any],
+    phase_records: dict[str, list[dict[str, Any]]],
+    counter_deltas: dict[int, dict[str, float]],
+    direct_mutation_controls: list[str],
+    minimum_phase_samples: int,
+) -> dict[str, Any]:
+    reference = phase_records[policy["reference_phase"]]
+    active = phase_records["FAULT_ACTIVE"]
+    if len(reference) < minimum_phase_samples or len(active) < minimum_phase_samples:
+        raise EffectivenessError("secondary signal lacks phase observations")
+    upper, median, mad_scale, iqr_scale = _robust_upper_bound(
+        [item["value"] for item in reference],
+        scale_multiplier=float(policy["robust_scale_multiplier"]),
+    )
+
+    def excess(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [item for item in records if item["value"] > upper]
+
+    reference_excess = excess(reference)
+    active_excess = excess(active)
+    reference_fraction = len(reference_excess) / len(reference)
+    active_fraction = len(active_excess) / len(active)
+    fraction_lift = active_fraction - reference_fraction
+    longest = _longest_consecutive([
+        int(item["sequence"]) for item in active_excess
+    ])
+    active_median = statistics.median(item["value"] for item in active)
+    forbidden = set(policy["forbidden_direct_controls"])
+    observed_forbidden = sorted(forbidden.intersection(direct_mutation_controls))
+    reasons = []
+    if observed_forbidden:
+        reasons.append("forbidden_direct_mutation")
+    if active_median > upper:
+        reasons.append("active_median_above_healthy_upper")
+    if longest > int(policy["max_consecutive_excess_windows"]):
+        reasons.append("consecutive_excess_windows")
+    if fraction_lift > float(policy["max_excess_fraction_lift"]):
+        reasons.append("excess_fraction_lift")
+
+    incidents = []
+    for item in active_excess:
+        sequence = int(item["sequence"])
+        raw = counter_deltas.get(sequence, {})
+        if "nr_throttled" not in raw or "nr_periods" not in raw:
+            raise EffectivenessError(
+                "secondary throttle incident lacks raw counter evidence"
+            )
+        if raw["nr_periods"] <= 0 or raw["nr_throttled"] < 0:
+            raise EffectivenessError("secondary throttle raw counters are invalid")
+        incidents.append({
+            **item,
+            "nr_throttled_delta": raw["nr_throttled"],
+            "nr_periods_delta": raw["nr_periods"],
+            "healthy_upper": upper,
+        })
+    return {
+        "metric": policy["metric"],
+        "reference_phase": policy["reference_phase"],
+        "reference_valid_windows": len(reference),
+        "active_valid_windows": len(active),
+        "reference_median": median,
+        "reference_mad_scale": mad_scale,
+        "reference_iqr_scale": iqr_scale,
+        "healthy_upper": upper,
+        "active_median": active_median,
+        "reference_excess_count": len(reference_excess),
+        "active_excess_count": len(active_excess),
+        "reference_excess_fraction": reference_fraction,
+        "active_excess_fraction": active_fraction,
+        "excess_fraction_lift": fraction_lift,
+        "longest_consecutive_excess_windows": longest,
+        "direct_mutation_controls": sorted(direct_mutation_controls),
+        "forbidden_direct_controls_observed": observed_forbidden,
+        "contaminated": bool(reasons),
+        "contamination_reasons": reasons,
+        "incidental": bool(active_excess) and not reasons,
+        "incident_windows": incidents,
+        "policy": dict(policy),
+    }
 def evaluate_fault_effectiveness(
     *,
     normal_root: Path,
@@ -96,7 +217,11 @@ def evaluate_fault_effectiveness(
     normal = CollectionArchive.load(normal_root)
     lifecycle = _lifecycle(injection_session)
     values = {"HEALTHY_PRE": [], "FAULT_ACTIVE": [], "RECOVERY": []}
-    for window in normal.iter_windows():
+    policy = profile.get("secondary_signal_policy")
+    secondary_records = {
+        "HEALTHY_PRE": [], "FAULT_ACTIVE": [], "RECOVERY": [],
+    }
+    for fallback_sequence, window in enumerate(normal.iter_windows(), start=1):
         phase = classify_window_phase(
             window.window_start_ns, window.window_end_ns, lifecycle,
         )
@@ -110,6 +235,23 @@ def evaluate_fault_effectiveness(
             raise EffectivenessError("target metric does not resolve uniquely")
         if records[0].valid:
             values[phase].append(float(records[0].value))
+        if policy is not None:
+            secondary = [
+                item for item in (*window.node_metrics, *window.edge_metrics)
+                if _record_matches(
+                    item, coordinate, metric_name=str(policy["metric"]),
+                )
+            ]
+            if len(secondary) != 1:
+                raise EffectivenessError("secondary metric does not resolve uniquely")
+            if secondary[0].valid:
+                secondary_records[phase].append({
+                    "sequence": int(getattr(window, "sequence", fallback_sequence)),
+                    "window_start_ns": int(window.window_start_ns),
+                    "window_end_ns": int(window.window_end_ns),
+                    "value": float(secondary[0].value),
+                    "sample_count": int(secondary[0].sample_count),
+                })
     if len(values["HEALTHY_PRE"]) < minimum_phase_samples \
             or len(values["FAULT_ACTIVE"]) < minimum_phase_samples:
         raise EffectivenessError("direct target metric lacks phase observations")
@@ -118,6 +260,7 @@ def evaluate_fault_effectiveness(
     counter_series: dict[str, list[tuple[int, float]]] = {
         key: [] for key in _COUNTER_COMPONENTS
     }
+    counter_deltas: dict[int, dict[str, float]] = {}
     for root in primitive_roots:
         raw = RawPrimitiveArchive(root)
         if raw.manifest["dataset_id"] != normal.dataset_id:
@@ -135,6 +278,18 @@ def evaluate_fault_effectiveness(
                         by_timestamp.get(item.timestamp_ns, 0.0) + item.value
                     )
                 counter_series[key].extend(sorted(by_timestamp.items()))
+                if selected:
+                    start = by_timestamp.get(window.window_start_ns)
+                    end = by_timestamp.get(window.window_end_ns)
+                    if start is None or end is None:
+                        raise EffectivenessError(
+                            "raw counter evidence lacks a window boundary"
+                        )
+                    delta = end - start
+                    if delta < 0:
+                        raise EffectivenessError("raw counter evidence reset")
+                    per_window = counter_deltas.setdefault(window.sequence, {})
+                    per_window[key] = per_window.get(key, 0.0) + delta
     counters_before: dict[str, float] = {}
     counters_after: dict[str, float] = {}
     for key, samples in counter_series.items():
@@ -167,23 +322,50 @@ def evaluate_fault_effectiveness(
         "primary_value": baseline_value,
         "counters": counters_before,
     }
+    effective_contamination = dict(contamination)
+    secondary_signal = None
+    if policy is not None:
+        declared_controls = list(profile.get("direct_mutation_controls", ()))
+        observed_controls = injection_session.get("apply_result", {}).get(
+            "direct_mutation_controls"
+        )
+        if observed_controls is not None:
+            if sorted(observed_controls) != sorted(declared_controls):
+                raise EffectivenessError("direct mutation evidence/profile mismatch")
+            direct_controls = list(observed_controls)
+            mutation_evidence_source = "worker_apply_result"
+        else:
+            direct_controls = declared_controls
+            mutation_evidence_source = "allow_listed_mechanism_contract"
+        secondary_signal = _evaluate_secondary_signal(
+            policy=policy, phase_records=secondary_records,
+            counter_deltas=counter_deltas,
+            direct_mutation_controls=direct_controls,
+            minimum_phase_samples=minimum_phase_samples,
+        )
+        secondary_signal["direct_mutation_evidence_source"] = \
+            mutation_evidence_source
+        effective_contamination[str(policy["metric"])] = bool(
+            secondary_signal["contaminated"]
+        )
     active = {
         "metric": coordinate["metric"],
         "primary_value": active_value,
         "counters": counters_after,
         "conditions": conditions,
-        "contamination": dict(contamination),
+        "contamination": effective_contamination,
     }
     passed, failures = evaluate_effectiveness_criterion(
         profile["effectiveness_criterion"], baseline, active,
     )
     required_contamination = profile.get("contamination_checks", [])
-    missing = sorted(set(required_contamination) - set(contamination))
+    missing = sorted(set(required_contamination) - set(effective_contamination))
     contaminated = sorted(
-        key for key in required_contamination if contamination.get(key) is True
+        key for key in required_contamination
+        if effective_contamination.get(key) is True
     )
     report = {
-        "schema_version": "probeRCA-fault-effectiveness-report-v1",
+        "schema_version": "probeRCA-fault-effectiveness-report-v2",
         "dataset_id": normal.dataset_id,
         "coordinate": coordinate,
         "profile_id": profile["profile_id"],
@@ -199,12 +381,25 @@ def evaluate_fault_effectiveness(
         "missing_contamination_checks": missing,
         "contaminated_dimensions": contaminated,
         "cleanup_passed": injection_session.get("cleanup_passed") is True,
+        "secondary_signal_evidence": secondary_signal,
     }
     report["accepted"] = (
         report["criterion_passed"]
         and report["contamination_passed"]
         and report["cleanup_passed"]
     )
+    if report["accepted"]:
+        report["status"] = (
+            policy["incidental_status"]
+            if secondary_signal is not None and secondary_signal["incidental"]
+            else "PASS"
+        )
+    elif not report["criterion_passed"]:
+        report["status"] = "INVALID_INEFFECTIVE"
+    elif not report["contamination_passed"]:
+        report["status"] = "INVALID_CONTAMINATED"
+    else:
+        report["status"] = "INVALID_CLEANUP"
     report["report_fingerprint"] = fingerprint(report)
     return report
 
@@ -227,7 +422,7 @@ def build_real_pilot_report(
     if effectiveness_report.get("dataset_id") != injection_session.get("dataset_id"):
         raise EffectivenessError("Pilot effectiveness/session Dataset ID mismatch")
     report = {
-        "schema_version": "probeRCA-injector-pilot-evidence-v1",
+        "schema_version": "probeRCA-injector-pilot-evidence-v2",
         "profile_id": profile["profile_id"],
         "mechanism": profile["mechanism"],
         "target": injection_session.get("target"),
@@ -259,6 +454,10 @@ def build_real_pilot_report(
         "cleanup_passed": effectiveness_report.get("cleanup_passed") is True,
         "baseline_evidence": effectiveness_report.get("baseline_evidence"),
         "active_evidence": effectiveness_report.get("active_evidence"),
+        "secondary_signal_evidence": effectiveness_report.get(
+            "secondary_signal_evidence"
+        ),
+        "status": effectiveness_report.get("status"),
         "execution_error": injection_session.get("execution_error"),
     }
     report["accepted"] = effectiveness_report.get("accepted") is True \

@@ -173,7 +173,7 @@ class LinuxWorkerBackend:
     def _state(self, mechanism: str, target: dict[str, Any]) -> dict[str, Any]:
         state: dict[str, Any] = {"runtime_identity": self._identity(target)}
         cgroup = self._cgroup_path(target)
-        if mechanism == "service_cpu_throttle":
+        if mechanism in {"service_cpu", "service_cpu_throttle"}:
             state["cpu.max"] = (cgroup / "cpu.max").read_text(encoding="ascii").strip()
         if mechanism in {"service_memory", "host_memory"}:
             state["memory.high"] = (cgroup / "memory.high").read_text(
@@ -539,7 +539,19 @@ class LinuxWorkerBackend:
                 self._spawn_actor(mechanism, payload, journal)
             journal["status"] = "active"
             _atomic_json(path, journal)
-            return {"applied": True, "journal_fingerprint": fingerprint(journal)}
+            direct_controls = {
+                "service_cpu_throttle": ["cpu.max"],
+                "service_memory": ["memory.high"],
+                "host_memory": ["memory.high"],
+                "host_nic": ["traffic_control"],
+                "tcp_latency": ["traffic_control"],
+                "tcp_failure": ["traffic_control"],
+            }.get(mechanism, [])
+            return {
+                "applied": True,
+                "journal_fingerprint": fingerprint(journal),
+                "direct_mutation_controls": direct_controls,
+            }
         except Exception:
             journal["status"] = "partial"
             _atomic_json(path, journal)

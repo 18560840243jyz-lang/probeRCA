@@ -1021,6 +1021,142 @@ def test_direct_effectiveness_uses_actual_phases_without_rca(monkeypatch, tmp_pa
     assert "fista" not in serialized
 
 
+def _evaluate_service_cpu_secondary_signal(
+    monkeypatch, tmp_path, *, throttle_sequences, supplied_throttle=False,
+):
+    dataset_id = "e" * 64
+    normal_windows = []
+    raw_windows = []
+    throttled_total = 0.0
+    for sequence in range(1, 181):
+        start = (sequence - 1) * 1_000_000_000
+        end = start + 1_000_000_000
+        throttle = 0.1 if sequence in throttle_sequences else 0.0
+        usage = 0.57 if 62 <= sequence <= 120 else 0.26
+        metrics = tuple(SimpleNamespace(
+            metric_name=name, service_name="frontend", scope="service",
+            valid=True, value=value, sample_count=10,
+        ) for name, value in (
+            ("cpu_usage_rate", usage),
+            ("cpu_throttle_ratio", throttle),
+        ))
+        normal_windows.append(SimpleNamespace(
+            sequence=sequence, window_start_ns=start, window_end_ns=end,
+            node_metrics=metrics, edge_metrics=(),
+        ))
+        before_throttled = throttled_total
+        if sequence in throttle_sequences:
+            throttled_total += 1.0
+        samples = []
+        for component, before, after in (
+            ("cpu_nr_throttled_total", before_throttled, throttled_total),
+            ("cpu_nr_periods_total", (sequence - 1) * 10.0, sequence * 10.0),
+        ):
+            for timestamp, value in ((start, before), (end, after)):
+                samples.append(SimpleNamespace(
+                    component=component, entity_type="service",
+                    service_name="frontend", node_name="worker-1",
+                    src_service=None, dst_service=None, protocol=None,
+                    timestamp_ns=timestamp, value=value,
+                ))
+        raw_windows.append(SimpleNamespace(
+            sequence=sequence, window_start_ns=start, window_end_ns=end,
+            samples=tuple(samples),
+        ))
+
+    class FakeNormal:
+        @staticmethod
+        def iter_windows():
+            return iter(normal_windows)
+    FakeNormal.dataset_id = dataset_id
+
+    class FakeRaw:
+        @staticmethod
+        def iter_windows():
+            return iter(raw_windows)
+    FakeRaw.manifest = {"dataset_id": dataset_id}
+
+    monkeypatch.setattr(
+        "proberca.campaign.effectiveness.CollectionArchive.load",
+        lambda _path: FakeNormal(),
+    )
+    monkeypatch.setattr(
+        "proberca.campaign.effectiveness.RawPrimitiveArchive",
+        lambda _path: FakeRaw(),
+    )
+    profile = next(item for item in load_injector_registry(
+        REPOSITORY / "configs/final_multinode_injector_candidates.yaml",
+        require_frozen=False,
+    )["profiles"] if item["mechanism"] == "service_cpu")
+    contamination = {"pod_restart": False}
+    if supplied_throttle:
+        contamination["cpu_throttle_ratio"] = False
+    return evaluate_fault_effectiveness(
+        normal_root=tmp_path / "normal", primitive_roots=[tmp_path / "worker-1"],
+        coordinate={
+            "entity_kind": "service", "entity_id": "frontend",
+            "metric": "cpu_usage_rate",
+        },
+        profile=profile,
+        injection_session={
+            "planned_apply_ns": 60_000_000_000,
+            "apply_command_start_ns": 60_000_000_000,
+            "apply_confirmed_ns": 61_000_000_000,
+            "planned_cleanup_ns": 120_000_000_000,
+            "cleanup_command_start_ns": 120_000_000_000,
+            "cleanup_confirmed_ns": 121_000_000_000,
+            "cleanup_result": {}, "cleanup_passed": True,
+            "apply_result": {},
+        },
+        contamination=contamination,
+    )
+
+
+def test_service_cpu_isolated_throttle_is_incidental_secondary_signal(
+    monkeypatch, tmp_path,
+):
+    report = _evaluate_service_cpu_secondary_signal(
+        monkeypatch, tmp_path, throttle_sequences={80},
+    )
+    evidence = report["secondary_signal_evidence"]
+    assert report["accepted"] is True
+    assert report["status"] == "PASS_WITH_INCIDENTAL_SECONDARY_SIGNAL"
+    assert report["contamination_passed"] is True
+    assert evidence["active_excess_count"] == 1
+    assert evidence["longest_consecutive_excess_windows"] == 1
+    assert evidence["active_excess_fraction"] == pytest.approx(1 / 59)
+    assert evidence["active_median"] == 0.0
+    assert evidence["healthy_upper"] == 0.0
+    assert evidence["direct_mutation_evidence_source"] == \
+        "allow_listed_mechanism_contract"
+    assert evidence["incident_windows"] == [{
+        "sequence": 80,
+        "window_start_ns": 79_000_000_000,
+        "window_end_ns": 80_000_000_000,
+        "value": 0.1,
+        "sample_count": 10,
+        "nr_throttled_delta": 1.0,
+        "nr_periods_delta": 10.0,
+        "healthy_upper": 0.0,
+    }]
+
+
+def test_service_cpu_sustained_throttle_is_contamination_and_manual_false_cannot_override(
+    monkeypatch, tmp_path,
+):
+    report = _evaluate_service_cpu_secondary_signal(
+        monkeypatch, tmp_path, throttle_sequences={80, 81, 82},
+        supplied_throttle=True,
+    )
+    evidence = report["secondary_signal_evidence"]
+    assert report["accepted"] is False
+    assert report["status"] == "INVALID_CONTAMINATED"
+    assert report["contaminated_dimensions"] == ["cpu_throttle_ratio"]
+    assert evidence["longest_consecutive_excess_windows"] == 3
+    assert "consecutive_excess_windows" in evidence["contamination_reasons"]
+    assert "excess_fraction_lift" in evidence["contamination_reasons"]
+
+
 def test_simulated_pilots_can_never_freeze_formal_injectors():
     registry = load_injector_registry(
         REPOSITORY / "configs/final_multinode_injector_candidates.yaml",
@@ -1160,6 +1296,39 @@ def test_service_cpu_actor_receives_frozen_bounded_duty_cycle(monkeypatch, tmp_p
     }, {})
     assert commands[0][commands[0].index("--workers") + 1] == "1"
     assert commands[0][commands[0].index("--duty-cycle") + 1] == "0.3"
+
+
+def test_service_cpu_mechanism_records_but_never_mutates_cpu_max(monkeypatch, tmp_path):
+    from proberca.campaign.worker_agent import LinuxWorkerBackend
+
+    actor = tmp_path / "multinode_fault_actor.py"
+    actor.write_text("# test actor\n", encoding="utf-8")
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    (cgroup / "cgroup.procs").write_text("", encoding="ascii")
+    (cgroup / "cpu.max").write_text("50000 100000\n", encoding="ascii")
+    backend = LinuxWorkerBackend(
+        node_id="worker-1", state_root=tmp_path / "state",
+        work_root=tmp_path / "work", actor_path=actor,
+    )
+    monkeypatch.setattr(backend, "_cgroup_path", lambda _target: cgroup)
+    monkeypatch.setattr(backend, "_identity", lambda _target: "a" * 64)
+    monkeypatch.setattr(backend, "_spawn_actor", lambda *_args: None)
+    profile = next(item for item in load_injector_registry(
+        REPOSITORY / "configs/final_multinode_injector_candidates.yaml",
+        require_frozen=False,
+    )["profiles"] if item["mechanism"] == "service_cpu")
+    target = _target().as_dict()
+    before = backend._state("service_cpu", target)
+    result = backend.apply({
+        "session_id": "3" * 64, "mechanism": "service_cpu",
+        "target": target, "intensity": profile["intensity"],
+    })
+    after = backend._state("service_cpu", target)
+    assert before["cpu.max"] == "50000 100000"
+    assert after == before
+    assert result["direct_mutation_controls"] == []
+    assert (cgroup / "cpu.max").read_text(encoding="ascii") == "50000 100000\n"
 
 
 def test_ssh_transport_pins_host_key_and_never_uses_remote_shell(tmp_path):

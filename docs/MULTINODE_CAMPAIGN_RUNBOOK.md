@@ -113,6 +113,17 @@ intervention, or inexact cleanup cannot freeze the registry.  If Host NIC is
 unsupported, change the campaign flag before manifest generation and use the
 131-dataset branch; never substitute TCP loss.
 
+For `service_cpu`, the evaluator derives `cpu_throttle_ratio` contamination
+from the sealed Pilot rather than trusting an operator Boolean. Its reference
+is the same Pilot's label-blind `HEALTHY_PRE` segment, using the configured
+median-plus-robust-scale bound. A quota mutation, an active median above that
+bound, more than two consecutive excess windows, or an active-minus-reference
+excess fraction above five percentage points invalidates the Pilot. One or two
+isolated excess windows are preserved as raw `nr_throttled/nr_periods` evidence
+and produce `PASS_WITH_INCIDENTAL_SECONDARY_SIGNAL`; they do not turn a unique
+CPU-usage intervention into a CPU-throttle intervention. This Pilot-only gate
+does not use the final Healthy control-plane model, Soft/Hard, or RCA output.
+
 ## 5. Freeze the executable campaign
 
 Generate public/private manifests only after the load and injector registries
