@@ -63,6 +63,14 @@ class FakeWorkerAgent:
             return {
                 "metric": metric,
                 "primary_value": 10.0 if active else 1.0,
+                "valid_window_count": (
+                    int(criterion.get("active_valid_windows_min", 0))
+                    if active else 0
+                ),
+                "positive_window_count": (
+                    int(criterion.get("active_positive_windows_min", 0))
+                    if active else 0
+                ),
                 "conditions": conditions,
                 "counters": counters,
                 "contamination": {name: False for name in contamination_names},

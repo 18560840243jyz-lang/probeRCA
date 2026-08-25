@@ -398,7 +398,7 @@ def test_final_burst_runtime_log_is_epoch_scoped_and_bounded():
     assert 'fopen(options->output_path, "a")' not in loader
     assert '"max-output-bytes"' in loader
     assert "final Burst output byte limit reached" in loader
-    assert "--max-output-bytes 4294967296" in service
+    assert "--max-output-bytes 68719476736" in service
 
 
 def test_bpf_snapshot_filters_to_sorted_active_cgroups(monkeypatch):

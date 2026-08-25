@@ -47,6 +47,7 @@ from proberca.campaign.restore import (
 from proberca.campaign.execution import (
     InjectorExecutionError,
     TargetBinding,
+    evaluate_effectiveness_criterion,
     freeze_injector_registry,
     run_injector_pilot,
 )
@@ -612,8 +613,10 @@ def test_load_profiles_have_reproducible_open_loop_rate_and_frozen_mix():
     profiles = config["load_qualification"]["profiles"]
     assert [item["target_arrival_rate_rps"] for item in profiles] == [25, 40, 55]
     assert [item["scale_percent"] for item in profiles] == [25, 40, 55]
+    assert [item["workers"] for item in profiles] == [64, 64, 64]
+    assert [item["maximum_pending"] for item in profiles] == [512, 512, 512]
     for item in profiles:
-        assert item["workers"] == 8
+        assert item["workers"] == 64
         assert item["behavior_weights"] == {
             "browse_search_list": 40,
             "detail_recommendation_ad_currency": 25,
@@ -763,7 +766,8 @@ def test_multinode_load_installer_uses_one_formal_source_and_profile(monkeypatch
     assert sum("create" in command and "configmap" in command for command in flattened) == 1
     set_env = next(command for command in flattened if "set" in command and "env" in command)
     assert "TARGET_ARRIVAL_RATE_RPS=40" in set_env
-    assert "WORKERS=8" in set_env
+    assert "WORKERS=64" in set_env
+    assert "MAXIMUM_PENDING=512" in set_env
     assert "LOAD_PROFILE_ID=multi-node-open-loop-40" in set_env
     assert any(item.startswith("LOAD_PROFILE_FINGERPRINT=") for item in set_env)
     assert sum("scale" in command for command in flattened) == 1
@@ -1550,6 +1554,215 @@ def test_tcp_injector_uses_selective_root_netem_not_invalid_tc_action(
     )
     assert all("action netem" not in item for item in rendered)
     assert journal["tc_mode"] == "root_prio_netem"
+
+
+def test_tcp_injector_evidence_uses_dedicated_netem_qdisc_packets(
+    monkeypatch, tmp_path,
+):
+    from proberca.campaign.worker_agent import LinuxWorkerBackend
+
+    backend = LinuxWorkerBackend(
+        node_id="worker-1", state_root=tmp_path / "state",
+        work_root=tmp_path / "work",
+    )
+    responses = iter([
+        json.dumps([{
+            "kind": "flower", "pref": 41234,
+            "options": {"flowid": "1:3"},
+        }]),
+        json.dumps([
+            {"kind": "prio", "handle": "1:", "bytes": 5000,
+             "packets": 50, "drops": 0, "overlimits": 0},
+            {"kind": "netem", "handle": "30:", "bytes": 1200,
+             "packets": 12, "drops": 2, "overlimits": 0},
+        ]),
+    ])
+    commands = []
+
+    def run(arguments, **_kwargs):
+        commands.append(tuple(arguments))
+        return next(responses)
+
+    monkeypatch.setattr(backend, "_run", run)
+    evidence = backend._tc_filter_evidence({
+        "tc_prefix": ["nsenter", "--target", "42", "--net"],
+        "tc_mode": "root_prio_netem", "tc_interface": "eth0",
+        "tc_preference": 41234,
+    })
+    assert evidence["matched_filter_present"] is True
+    assert evidence["packets"] == 12
+    assert evidence["drops"] == 2
+    assert evidence["overlimits"] == 0
+    assert len(evidence["raw_fingerprint"]) == 64
+    assert any("filter show" in " ".join(item) for item in commands)
+    assert any("qdisc show" in " ".join(item) for item in commands)
+
+
+def test_tcp_failure_profile_uses_terminal_rst_not_random_loss():
+    registry = load_injector_registry(
+        REPOSITORY / "configs/final_multinode_injector_candidates.yaml",
+        require_frozen=False,
+    )
+    profile = next(
+        item for item in registry["profiles"]
+        if item["mechanism"] == "tcp_failure"
+    )
+    assert profile["profile_id"] == "tcp-failure-v2"
+    assert profile["intensity"] == {
+        "action": "reject_with_tcp_reset",
+        "direction": "caller_to_callee",
+    }
+    assert profile["direct_mutation_controls"] == ["packet_filter"]
+    assert "loss_percent" not in json.dumps(profile)
+
+
+def test_tcp_failure_installs_directional_output_rst_without_netem(
+    monkeypatch, tmp_path,
+):
+    from proberca.campaign.worker_agent import LinuxWorkerBackend
+
+    backend = LinuxWorkerBackend(
+        node_id="worker-1", state_root=tmp_path / "state",
+        work_root=tmp_path / "work",
+    )
+    commands = []
+    monkeypatch.setattr(
+        backend, "_network_prefix",
+        lambda _target: ["nsenter", "--target", "42", "--net"],
+    )
+    monkeypatch.setattr(
+        backend, "_run",
+        lambda arguments, **_kwargs: commands.append(tuple(arguments)) or "",
+    )
+    payload = {
+        "session_id": "2" * 64,
+        "target": {"attributes": {
+            "destination_ip": "10.96.0.20", "destination_port": 3550,
+        }},
+        "intensity": {
+            "action": "reject_with_tcp_reset",
+            "direction": "caller_to_callee",
+        },
+    }
+    journal = {"status": "applying"}
+    backend._apply_tcp_reset(payload, journal)
+    rendered = [" ".join(item) for item in commands]
+    assert any("iptables -w 5 -t filter -N PRCA_" in item for item in rendered)
+    assert any(
+        "-A PRCA_" in item
+        and "-d 10.96.0.20 -p tcp --dport 3550" in item
+        and "-j REJECT --reject-with tcp-reset" in item
+        for item in rendered
+    )
+    assert any(
+        "-I OUTPUT -d 10.96.0.20 -p tcp --dport 3550" in item
+        for item in rendered
+    )
+    assert all("tc " not in item and "netem" not in item for item in rendered)
+    assert journal["packet_filter_prefix"] == [
+        "nsenter", "--target", "42", "--net",
+    ]
+
+
+def test_tcp_failure_evidence_and_cleanup_are_exact_and_counter_aware(
+    monkeypatch, tmp_path,
+):
+    from proberca.campaign.worker_agent import LinuxWorkerBackend
+
+    backend = LinuxWorkerBackend(
+        node_id="worker-1", state_root=tmp_path / "state",
+        work_root=tmp_path / "work",
+    )
+    chain = "PRCA_" + "3" * 16
+    comment = "proberca:" + "3" * 16
+    raw = "\n".join((
+        "*filter",
+        f"[17:1020] -A OUTPUT -d 10.96.0.20/32 -p tcp -m tcp "
+        f"--dport 3550 -m comment --comment \"{comment}\" -j {chain}",
+        f"[17:1020] -A {chain} -d 10.96.0.20/32 -p tcp -m tcp "
+        f"--dport 3550 -m comment --comment \"{comment}\" "
+        "-j REJECT --reject-with tcp-reset",
+        "COMMIT",
+    ))
+    monkeypatch.setattr(backend, "_run", lambda *_args, **_kwargs: raw)
+    evidence = backend._packet_filter_evidence({
+        "packet_filter_prefix": [], "packet_filter_chain": chain,
+        "packet_filter_comment": comment,
+    })
+    assert evidence["matched_filter_present"] is True
+    assert evidence["packets"] == 17
+    assert evidence["bytes"] == 1020
+    assert evidence["action"] == "reject_with_tcp_reset"
+
+    target = {"attributes": {"cgroup_path": "/sys/fs/cgroup/example"}}
+    baseline = {"runtime_identity": "a" * 64, "packet_filter": {
+        "filter_rules": ["-P INPUT ACCEPT", "-P FORWARD ACCEPT", "-P OUTPUT ACCEPT"],
+    }}
+    session = "3" * 64
+    journal = {
+        "schema_version": "probeRCA-worker-mutation-journal-v1",
+        "session_id": session, "mechanism": "tcp_failure", "target": target,
+        "baseline_state": baseline, "status": "active",
+        "packet_filter_prefix": [], "packet_filter_chain": chain,
+        "packet_filter_comment": comment,
+        "packet_filter_jump_spec": [
+            "OUTPUT", "-d", "10.96.0.20", "-p", "tcp", "--dport", "3550",
+            "-m", "comment", "--comment", comment, "-j", chain,
+        ],
+    }
+    path = backend._journal_path(session)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(journal), encoding="utf-8")
+    commands = []
+    monkeypatch.setattr(backend, "_cgroup_path", lambda _target: tmp_path)
+    monkeypatch.setattr(backend, "_packet_filter_evidence", lambda _journal: evidence)
+    monkeypatch.setattr(backend, "_state", lambda *_args: baseline)
+    monkeypatch.setattr(
+        backend, "_run",
+        lambda arguments, **_kwargs: commands.append(tuple(arguments)) or "",
+    )
+    result = backend.cleanup({"session_id": session, "target": target})
+    rendered = [" ".join(item) for item in commands]
+    assert any("-D OUTPUT" in item for item in rendered)
+    assert any(f"-F {chain}" in item for item in rendered)
+    assert any(f"-X {chain}" in item for item in rendered)
+    assert result["packet_filter_evidence"] == evidence
+    assert result["restored_state_fingerprint"] == fingerprint(baseline)
+
+
+def test_tcp_failure_effectiveness_requires_hits_errors_and_sustained_lift():
+    criterion = {
+        "metric": "edge_failure_rate",
+        "filter_hit_and_failure_lift_required": True,
+        "edge_error_delta_min": 1,
+        "active_valid_windows_min": 48,
+        "active_positive_windows_min": 30,
+        "active_median_min": 0.3,
+    }
+    baseline = {"primary_value": 0.0, "counters": {"edge_error": 4}}
+    active = {
+        "metric": "edge_failure_rate", "primary_value": 0.75,
+        "valid_window_count": 55, "positive_window_count": 54,
+        "counters": {"edge_error": 120},
+        "conditions": {"filter_hit_and_failure_lift_required": True},
+    }
+    passed, failures = evaluate_effectiveness_criterion(
+        criterion, baseline, active,
+    )
+    assert passed is True
+    assert failures == []
+    for key, value in (
+        ("valid_window_count", 47),
+        ("positive_window_count", 29),
+        ("primary_value", 0.29),
+    ):
+        failed = dict(active)
+        failed[key] = value
+        passed, failures = evaluate_effectiveness_criterion(
+            criterion, baseline, failed,
+        )
+        assert passed is False
+        assert failures
 
 
 def test_label_side_target_resolver_binds_formal_edge_without_hardcoding():

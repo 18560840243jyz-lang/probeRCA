@@ -136,20 +136,96 @@ class LinuxWorkerBackend:
             filters[direction] = json.loads(raw or "[]")
         return {"qdisc": json.loads(qdisc or "[]"), "filters": filters}
 
+    def _packet_filter_snapshot(self, target: dict[str, Any]) -> dict[str, Any]:
+        """Return the normalized filter rules without mutable packet counters."""
+
+        prefix = self._network_prefix(target)
+        raw = self._run(prefix + [
+            "iptables", "-w", "5", "-t", "filter", "-S",
+        ])
+        return {
+            "filter_rules": [
+                line.strip() for line in raw.splitlines() if line.strip()
+            ],
+        }
+
+    def _packet_filter_evidence(self, journal: dict[str, Any]) -> dict[str, Any]:
+        """Read the dedicated RST rule counters before exact cleanup."""
+
+        prefix = list(journal["packet_filter_prefix"])
+        raw = self._run(prefix + [
+            "iptables-save", "-c", "-t", "filter",
+        ], tolerate_missing=True)
+        chain = str(journal["packet_filter_chain"])
+        comment = str(journal["packet_filter_comment"])
+        rule_pattern = re.compile(
+            rf"^\[(\d+):(\d+)\]\s+-A\s+{re.escape(chain)}\s+.*"
+            rf"--comment\s+\"?{re.escape(comment)}\"?.*"
+            r"-j\s+REJECT\s+--reject-with\s+tcp-reset\s*$"
+        )
+        packets = bytes_count = 0
+        matched = False
+        for line in raw.splitlines():
+            match = rule_pattern.match(line.strip())
+            if match is not None:
+                if matched:
+                    raise WorkerAgentError("RST mutation rule is not unique")
+                matched = True
+                packets = int(match.group(1))
+                bytes_count = int(match.group(2))
+        jump_present = any(
+            line.startswith("[")
+            and f"-A OUTPUT " in line
+            and f"--comment \"{comment}\"" in line
+            and f"-j {chain}" in line
+            for line in raw.splitlines()
+        )
+        return {
+            "matched_filter_present": matched and jump_present,
+            "packets": packets,
+            "bytes": bytes_count,
+            "action": "reject_with_tcp_reset",
+            "raw_fingerprint": fingerprint({
+                "chain": chain,
+                "comment": comment,
+                "rules": [
+                    line.strip() for line in raw.splitlines()
+                    if chain in line or comment in line
+                ],
+            }),
+        }
+
     def _tc_filter_evidence(self, journal: dict[str, Any]) -> dict[str, Any]:
         prefix = list(journal["tc_prefix"])
         if journal["tc_mode"] == "root_prio_netem":
-            raw = self._run(prefix + [
+            filter_raw = self._run(prefix + [
                 "tc", "-s", "-j", "filter", "show",
                 "dev", journal["tc_interface"], "parent", "1:",
                 "pref", str(journal["tc_preference"]),
             ], tolerate_missing=True)
+            qdisc_raw = self._run(prefix + [
+                "tc", "-s", "-j", "qdisc", "show",
+                "dev", journal["tc_interface"],
+            ], tolerate_missing=True)
+            filter_payload = json.loads(filter_raw or "[]")
+            qdisc_payload = json.loads(qdisc_raw or "[]")
+            # A flower classifier that selects a class with ``flowid`` does
+            # not expose packet counters consistently across iproute2/kernel
+            # combinations.  The dedicated 30: netem child receives only the
+            # selected flow, so its counters are the authoritative hit
+            # evidence while the classifier must still be present.
+            payload = [
+                item for item in qdisc_payload
+                if item.get("handle") == "30:"
+            ]
         else:
             raw = self._run(prefix + [
                 "tc", "-s", "-j", "qdisc", "show",
                 "dev", journal["tc_interface"],
             ], tolerate_missing=True)
-        payload = json.loads(raw or "[]")
+            filter_payload = None
+            qdisc_payload = json.loads(raw or "[]")
+            payload = qdisc_payload
 
         def total(value: Any, key: str) -> int:
             if isinstance(value, dict):
@@ -163,11 +239,17 @@ class LinuxWorkerBackend:
             return 0
 
         return {
-            "matched_filter_present": bool(payload),
+            "matched_filter_present": (
+                bool(filter_payload)
+                if filter_payload is not None else bool(payload)
+            ),
             "packets": total(payload, "packets"),
             "drops": total(payload, "drops"),
             "overlimits": total(payload, "overlimits"),
-            "raw_fingerprint": fingerprint(payload),
+            "raw_fingerprint": fingerprint({
+                "filter": filter_payload,
+                "qdisc": qdisc_payload,
+            }),
         }
 
     def _state(self, mechanism: str, target: dict[str, Any]) -> dict[str, Any]:
@@ -179,13 +261,18 @@ class LinuxWorkerBackend:
             state["memory.high"] = (cgroup / "memory.high").read_text(
                 encoding="ascii"
             ).strip()
-        if mechanism in {"host_nic", "tcp_latency", "tcp_failure"}:
+        if mechanism in {"host_nic", "tcp_latency"}:
             state["traffic_control"] = self._tc_snapshot(target)
+        if mechanism == "tcp_failure":
+            state["packet_filter"] = self._packet_filter_snapshot(target)
         return state
 
     def preflight(self, payload: dict[str, Any]) -> dict[str, Any]:
         tools = {}
-        for name in ("tc", "nsenter", "python3", "bpftool", "clang", "make"):
+        for name in (
+            "tc", "nsenter", "iptables", "iptables-save", "python3",
+            "bpftool", "clang", "make",
+        ):
             tools[name] = shutil.which(name) is not None
         stat = os.statvfs(self.work_root.parent if self.work_root.parent.exists() else "/")
         synchronized = False
@@ -449,18 +536,15 @@ class LinuxWorkerBackend:
                 "target interface qdisc is not safely replaceable for netem Pilot"
             )
         preference = 40000 + int(payload["session_id"][:4], 16) % 20000
-        tc_mode = (
-            "root_prio_netem"
-            if mechanism in {"tcp_latency", "tcp_failure"}
+        tc_mode = "root_prio_netem" if mechanism == "tcp_latency" \
             else "root_netem"
-        )
         # Persist enough cleanup intent in the in-memory journal before the
         # first mutation. ``apply`` writes this journal on any partial failure.
         journal.update({
             "tc_interface": interface, "tc_mode": tc_mode,
             "tc_preference": preference, "tc_prefix": prefix,
         })
-        if mechanism in {"tcp_latency", "tcp_failure"}:
+        if mechanism == "tcp_latency":
             self._run(prefix + [
                 "tc", "qdisc", "add", "dev", interface, "root",
                 "handle", "1:", "prio", "bands", "3", "priomap",
@@ -470,12 +554,7 @@ class LinuxWorkerBackend:
                 "tc", "qdisc", "add", "dev", interface,
                 "parent", "1:3", "handle", "30:", "netem",
             ]
-            if mechanism == "tcp_latency":
-                netem.extend(["delay", f"{int(payload['intensity']['delay_ms'])}ms"])
-            else:
-                netem.extend([
-                    "loss", f"{float(payload['intensity']['loss_percent']):g}%",
-                ])
+            netem.extend(["delay", f"{int(payload['intensity']['delay_ms'])}ms"])
             self._run(netem)
             destination = str(attributes.get("destination_ip", ""))
             ipaddress.ip_address(destination)
@@ -495,6 +574,55 @@ class LinuxWorkerBackend:
                 "tc", "qdisc", "add", "dev", interface, "root",
                 "handle", "30:", "netem", "loss", f"{percent:g}%",
             ])
+
+    def _apply_tcp_reset(
+        self, payload: dict[str, Any], journal: dict[str, Any],
+    ) -> None:
+        """Install one direction/port-scoped RST rule in the caller Pod netns."""
+
+        target = payload["target"]
+        attributes = target["attributes"]
+        intensity = payload["intensity"]
+        if intensity.get("action") != "reject_with_tcp_reset" \
+                or intensity.get("direction") != "caller_to_callee":
+            raise WorkerAgentError("TCP failure profile is not directional RST")
+        destination = str(attributes.get("destination_ip", ""))
+        ipaddress.ip_address(destination)
+        port = int(attributes.get("destination_port", 0))
+        if not 1 <= port <= 65535:
+            raise WorkerAgentError("TCP reset destination port is invalid")
+        prefix = self._network_prefix(target)
+        token = payload["session_id"][:16]
+        chain = f"PRCA_{token.upper()}"
+        comment = f"proberca:{token}"
+        jump_spec = [
+            "OUTPUT", "-d", destination, "-p", "tcp", "--dport", str(port),
+            "-m", "comment", "--comment", comment, "-j", chain,
+        ]
+        reject_spec = [
+            chain, "-d", destination, "-p", "tcp", "--dport", str(port),
+            "-m", "comment", "--comment", comment,
+            "-j", "REJECT", "--reject-with", "tcp-reset",
+        ]
+        journal.update({
+            "packet_filter_prefix": prefix,
+            "packet_filter_chain": chain,
+            "packet_filter_comment": comment,
+            "packet_filter_jump_spec": jump_spec,
+            "packet_filter_reject_spec": reject_spec,
+        })
+        # Persist cleanup intent before the first mutation so a partial apply
+        # remains recoverable without flushing unrelated rules.
+        _atomic_json(self._journal_path(payload["session_id"]), journal)
+        self._run(prefix + [
+            "iptables", "-w", "5", "-t", "filter", "-N", chain,
+        ])
+        self._run(prefix + [
+            "iptables", "-w", "5", "-t", "filter", "-A", *reject_spec,
+        ])
+        self._run(prefix + [
+            "iptables", "-w", "5", "-t", "filter", "-I", *jump_spec,
+        ])
 
     def apply(self, payload: dict[str, Any]) -> dict[str, Any]:
         mechanism = str(payload.get("mechanism"))
@@ -533,8 +661,10 @@ class LinuxWorkerBackend:
                     ))
                 (cgroup / "memory.high").write_text(f"{value}\n", encoding="ascii")
                 self._spawn_actor(mechanism, payload, journal)
-            elif mechanism in {"host_nic", "tcp_latency", "tcp_failure"}:
+            elif mechanism in {"host_nic", "tcp_latency"}:
                 self._apply_tc(mechanism, payload, journal)
+            elif mechanism == "tcp_failure":
+                self._apply_tcp_reset(payload, journal)
             else:
                 self._spawn_actor(mechanism, payload, journal)
             journal["status"] = "active"
@@ -545,7 +675,7 @@ class LinuxWorkerBackend:
                 "host_memory": ["memory.high"],
                 "host_nic": ["traffic_control"],
                 "tcp_latency": ["traffic_control"],
-                "tcp_failure": ["traffic_control"],
+                "tcp_failure": ["packet_filter"],
             }.get(mechanism, [])
             return {
                 "applied": True,
@@ -590,12 +720,27 @@ class LinuxWorkerBackend:
             (cgroup / "memory.high").write_text(
                 baseline["memory.high"] + "\n", encoding="ascii"
             )
-        if mechanism in {"host_nic", "tcp_latency", "tcp_failure"} \
+        if mechanism in {"host_nic", "tcp_latency"} \
                 and "tc_preference" in journal:
             traffic_control_evidence = self._tc_filter_evidence(journal)
             prefix = list(journal["tc_prefix"])
             self._run(prefix + [
                 "tc", "qdisc", "del", "dev", journal["tc_interface"], "root",
+            ], tolerate_missing=True)
+        if mechanism == "tcp_failure" \
+                and "packet_filter_chain" in journal:
+            packet_filter_evidence = self._packet_filter_evidence(journal)
+            prefix = list(journal["packet_filter_prefix"])
+            jump_spec = list(journal["packet_filter_jump_spec"])
+            chain = str(journal["packet_filter_chain"])
+            self._run(prefix + [
+                "iptables", "-w", "5", "-t", "filter", "-D", *jump_spec,
+            ], tolerate_missing=True)
+            self._run(prefix + [
+                "iptables", "-w", "5", "-t", "filter", "-F", chain,
+            ], tolerate_missing=True)
+            self._run(prefix + [
+                "iptables", "-w", "5", "-t", "filter", "-X", chain,
             ], tolerate_missing=True)
         fault_file = journal.get("fault_file")
         if fault_file:
@@ -615,6 +760,8 @@ class LinuxWorkerBackend:
         journal["status"] = "cleaned"
         if "traffic_control_evidence" in locals():
             journal["traffic_control_evidence"] = traffic_control_evidence
+        if "packet_filter_evidence" in locals():
+            journal["packet_filter_evidence"] = packet_filter_evidence
         _atomic_json(path, journal)
         result = {
             "cleaned": True,
@@ -622,6 +769,8 @@ class LinuxWorkerBackend:
         }
         if "traffic_control_evidence" in locals():
             result["traffic_control_evidence"] = traffic_control_evidence
+        if "packet_filter_evidence" in locals():
+            result["packet_filter_evidence"] = packet_filter_evidence
         return result
 
 

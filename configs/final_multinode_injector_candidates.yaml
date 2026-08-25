@@ -18,7 +18,7 @@ profiles:
     incidental_status: PASS_WITH_INCIDENTAL_SECONDARY_SIGNAL
 - profile_id: service-cpu-throttle-v1
   mechanism: service_cpu_throttle
-  intensity: {cpu_max_quota_us: 25000, cpu_max_period_us: 100000}
+  intensity: {cpu_max_quota_us: 5000, cpu_max_period_us: 100000}
   cleanup: {action: restore_exact_cpu_max}
   effectiveness_criterion: {metric: cpu_throttle_ratio, nr_throttled_delta_min: 1}
   contamination_checks: [pod_restart]
@@ -76,9 +76,16 @@ profiles:
   cleanup: {action: restore_exact_qdisc_and_filters}
   effectiveness_criterion: {metric: edge_latency_p95, filter_hit_and_latency_lift_required: true}
   contamination_checks: [reverse_direction, non_target_edge, packet_loss]
-- profile_id: tcp-failure-v1
+- profile_id: tcp-failure-v2
   mechanism: tcp_failure
-  intensity: {loss_percent: 10, direction: caller_to_callee}
-  cleanup: {action: restore_exact_qdisc_and_filters}
-  effectiveness_criterion: {metric: edge_failure_rate, filter_hit_and_failure_lift_required: true}
+  intensity: {action: reject_with_tcp_reset, direction: caller_to_callee}
+  direct_mutation_controls: [packet_filter]
+  cleanup: {action: restore_exact_packet_filter_rules}
+  effectiveness_criterion:
+    metric: edge_failure_rate
+    filter_hit_and_failure_lift_required: true
+    edge_error_delta_min: 1
+    active_valid_windows_min: 48
+    active_positive_windows_min: 30
+    active_median_min: 0.3
   contamination_checks: [reverse_direction, non_target_edge, added_delay]

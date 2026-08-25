@@ -28,8 +28,8 @@ spec:
         env:
         - {name: TARGET_BASE_URL, value: "http://frontend.online-boutique.svc.cluster.local:80"}
         - {name: TARGET_ARRIVAL_RATE_RPS, value: "25"}
-        - {name: WORKERS, value: "8"}
-        - {name: MAXIMUM_PENDING, value: "64"}
+        - {name: WORKERS, value: "64"}
+        - {name: MAXIMUM_PENDING, value: "512"}
         - {name: REQUEST_TIMEOUT_SEC, value: "10"}
         - {name: LOAD_SEED, value: "20260824"}
         - name: BEHAVIOR_WEIGHTS_JSON

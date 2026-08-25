@@ -513,13 +513,18 @@ can freeze the highest objectively qualified 25/40/55 load profile, run all 12
 real direct-evidence Pilots, verify exact image/placement and node capacity, and
 produce `formal_campaign_go=true`.
 
-TCP delay/loss injection is implemented as a selective prio+netem child qdisc in
-the caller Pod network namespace, with a destination IP/TCP-port flower filter
-and exact qdisc cleanup. The old `tc action netem` construction is invalid and is
-not part of the formal implementation. Host NIC netem is allowed only when the
-Pilot proves the host interface qdisc is safely replaceable and the formal NIC
-drop/error coordinate rises; otherwise Host NIC is removed before manifest
-generation without TCP substitution.
+TCP latency injection is implemented as a selective prio+netem child qdisc in
+the caller Pod network namespace, with a destination IP/TCP-port flower filter,
+pure delay, and exact qdisc cleanup. TCP failure is a separate terminal-failure
+mechanism: a dedicated caller-Pod-netns OUTPUT chain matches the destination
+Service IP/TCP port and executes `REJECT --reject-with tcp-reset`, with rule-hit
+evidence and exact chain removal. Random netem loss was rejected because TCP
+retransmission converted it into latency without activating the formal failure
+coordinate. The old `tc action netem` construction is invalid and is not part of
+the formal implementation. Host NIC netem is allowed only when the Pilot proves
+the host interface qdisc is safely replaceable and the formal NIC drop/error
+coordinate rises; otherwise Host NIC is removed before manifest generation
+without TCP substitution.
 
 ## Incident-local resource residual decision
 

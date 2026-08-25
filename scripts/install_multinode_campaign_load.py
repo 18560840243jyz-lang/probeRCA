@@ -66,6 +66,7 @@ def install(
         "deployment/proberca-multinode-open-loop-load",
         f"TARGET_ARRIVAL_RATE_RPS={profile['target_arrival_rate_rps']}",
         f"WORKERS={profile['workers']}",
+        f"MAXIMUM_PENDING={profile['maximum_pending']}",
         f"BEHAVIOR_WEIGHTS_JSON={weights}",
         f"LOAD_PROFILE_ID={profile['profile_id']}",
         f"LOAD_PROFILE_FINGERPRINT={profile_fingerprint}",

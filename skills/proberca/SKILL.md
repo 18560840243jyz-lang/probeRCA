@@ -2500,8 +2500,11 @@ TCP边独立告警
   和封存archive计算逐坐标投影行数，禁止人工拼接或省略稀疏坐标。
 - 注入器candidate的每个字段必须被allow-listed执行器实际消费。12个真实Pilot必须用
   独立数据证据证明effectiveness、非目标污染为零和精确cleanup；模拟Pilot永远不能冻结
-  注册表。TCP使用Pod netns内按目标方向匹配的qdisc/filter；Host NIC若云网卡qdisc不能
-  安全替换或正式drop/error指标不能上升，就在正式manifest生成前删除该坐标。
+  注册表。TCP latency使用调用方Pod netns内按目标方向匹配的qdisc/filter和纯delay；
+  TCP failure使用同一调用方Pod netns的OUTPUT专用链，按目标Service IP和端口执行
+  `REJECT --reject-with tcp-reset`。随机loss只作为被拒绝的注入器诊断证据，不能冒充正式
+  failure。Host NIC若云网卡qdisc不能安全替换或正式drop/error指标不能上升，就在正式
+  manifest生成前删除该坐标。
 - 单根因Pilot由唯一直接干预定义，不能因为一个孤立的次级资源症状自动改判为多根因。
   `service_cpu`的`cpu_throttle_ratio`污染必须由封存Pilot自身`HEALTHY_PRE`段建立稳健上界，
   再用逐窗`nr_throttled/nr_periods`直接计数自动复核；禁止使用人工布尔值或尚未建立的最终

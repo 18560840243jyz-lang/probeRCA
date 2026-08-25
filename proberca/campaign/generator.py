@@ -82,6 +82,10 @@ def _validate_config(config: dict[str, Any]) -> None:
     for profile in profiles:
         if float(profile["target_arrival_rate_rps"]) <= 0 or int(profile["workers"]) <= 0:
             raise CampaignConfigError("load profile rate and workers must be positive")
+        if int(profile.get("maximum_pending", 0)) < int(profile["workers"]):
+            raise CampaignConfigError(
+                "load profile pending capacity must cover all workers"
+            )
         weights = profile["behavior_weights"]
         if set(weights) != {
             "browse_search_list", "detail_recommendation_ad_currency", "cart", "checkout",

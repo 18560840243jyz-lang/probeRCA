@@ -60,17 +60,20 @@ load_qualification:
   - profile_id: multi-node-open-loop-25
     scale_percent: 25
     target_arrival_rate_rps: 25
-    workers: 8
+    workers: 64
+    maximum_pending: 512
     behavior_weights: {browse_search_list: 40, detail_recommendation_ad_currency: 25, cart: 20, checkout: 15}
   - profile_id: multi-node-open-loop-40
     scale_percent: 40
     target_arrival_rate_rps: 40
-    workers: 8
+    workers: 64
+    maximum_pending: 512
     behavior_weights: {browse_search_list: 40, detail_recommendation_ad_currency: 25, cart: 20, checkout: 15}
   - profile_id: multi-node-open-loop-55
     scale_percent: 55
     target_arrival_rate_rps: 55
-    workers: 8
+    workers: 64
+    maximum_pending: 512
     behavior_weights: {browse_search_list: 40, detail_recommendation_ad_currency: 25, cart: 20, checkout: 15}
   objective_gates:
     maximum_business_error_rate: 0.001
@@ -141,7 +144,7 @@ formal_fault_matrix:
     - {src: recommendationservice, dst: productcatalogservice}
   - metric: edge_failure_rate
     mechanism: tcp_failure
-    injector_profile_id: tcp-failure-v1
+    injector_profile_id: tcp-failure-v2
     targets:
     - {src: frontend, dst: cartservice}
     - {src: checkoutservice, dst: paymentservice}
@@ -160,7 +163,7 @@ pilot_matrix:
 - {entity_kind: host, entity_id: worker-2, metric: io_psi, mechanism: host_io, injector_profile_id: host-io-v1}
 - {entity_kind: host, entity_id: worker-1, metric: nic_drop_error_rate, mechanism: host_nic, injector_profile_id: host-nic-v1}
 - {entity_kind: tcp_edge, entity_id: frontend->cartservice, metric: edge_latency_p95, mechanism: tcp_latency, injector_profile_id: tcp-latency-v1}
-- {entity_kind: tcp_edge, entity_id: frontend->productcatalogservice, metric: edge_failure_rate, mechanism: tcp_failure, injector_profile_id: tcp-failure-v1}
+- {entity_kind: tcp_edge, entity_id: frontend->productcatalogservice, metric: edge_failure_rate, mechanism: tcp_failure, injector_profile_id: tcp-failure-v2}
 
 overhead_experiments:
 - {experiment_id: O0, mode: application-only}

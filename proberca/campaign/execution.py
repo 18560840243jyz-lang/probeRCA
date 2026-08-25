@@ -92,6 +92,15 @@ def evaluate_effectiveness_criterion(
                 passed = conditions.get(key) is True
             if not passed:
                 failures.append(f"direct_condition_failed:{key}")
+        elif key == "active_valid_windows_min":
+            if int(active.get("valid_window_count", 0)) < int(expected):
+                failures.append("active_valid_windows_insufficient")
+        elif key == "active_positive_windows_min":
+            if int(active.get("positive_window_count", 0)) < int(expected):
+                failures.append("active_positive_windows_insufficient")
+        elif key == "active_median_min":
+            if active_value < float(expected):
+                failures.append("active_median_insufficient")
         else:
             failures.append(f"unsupported_effectiveness_criterion:{key}")
     return not failures, failures

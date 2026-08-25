@@ -27,6 +27,9 @@ _COUNTER_COMPONENTS = {
         "node_nic_rx_error_total", "node_nic_tx_error_total",
         "node_qdisc_tx_drop_total",
     ),
+    "edge_request": ("edge_request_total",),
+    "edge_error": ("edge_error_total",),
+    "edge_timeout": ("edge_timeout_total",),
 }
 
 
@@ -305,11 +308,12 @@ def evaluate_fault_effectiveness(
         if before and after:
             counters_before[key] = before[-1]
             counters_after[key] = after[-1]
-    tc = injection_session.get("cleanup_result", {}).get(
-        "traffic_control_evidence", {}
-    )
-    filter_hit = tc.get("matched_filter_present") is True \
-        and int(tc.get("packets", 0)) > 0
+    cleanup_result = injection_session.get("cleanup_result", {})
+    mutation_evidence = cleanup_result.get("packet_filter_evidence")
+    if mutation_evidence is None:
+        mutation_evidence = cleanup_result.get("traffic_control_evidence", {})
+    filter_hit = mutation_evidence.get("matched_filter_present") is True \
+        and int(mutation_evidence.get("packets", 0)) > 0
     lift = active_value > baseline_value
     conditions = {
         "direct_counter_lift_required": lift,
@@ -351,9 +355,14 @@ def evaluate_fault_effectiveness(
     active = {
         "metric": coordinate["metric"],
         "primary_value": active_value,
+        "valid_window_count": len(values["FAULT_ACTIVE"]),
+        "positive_window_count": sum(
+            value > 0.0 for value in values["FAULT_ACTIVE"]
+        ),
         "counters": counters_after,
         "conditions": conditions,
         "contamination": effective_contamination,
+        "mutation_evidence": mutation_evidence,
     }
     passed, failures = evaluate_effectiveness_criterion(
         profile["effectiveness_criterion"], baseline, active,

@@ -38,7 +38,7 @@ _INTENSITY_FIELDS = {
     }),
     "host_nic": frozenset({"drop_percent", "direction", "interface"}),
     "tcp_latency": frozenset({"delay_ms", "direction"}),
-    "tcp_failure": frozenset({"loss_percent", "direction"}),
+    "tcp_failure": frozenset({"action", "direction"}),
 }
 
 _DIRECT_MUTATION_CONTROLS = {
@@ -48,7 +48,7 @@ _DIRECT_MUTATION_CONTROLS = {
     "host_memory": frozenset({"memory.high"}),
     "host_nic": frozenset({"traffic_control"}),
     "tcp_latency": frozenset({"traffic_control"}),
-    "tcp_failure": frozenset({"traffic_control"}),
+    "tcp_failure": frozenset({"packet_filter"}),
 }
 
 _SECONDARY_SIGNAL_POLICY_FIELDS = frozenset({
