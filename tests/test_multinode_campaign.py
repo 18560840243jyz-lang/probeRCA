@@ -1524,8 +1524,18 @@ def test_multinode_worker_reader_can_freeze_endpointslice_topology():
         for resource in rule["resources"]
         for verb in rule["verbs"]
     }
-    for verb in ("get", "list", "watch"):
-        assert ("discovery.k8s.io", "endpointslices", verb) in permissions
+    required = {
+        "": {
+            "nodes", "pods", "services",
+            "persistentvolumeclaims", "persistentvolumes",
+        },
+        "discovery.k8s.io": {"endpointslices"},
+        "apps": {"deployments", "replicasets", "statefulsets", "daemonsets"},
+    }
+    for group, resources in required.items():
+        for resource in resources:
+            for verb in ("get", "list", "watch"):
+                assert (group, resource, verb) in permissions
 
 
 def _formal_metric_records(worker, services, edges, contract, timestamp_ns=0):
