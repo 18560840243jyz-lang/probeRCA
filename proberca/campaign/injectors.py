@@ -15,7 +15,9 @@ class InjectorRegistryError(ValueError):
 
 
 _INTENSITY_FIELDS = {
-    "service_cpu": frozenset({"actor_workers", "target_cgroup"}),
+    "service_cpu": frozenset({
+        "actor_workers", "duty_cycle", "target_cgroup",
+    }),
     "service_cpu_throttle": frozenset({
         "cpu_max_quota_us", "cpu_max_period_us",
     }),

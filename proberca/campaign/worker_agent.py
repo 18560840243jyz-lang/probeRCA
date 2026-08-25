@@ -386,6 +386,11 @@ class LinuxWorkerBackend:
             "--duration", "3600", "--cgroup", str(cgroup),
             "--workers", str(workers),
         ]
+        if mechanism == "service_cpu":
+            duty_cycle = float(intensity["duty_cycle"])
+            if not 0.0 < duty_cycle <= 1.0:
+                raise WorkerAgentError("service CPU duty cycle is invalid")
+            arguments.extend(["--duty-cycle", f"{duty_cycle:g}"])
         if mode == "memory":
             if "working_set_bytes" in intensity:
                 byte_count = int(intensity["working_set_bytes"])

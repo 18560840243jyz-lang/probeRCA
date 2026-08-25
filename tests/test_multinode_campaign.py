@@ -1123,6 +1123,45 @@ def test_service_io_actor_receives_frozen_write_rate(monkeypatch, tmp_path):
         str(16 * 1024 * 1024)
 
 
+def test_service_cpu_actor_receives_frozen_bounded_duty_cycle(monkeypatch, tmp_path):
+    from proberca.campaign.worker_agent import LinuxWorkerBackend
+
+    actor = tmp_path / "multinode_fault_actor.py"
+    actor.write_text("# test actor\n", encoding="utf-8")
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    (cgroup / "cgroup.procs").write_text("", encoding="ascii")
+    commands = []
+
+    def popen(arguments, **_kwargs):
+        commands.append(arguments)
+        return SimpleNamespace(pid=12345)
+
+    backend = LinuxWorkerBackend(
+        node_id="worker-1", state_root=tmp_path / "state",
+        work_root=tmp_path / "work", actor_path=actor, popen=popen,
+    )
+    monkeypatch.setattr(backend, "_cgroup_path", lambda _target: cgroup)
+    profile = next(
+        item for item in load_injector_registry(
+            REPOSITORY / "configs/final_multinode_injector_candidates.yaml",
+            require_frozen=False,
+        )["profiles"] if item["mechanism"] == "service_cpu"
+    )
+    assert profile["intensity"] == {
+        "actor_workers": 1,
+        "duty_cycle": 0.3,
+        "target_cgroup": "application",
+    }
+    backend._spawn_actor("service_cpu", {
+        "session_id": "2" * 64,
+        "target": _target().as_dict(),
+        "intensity": profile["intensity"],
+    }, {})
+    assert commands[0][commands[0].index("--workers") + 1] == "1"
+    assert commands[0][commands[0].index("--duty-cycle") + 1] == "0.3"
+
+
 def test_ssh_transport_pins_host_key_and_never_uses_remote_shell(tmp_path):
     identity = tmp_path / "id"
     known_hosts = tmp_path / "known_hosts"

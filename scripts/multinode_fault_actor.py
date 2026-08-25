@@ -29,15 +29,24 @@ def _join_cgroup(value: str) -> None:
     (path / "cgroup.procs").write_text(f"{os.getpid()}\n", encoding="ascii")
 
 
-def _cpu(workers: int, deadline: float) -> None:
-    def work(stop: multiprocessing.Event, end: float) -> None:
+def _cpu(workers: int, deadline: float, duty_cycle: float) -> None:
+    def work(stop: multiprocessing.Event, end: float, duty: float) -> None:
         value = 1
+        period_seconds = 0.1
         while not stop.is_set() and time.monotonic() < end:
-            value = (value * 1664525 + 1013904223) & 0xFFFFFFFF
+            period_start = time.monotonic()
+            busy_until = min(end, period_start + period_seconds * duty)
+            while not stop.is_set() and time.monotonic() < busy_until:
+                value = (value * 1664525 + 1013904223) & 0xFFFFFFFF
+            remaining = period_start + period_seconds - time.monotonic()
+            if remaining > 0:
+                stop.wait(remaining)
 
     process_stop = multiprocessing.Event()
     processes = [
-        multiprocessing.Process(target=work, args=(process_stop, deadline))
+        multiprocessing.Process(
+            target=work, args=(process_stop, deadline, duty_cycle),
+        )
         for _ in range(workers)
     ]
     for process in processes:
@@ -141,6 +150,7 @@ def main() -> int:
     parser.add_argument("--duration", required=True, type=int)
     parser.add_argument("--cgroup", required=True)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--duty-cycle", type=float, default=1.0)
     parser.add_argument("--bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--bytes-per-second", type=int, default=0)
     parser.add_argument("--file", type=Path)
@@ -149,6 +159,8 @@ def main() -> int:
         raise SystemExit("actor duration must be in 1..3600 seconds")
     if arguments.workers <= 0 or arguments.workers > 128:
         raise SystemExit("actor worker count must be in 1..128")
+    if not 0.0 < arguments.duty_cycle <= 1.0:
+        raise SystemExit("actor duty cycle must be in (0, 1]")
     if arguments.bytes <= 0:
         raise SystemExit("actor byte count must be positive")
     if arguments.bytes_per_second < 0:
@@ -158,7 +170,7 @@ def main() -> int:
     _join_cgroup(arguments.cgroup)
     deadline = time.monotonic() + arguments.duration
     if arguments.mode == "cpu":
-        _cpu(arguments.workers, deadline)
+        _cpu(arguments.workers, deadline, arguments.duty_cycle)
     elif arguments.mode == "memory":
         _memory(arguments.bytes, deadline)
     elif arguments.mode == "io":

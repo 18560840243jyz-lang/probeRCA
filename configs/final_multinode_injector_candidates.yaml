@@ -3,7 +3,7 @@ status: candidate
 profiles:
 - profile_id: service-cpu-v1
   mechanism: service_cpu
-  intensity: {actor_workers: 2, target_cgroup: application}
+  intensity: {actor_workers: 1, duty_cycle: 0.3, target_cgroup: application}
   cleanup: {action: terminate_actor, require_cgroup_empty: true}
   effectiveness_criterion: {metric: cpu_usage_rate, direct_counter_lift_required: true}
   contamination_checks: [cpu_throttle_ratio, pod_restart]
