@@ -129,7 +129,7 @@ def render(
                 optional.append("worker")
             query["optional_labels"] = optional
         burst = {
-            "schema_version": "probeRCA-final-live-burst-v2",
+            "schema_version": "probeRCA-final-live-burst-v3",
             "cluster_id": cluster_id,
             "event_log_path": "/var/lib/proberca-final-burst/events.jsonl",
             "cgroup_root": "/sys/fs/cgroup",
@@ -138,6 +138,8 @@ def render(
             "expected_program_count": 31,
             "sampling_profile": "low",
             "max_buffered_event_records": 250000,
+            "runtime_mode": "host",
+            "monitored_node_name": node["kubernetes_node_name"],
         }
         (root / "primitive-exporter.yaml").write_text(
             yaml.safe_dump(exporter, sort_keys=False), encoding="utf-8",

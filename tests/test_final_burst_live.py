@@ -1124,3 +1124,17 @@ def test_live_burst_config_rejects_unknown_sampling_profile(tmp_path):
     }
     with pytest.raises(RawCollectionError, match="sampling_profile"):
         FinalLiveBurstConfig.from_dict(payload)
+
+
+def test_multinode_burst_config_requires_a_frozen_monitored_node(tmp_path):
+    payload = {
+        **_config(tmp_path).__dict__,
+        "schema_version": "probeRCA-final-live-burst-v3",
+        "runtime_mode": "host",
+        "monitored_node_name": "worker-2",
+    }
+    config = FinalLiveBurstConfig.from_dict(payload)
+    assert config.monitored_node_name == "worker-2"
+    invalid = {**payload, "monitored_node_name": ""}
+    with pytest.raises(RawCollectionError, match="monitored node"):
+        FinalLiveBurstConfig.from_dict(invalid)

@@ -93,6 +93,7 @@ from proberca.dataplane.primitive_exporter import (
     FinalPrimitiveExporterConfig,
     MULTINODE_PRIMITIVE_EXPORTER_SCHEMA_VERSION,
 )
+from proberca.dataplane.burst_live import FinalLiveBurstConfig
 from proberca.dataplane.collector import (
     FinalLiveCollectorConfig,
     MULTINODE_COLLECTOR_CONFIG_SCHEMA_VERSION,
@@ -1470,6 +1471,12 @@ def test_multinode_dataplane_render_is_worker_local_and_formally_complete(tmp_pa
             and "worker" in item["optional_labels"]
             for item in source["prometheus"]["queries"]
         )
+        burst = FinalLiveBurstConfig.from_dict(yaml.safe_load((
+            output / worker / "live-burst.yaml"
+        ).read_text(encoding="utf-8")))
+        assert burst.schema_version == "probeRCA-final-live-burst-v3"
+        assert burst.runtime_mode == "host"
+        assert burst.monitored_node_name == worker
     assert len(union) == 11
     assert len(projected_edges) == 15
     scrape = yaml.safe_load((

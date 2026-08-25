@@ -270,6 +270,7 @@ def test_host_exporter_reads_beyla_from_its_frozen_monitored_node():
     assert calls == [
         ("http://10.0.0.3:9400/metrics", primitive_module._BEYLA_REQUEST_METRICS)
     ]
+    assert exporter._monitored_inventory_node(inventory) == "worker-2"
 
 
 def test_host_exporter_fails_closed_when_monitored_node_is_absent():

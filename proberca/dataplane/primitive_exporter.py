@@ -1039,10 +1039,8 @@ class FinalPrimitiveExporter:
             records.append(record)
         return tuple(records)
 
-    def _beyla(
-        self, inventory: Inventory,
-    ) -> tuple[PrometheusSample, ...]:
-        if self.config.runtime_mode == "host":
+    def _monitored_inventory_node(self, inventory: Inventory) -> str:
+        if getattr(self.config, "runtime_mode", "kind_container") == "host":
             node = self.config.monitored_node_name
             if (
                 not node
@@ -1058,6 +1056,12 @@ class FinalPrimitiveExporter:
                     "single-VM exporter requires exactly one Kubernetes node"
                 )
             node = inventory.node_names[0]
+        return node
+
+    def _beyla(
+        self, inventory: Inventory,
+    ) -> tuple[PrometheusSample, ...]:
+        node = self._monitored_inventory_node(inventory)
         url = (
             f"http://{inventory.node_internal_ips[node]}:"
             f"{self.config.beyla_port}/metrics"
@@ -2363,11 +2367,7 @@ class FinalPrimitiveExporter:
         *,
         qdisc_raw: tuple[tuple[str, float], ...] | None = None,
     ) -> tuple[PrometheusSample, ...]:
-        if len(inventory.node_names) != 1:
-            raise RawCollectionError(
-                "one node_exporter cannot represent multiple nodes"
-            )
-        node = inventory.node_names[0]
+        node = self._monitored_inventory_node(inventory)
         samples = collected or self._fetch_url(
             self.config.node_exporter_url
         )

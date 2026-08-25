@@ -20,7 +20,8 @@ from .contracts import fingerprint
 from .raw import RawCollectionError
 
 
-LIVE_BURST_CONFIG_SCHEMA_VERSION = "probeRCA-final-live-burst-v2"
+LIVE_BURST_CONFIG_SCHEMA_VERSION = "probeRCA-final-live-burst-v3"
+LEGACY_LIVE_BURST_CONFIG_SCHEMA_VERSION = "probeRCA-final-live-burst-v2"
 INITIAL_LOG_TAIL_BYTES = 32 * 1024 * 1024
 
 EVENT_SCHED_RUNQUEUE = 1
@@ -110,19 +111,42 @@ class FinalLiveBurstConfig:
     expected_program_count: int
     sampling_profile: str
     max_buffered_event_records: int
+    runtime_mode: str = "single_node"
+    monitored_node_name: str | None = None
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "FinalLiveBurstConfig":
-        if not isinstance(payload, dict) \
-                or set(payload) != set(cls.__dataclass_fields__):
+        if not isinstance(payload, dict):
             raise RawCollectionError("live Burst config fields mismatch")
-        result = cls(**payload)
+        normalized = dict(payload)
+        normalized.setdefault("runtime_mode", "single_node")
+        normalized.setdefault("monitored_node_name", None)
+        if set(normalized) != set(cls.__dataclass_fields__):
+            raise RawCollectionError("live Burst config fields mismatch")
+        result = cls(**normalized)
         result.validate()
         return result
 
     def validate(self) -> None:
-        if self.schema_version != LIVE_BURST_CONFIG_SCHEMA_VERSION:
+        if self.schema_version not in {
+            LEGACY_LIVE_BURST_CONFIG_SCHEMA_VERSION,
+            LIVE_BURST_CONFIG_SCHEMA_VERSION,
+        }:
             raise RawCollectionError("unsupported live Burst config")
+        if self.schema_version == LEGACY_LIVE_BURST_CONFIG_SCHEMA_VERSION:
+            if self.runtime_mode != "single_node" \
+                    or self.monitored_node_name is not None:
+                raise RawCollectionError(
+                    "legacy live Burst config must use single-node runtime"
+                )
+        elif (
+            self.runtime_mode != "host"
+            or not isinstance(self.monitored_node_name, str)
+            or not self.monitored_node_name.strip()
+        ):
+            raise RawCollectionError(
+                "multi-node live Burst config requires a monitored node"
+            )
         if (
             not self.cluster_id
             or not self.event_log_path
@@ -395,6 +419,9 @@ class FinalLiveBurstSource:
         needs_refresh = False
         container_ids = []
         for identity in identities:
+            if self.config.runtime_mode == "host" \
+                    and identity.node_name != self.config.monitored_node_name:
+                continue
             if not identity.service_ids or getattr(
                     identity, "container_type", "app") != "app":
                 continue
@@ -718,6 +745,9 @@ class FinalLiveBurstSource:
         service_entities = set()
         refreshed_paths = False
         for identity in runtime_identities(revision):
+            if self.config.runtime_mode == "host" \
+                    and identity.node_name != self.config.monitored_node_name:
+                continue
             if (
                 not identity.ready
                 or not identity.started
@@ -797,12 +827,13 @@ class FinalLiveBurstSource:
             (namespace, service)
             for namespace, service, _entity in service_entities
         }
-        if (
-            len(node_names) != 1
-            or covered_services != monitored_services
-        ):
+        expected_nodes = (
+            {self.config.monitored_node_name}
+            if self.config.runtime_mode == "host" else node_names
+        )
+        if node_names != expected_nodes or covered_services != monitored_services:
             raise RawCollectionError(
-                "single-VM Burst identity coverage is incomplete"
+                "Burst identity coverage is incomplete for the monitored node"
             )
         return cgroups, ip_services, next(iter(node_names)), service_entities
 
