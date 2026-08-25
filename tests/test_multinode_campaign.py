@@ -1511,6 +1511,23 @@ def test_multinode_dataplane_render_is_worker_local_and_formally_complete(tmp_pa
     } == {f"{value}:9100" for value in dataplane_hosts.values()}
 
 
+def test_multinode_worker_reader_can_freeze_endpointslice_topology():
+    documents = list(yaml.safe_load_all((
+        REPOSITORY
+        / "deploy/multinode-campaign/worker-readonly-rbac.yaml"
+    ).read_text(encoding="utf-8")))
+    role = next(item for item in documents if item["kind"] == "ClusterRole")
+    permissions = {
+        (group, resource, verb)
+        for rule in role["rules"]
+        for group in rule["apiGroups"]
+        for resource in rule["resources"]
+        for verb in rule["verbs"]
+    }
+    for verb in ("get", "list", "watch"):
+        assert ("discovery.k8s.io", "endpointslices", verb) in permissions
+
+
 def _formal_metric_records(worker, services, edges, contract, timestamp_ns=0):
     roles = contract["normal_metric_roles"]
     nodes = []
