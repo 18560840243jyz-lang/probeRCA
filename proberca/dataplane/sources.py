@@ -311,6 +311,7 @@ class PrometheusPrimitiveSource:
 
     def wait_for_target_timestamp(
         self, *, target_timestamp_ns: int, cluster_id: str,
+        required_labels: dict[str, str] | None = None,
     ) -> None:
         """Wait until Prometheus has stored the exact final target sentinel."""
 
@@ -323,12 +324,20 @@ class PrometheusPrimitiveSource:
             )
         if not isinstance(cluster_id, str) or not cluster_id:
             raise RawCollectionError("sentinel cluster identity is required")
+        required_labels = dict(required_labels or {})
+        if "cluster_id" in required_labels or any(
+            not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", key)
+            or not isinstance(value, str) or not value
+            for key, value in required_labels.items()
+        ):
+            raise RawCollectionError("sentinel required labels are invalid")
         target_sec = f"{target_timestamp_ns / 1_000_000_000:.9f}"
-        promql = (
-            "proberca_final_primitive_exporter_ready{cluster_id="
-            + json.dumps(cluster_id)
-            + "}"
+        selector_labels = {"cluster_id": cluster_id, **required_labels}
+        selector = ",".join(
+            f"{key}={json.dumps(value)}"
+            for key, value in sorted(selector_labels.items())
         )
+        promql = f"proberca_final_primitive_exporter_ready{{{selector}}}"
         started = time.monotonic()
         deadline = started + float(
             self.config.final_target_wait_timeout_sec
@@ -373,7 +382,10 @@ class PrometheusPrimitiveSource:
             matches = []
             for series in data.get("result") or []:
                 labels = series.get("metric") or {}
-                if labels.get("cluster_id") != cluster_id:
+                if any(
+                    labels.get(key) != value
+                    for key, value in selector_labels.items()
+                ):
                     continue
                 for pair in series.get("values") or []:
                     if not isinstance(pair, list) or len(pair) != 2:
@@ -393,6 +405,7 @@ class PrometheusPrimitiveSource:
             if matches:
                 self.last_sentinel_wait_stats = {
                     "target_timestamp_ns": target_timestamp_ns,
+                    "required_labels": required_labels,
                     "attempts": attempts,
                     "wall_seconds": time.monotonic() - started,
                 }

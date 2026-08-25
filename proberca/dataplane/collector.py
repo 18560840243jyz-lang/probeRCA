@@ -873,9 +873,16 @@ class FinalLiveCollectionRunner:
             self.primitive_source, "wait_for_target_timestamp", None
         )
         if callable(waiter):
+            arguments = {
+                "target_timestamp_ns": timestamp_ns,
+                "cluster_id": self.config.cluster_id,
+            }
+            if getattr(self.config, "is_worker_projection", False):
+                arguments["required_labels"] = {
+                    "worker": self.config.projection_owner,
+                }
             waiter(
-                target_timestamp_ns=timestamp_ns,
-                cluster_id=self.config.cluster_id,
+                **arguments,
             )
 
     def collect_one(self, sequence: int) -> CollectedWindow:

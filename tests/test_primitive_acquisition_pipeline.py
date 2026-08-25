@@ -362,6 +362,57 @@ def test_prometheus_final_target_wait_requires_exact_sentinel_timestamp():
     assert source.last_sentinel_wait_stats["target_timestamp_ns"] == target_ns
 
 
+def test_prometheus_final_target_wait_selects_one_worker_sentinel():
+    target_ns = 10_000_000_000
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "status": "success",
+                "data": {
+                    "resultType": "matrix",
+                    "result": [{
+                        "metric": {
+                            "cluster_id": "cluster", "worker": worker,
+                            "instance": f"{worker}:9477",
+                        },
+                        "values": [[10.0, "1"]],
+                    } for worker in ("worker-1", "worker-2", "worker-3")],
+                },
+            }
+
+    calls = []
+    source = PrometheusPrimitiveSource.__new__(PrometheusPrimitiveSource)
+    source.config = SimpleNamespace(
+        base_url="http://prometheus",
+        timeout_sec=1.0,
+        reject_warnings=True,
+        final_target_wait_timeout_sec=1.0,
+        sentinel_poll_interval_sec=0.05,
+    )
+    source.session = SimpleNamespace(
+        get=lambda url, **kwargs: calls.append((url, kwargs)) or Response()
+    )
+    source.last_sentinel_wait_stats = {}
+
+    source.wait_for_target_timestamp(
+        target_timestamp_ns=target_ns,
+        cluster_id="cluster",
+        required_labels={"worker": "worker-2"},
+    )
+
+    assert calls[0][1]["params"]["query"] == (
+        'proberca_final_primitive_exporter_ready{cluster_id="cluster",'
+        'worker="worker-2"}'
+    )
+    assert source.last_sentinel_wait_stats["required_labels"] == {
+        "worker": "worker-2",
+    }
+
+
 def test_live_runner_passes_exact_final_boundary_to_primitive_waiter():
     calls = []
     runner = FinalLiveCollectionRunner.__new__(FinalLiveCollectionRunner)
@@ -373,4 +424,24 @@ def test_live_runner_passes_exact_final_boundary_to_primitive_waiter():
     assert calls == [{
         "target_timestamp_ns": 12_000_000_000,
         "cluster_id": "cluster",
+    }]
+
+
+def test_live_runner_scopes_final_boundary_sentinel_to_projection_worker():
+    calls = []
+    runner = FinalLiveCollectionRunner.__new__(FinalLiveCollectionRunner)
+    runner.config = SimpleNamespace(
+        cluster_id="cluster", is_worker_projection=True,
+        projection_owner="worker-2",
+    )
+    runner.primitive_source = SimpleNamespace(
+        wait_for_target_timestamp=lambda **kwargs: calls.append(kwargs)
+    )
+
+    runner._wait_for_primitive_target(12_000_000_000)
+
+    assert calls == [{
+        "target_timestamp_ns": 12_000_000_000,
+        "cluster_id": "cluster",
+        "required_labels": {"worker": "worker-2"},
     }]
