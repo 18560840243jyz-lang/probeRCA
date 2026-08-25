@@ -2481,8 +2481,9 @@ TCP边独立告警
   后重采，不允许跳到后续case、重新随机或覆盖已封存Dataset ID/SHA。
 - TCP failure正式注入保持持续、有向、端口级TCP RST。gRPC初始失败后进入退避造成的
   `no_exposure`必须保持`value=null/valid=false`，不得改写为failure或0。其Pilot按episode
-  判定：固定2秒在途排空后15秒内至少5次尝试、3个failure正值窗、累计失败比例至少0.5，
-  同时有RST命中和error/timeout直接计数增长；后续退避必须由每5秒封存的目标行为意图账本
+  判定：固定2秒在途排空后的15秒内至少3次尝试且分布在3个failure正值窗、累计失败比例
+  至少0.5，同时有RST命中且完整活动段error/timeout直接计数增量至少5；后续退避必须由
+  每5秒封存的目标行为意图账本
   证明需求仍存在；精确清理后至少连续30个暴露窗恢复到Healthy-Pre failure范围。缺少需求
   意图证据只能输出`NOT_EVALUABLE_INSUFFICIENT_DEMAND`，通过状态固定为
   `PASS_TERMINAL_FAILURE_WITH_EXPECTED_BACKOFF`。不得用48/60有效窗、脉冲RST、补1或强制重连

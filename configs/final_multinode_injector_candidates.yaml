@@ -86,10 +86,10 @@ profiles:
   terminal_failure_policy:
     drain_grace_seconds: 2
     initial_confirmation_seconds: 15
-    initial_attempts_min: 5
+    initial_attempts_min: 3
     initial_positive_windows_min: 3
     initial_failure_ratio_min: 0.5
-    direct_failure_delta_min: 1
+    direct_failure_delta_min: 5
     demand_interval_seconds: 5
     minimum_target_intents_per_interval: 1
     recovery_consecutive_exposure_windows: 30

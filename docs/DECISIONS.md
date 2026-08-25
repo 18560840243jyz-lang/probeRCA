@@ -476,9 +476,10 @@ data-plane meaning `value=null`, `valid=false`, `invalid_reason=no_exposure`;
 they are never rewritten as failures or zeroes.
 
 Injector effectiveness is therefore evaluated once per episode: after a fixed
-two-second in-flight drain grace, the first 15 seconds must contain at least
-five attempts, three positive failure windows, a cumulative failure ratio of
-at least 0.5, direct error/timeout counter growth, and RST filter hits. During
+two-second in-flight drain grace, the next 15 seconds must contain at least
+three attempts in three positive failure windows and a cumulative failure ratio
+of at least 0.5. The full active phase must contain at least five direct
+error/timeout increments and RST filter hits. During
 the remainder of the active phase, a durable five-second behavior-intent ledger
 must prove continuing demand for the target edge. After exact cleanup, at least
 30 consecutive exposed windows must return to the empirical Healthy-Pre failure

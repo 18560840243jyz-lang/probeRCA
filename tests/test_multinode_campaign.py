@@ -1819,6 +1819,8 @@ def test_tcp_failure_profile_uses_episode_terminal_policy_not_sustained_windows(
     assert profile["terminal_failure_policy"]["pass_status"] == \
         "PASS_TERMINAL_FAILURE_WITH_EXPECTED_BACKOFF"
     assert profile["terminal_failure_policy"]["drain_grace_seconds"] == 2
+    assert profile["terminal_failure_policy"]["initial_attempts_min"] == 3
+    assert profile["terminal_failure_policy"]["direct_failure_delta_min"] == 5
 
 
 def test_terminal_tcp_failure_accepts_grpc_backoff_and_requires_demand_ledger(
