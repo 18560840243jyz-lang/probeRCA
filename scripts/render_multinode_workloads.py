@@ -23,6 +23,11 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _canonical_text_sha(path: Path) -> str:
+    payload = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _load_yaml(path: Path):
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
@@ -37,7 +42,9 @@ def render(
     if lock.get("schema_version") != "probeRCA-multinode-image-lock-v1":
         raise ValueError("unsupported image lock")
     source = repository / lock["online_boutique_source"]["manifest_path"]
-    if _sha(source) != lock["online_boutique_source"]["manifest_sha256"]:
+    if _canonical_text_sha(source) != lock["online_boutique_source"][
+        "manifest_sha256"
+    ]:
         raise ValueError("vendored Online Boutique manifest SHA-256 mismatch")
     workers = {
         item["node_id"]: item["kubernetes_node_name"]
@@ -56,7 +63,12 @@ def render(
     cadence = _load_yaml(
         repository / "deploy/final-dataplane/healthy-probe-cadence.yaml"
     )
-    documents = []
+    namespace = campaign["formal_scope"]["namespace"]
+    documents = [{
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {"name": namespace},
+    }]
     deployments = {}
     service_objects = {}
     for document in yaml.safe_load_all(source.read_text(encoding="utf-8")):
@@ -66,6 +78,7 @@ def render(
         name = document.get("metadata", {}).get("name")
         if kind == "Deployment" and name == "loadgenerator":
             continue
+        document.setdefault("metadata", {})["namespace"] = namespace
         if kind == "Deployment" and name in services:
             specification = document["spec"]
             specification["replicas"] = 1
@@ -120,16 +133,17 @@ def render(
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         raise ValueError("refusing to overwrite rendered workloads")
-    output.write_text(
-        yaml.safe_dump_all(documents, sort_keys=False), encoding="utf-8",
+    output.write_bytes(
+        yaml.safe_dump_all(documents, sort_keys=False).encode("utf-8")
     )
     report = {
         "schema_version": "probeRCA-multinode-workload-render-v1",
         "upstream_git_sha": lock["online_boutique_source"]["upstream_git_sha"],
-        "source_manifest_sha256": _sha(source),
+        "source_manifest_sha256": _canonical_text_sha(source),
         "rendered_manifest_sha256": _sha(output),
         "formal_service_count": len(deployments),
         "excluded_loadgenerator": "loadgenerator" not in deployments,
+        "namespace": namespace,
         "images_pinned": all(
             "@sha256:" in item["spec"]["template"]["spec"]["containers"][0]["image"]
             for item in deployments.values()

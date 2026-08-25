@@ -1804,7 +1804,21 @@ def test_multinode_workload_render_pins_images_placement_and_email_probe(tmp_pat
     assert report["formal_service_count"] == 11
     assert report["excluded_loadgenerator"] is True
     assert report["images_pinned"] is True
+    assert report["namespace"] == "online-boutique"
     documents = list(yaml.safe_load_all(output.read_text(encoding="utf-8")))
+    namespaces = [
+        item for item in documents
+        if item and item.get("kind") == "Namespace"
+    ]
+    assert namespaces == [{
+        "apiVersion": "v1", "kind": "Namespace",
+        "metadata": {"name": "online-boutique"},
+    }]
+    assert all(
+        item["metadata"].get("namespace") == "online-boutique"
+        for item in documents
+        if item and item.get("kind") != "Namespace"
+    )
     deployments = {
         item["metadata"]["name"]: item for item in documents
         if item and item.get("kind") == "Deployment"
@@ -1825,6 +1839,19 @@ def test_multinode_workload_render_pins_images_placement_and_email_probe(tmp_pat
     }
     assert email["readinessProbe"]["grpc"]["port"] == 8080
     assert email["livenessProbe"]["grpc"]["port"] == 8080
+
+
+def test_multinode_workload_source_hash_is_newline_stable(tmp_path):
+    renderer = _script_module(
+        "render_multinode_workloads_newline_test", "render_multinode_workloads.py",
+    )
+    linux = tmp_path / "linux.yaml"
+    windows = tmp_path / "windows.yaml"
+    linux.write_bytes(b"kind: Service\nmetadata:\n  name: frontend\n")
+    windows.write_bytes(b"kind: Service\r\nmetadata:\r\n  name: frontend\r\n")
+    assert renderer._canonical_text_sha(linux) == renderer._canonical_text_sha(
+        windows
+    )
 
 
 def test_multinode_cluster_installer_uses_rendered_workloads_and_worker_beyla(
