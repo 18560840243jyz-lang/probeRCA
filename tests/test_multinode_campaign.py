@@ -1424,6 +1424,14 @@ def test_multinode_dataplane_render_is_worker_local_and_formally_complete(tmp_pa
     nodes = yaml.safe_load((
         REPOSITORY / "configs/final_multinode_nodes.example.yaml"
     ).read_text(encoding="utf-8"))
+    dataplane_hosts = {
+        "worker-1": "192.0.2.11",
+        "worker-2": "192.0.2.12",
+        "worker-3": "192.0.2.13",
+    }
+    for node in nodes["nodes"]:
+        if node["node_id"] in dataplane_hosts:
+            node["dataplane_host"] = dataplane_hosts[node["node_id"]]
     # Make generated paths self-contained; no connection is attempted.
     nodes_path = tmp_path / "nodes.yaml"
     nodes_path.write_text(yaml.safe_dump(nodes), encoding="utf-8")
@@ -1486,6 +1494,9 @@ def test_multinode_dataplane_render_is_worker_local_and_formally_complete(tmp_pa
     assert scrape["honor_timestamps"] is True
     assert scrape["scrape_interval"] == "250ms"
     assert len(scrape["static_configs"]) == 3
+    assert {
+        item["targets"][0] for item in scrape["static_configs"]
+    } == {f"{value}:9477" for value in dataplane_hosts.values()}
     full_prometheus = yaml.safe_load((output / "prometheus.yaml").read_text(
         encoding="utf-8"
     ))
@@ -1494,6 +1505,10 @@ def test_multinode_dataplane_render_is_worker_local_and_formally_complete(tmp_pa
         "proberca-worker-node-exporter",
     ]
     assert len(full_prometheus["scrape_configs"][1]["static_configs"]) == 3
+    assert {
+        item["targets"][0]
+        for item in full_prometheus["scrape_configs"][1]["static_configs"]
+    } == {f"{value}:9100" for value in dataplane_hosts.values()}
 
 
 def _formal_metric_records(worker, services, edges, contract, timestamp_ns=0):

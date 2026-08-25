@@ -8,6 +8,7 @@ nodes:
 - node_id: s0
   role: controller
   host: 10.0.0.10
+  dataplane_host: 10.0.0.10
   user: ubuntu
   port: 22
   identity_file: /home/ubuntu/.ssh/proberca_campaign
@@ -18,6 +19,7 @@ nodes:
 - node_id: worker-1
   role: worker
   host: 10.0.0.11
+  dataplane_host: 10.0.0.11
   user: ubuntu
   port: 22
   identity_file: /home/ubuntu/.ssh/proberca_campaign
@@ -29,6 +31,7 @@ nodes:
 - node_id: worker-2
   role: worker
   host: 10.0.0.12
+  dataplane_host: 10.0.0.12
   user: ubuntu
   port: 22
   identity_file: /home/ubuntu/.ssh/proberca_campaign
@@ -40,6 +43,7 @@ nodes:
 - node_id: worker-3
   role: worker
   host: 10.0.0.13
+  dataplane_host: 10.0.0.13
   user: ubuntu
   port: 22
   identity_file: /home/ubuntu/.ssh/proberca_campaign

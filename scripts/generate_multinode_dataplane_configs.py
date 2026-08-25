@@ -59,6 +59,7 @@ def render(
     rendered = {}
     for worker in campaign["workers"]:
         node = worker_nodes[worker]
+        dataplane_host = node.get("dataplane_host", node["host"])
         root = output / worker
         root.mkdir()
         local_service_names = set(campaign["placement"][worker])
@@ -174,10 +175,12 @@ WantedBy=multi-user.target
             service, encoding="utf-8",
         )
         prometheus_targets.append({
-            "targets": [f"{node['host']}:9477"], "labels": {"worker": worker},
+            "targets": [f"{dataplane_host}:9477"],
+            "labels": {"worker": worker},
         })
         rendered[worker] = {
             "node": node["host"],
+            "dataplane_host": dataplane_host,
             "config_fingerprint": fingerprint({
                 "exporter": exporter, "source": source, "burst": burst,
             }),
@@ -194,18 +197,20 @@ WantedBy=multi-user.target
     (output / "prometheus-scrape-job.yaml").write_text(
         yaml.safe_dump(prometheus, sort_keys=False), encoding="utf-8",
     )
+    node_exporter_targets = []
+    for worker in campaign["workers"]:
+        node = worker_nodes[worker]
+        dataplane_host = node.get("dataplane_host", node["host"])
+        node_exporter_targets.append({
+            "targets": [f"{dataplane_host}:9100"],
+            "labels": {"worker": worker},
+        })
     node_exporter = {
         "job_name": "proberca-worker-node-exporter",
         "honor_timestamps": True,
         "scrape_interval": "1s",
         "scrape_timeout": "800ms",
-        "static_configs": [
-            {
-                "targets": [f"{worker_nodes[worker]['host']}:9100"],
-                "labels": {"worker": worker},
-            }
-            for worker in campaign["workers"]
-        ],
+        "static_configs": node_exporter_targets,
     }
     full_prometheus = {
         "global": {
