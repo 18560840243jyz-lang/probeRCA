@@ -467,6 +467,25 @@ identity stability, cleanup, and archive SHA checks. Current Soft, Hard, READY,
 campaign. This exception does not relax READY for ordinary online RCA operation
 or bounded algorithm smoke tests; it keeps collection and later analysis separate.
 
+## Terminal TCP-failure effectiveness decision
+
+The formal TCP-failure injector remains a continuous, directional, port-scoped
+TCP RST intervention. A gRPC client may stop issuing connection attempts after
+the first failures because of protocol backoff. Those later windows retain the
+data-plane meaning `value=null`, `valid=false`, `invalid_reason=no_exposure`;
+they are never rewritten as failures or zeroes.
+
+Injector effectiveness is therefore evaluated once per episode: after a fixed
+two-second in-flight drain grace, the first 15 seconds must contain at least
+five attempts, three positive failure windows, a cumulative failure ratio of
+at least 0.5, direct error/timeout counter growth, and RST filter hits. During
+the remainder of the active phase, a durable five-second behavior-intent ledger
+must prove continuing demand for the target edge. After exact cleanup, at least
+30 consecutive exposed windows must return to the empirical Healthy-Pre failure
+range. Missing demand evidence produces
+`NOT_EVALUABLE_INSUFFICIENT_DEMAND`, not a fabricated PASS. A successful episode
+is `PASS_TERMINAL_FAILURE_WITH_EXPECTED_BACKOFF`.
+
 The frozen configuration is `configs/final_multinode_campaign.yaml`. With a
 supported Host NIC intervention it generates 3 Healthy datasets, 12 injector
 Pilots, 111 formal fault episodes, and 9 controls: 135 core datasets. The 37

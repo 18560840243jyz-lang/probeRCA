@@ -83,9 +83,20 @@ profiles:
   cleanup: {action: restore_exact_packet_filter_rules}
   effectiveness_criterion:
     metric: edge_failure_rate
-    filter_hit_and_failure_lift_required: true
-    edge_error_delta_min: 1
-    active_valid_windows_min: 48
-    active_positive_windows_min: 30
-    active_median_min: 0.3
+  terminal_failure_policy:
+    drain_grace_seconds: 2
+    initial_confirmation_seconds: 15
+    initial_attempts_min: 5
+    initial_positive_windows_min: 3
+    initial_failure_ratio_min: 0.5
+    direct_failure_delta_min: 1
+    demand_interval_seconds: 5
+    minimum_target_intents_per_interval: 1
+    recovery_consecutive_exposure_windows: 30
+    edge_behavior_intents:
+      frontend->cartservice: [cart, checkout]
+      checkoutservice->paymentservice: [checkout]
+      frontend->productcatalogservice: [browse_search_list, detail_recommendation_ad_currency]
+      recommendationservice->productcatalogservice: [detail_recommendation_ad_currency]
+    pass_status: PASS_TERMINAL_FAILURE_WITH_EXPECTED_BACKOFF
   contamination_checks: [reverse_direction, non_target_edge, added_delay]

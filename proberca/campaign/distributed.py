@@ -22,6 +22,93 @@ class DistributedCollectionError(RuntimeError):
     pass
 
 
+def _capture_load_intents(
+    *, ledger_path: Path, output_root: Path, dataset_id: str,
+    first_window_start_ns: int, window_count: int,
+) -> dict[str, Any]:
+    """Copy the bounded interval ledger that covers this immutable dataset."""
+
+    if not ledger_path.is_file():
+        raise DistributedCollectionError("formal load-intent ledger is missing")
+    records = []
+    for line_number, line in enumerate(
+        ledger_path.read_text(encoding="utf-8").splitlines(), start=1,
+    ):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise DistributedCollectionError(
+                f"load-intent ledger line {line_number} is malformed"
+            ) from error
+        if item.get("schema_version") != "probeRCA-load-behavior-intent-v1":
+            raise DistributedCollectionError("load-intent ledger schema is invalid")
+        start = item.get("interval_start_ns")
+        end = item.get("interval_end_ns")
+        behaviors = item.get("behavior_intents")
+        if (
+            not isinstance(start, int) or not isinstance(end, int) or end <= start
+            or not isinstance(behaviors, dict)
+            or any(not isinstance(value, int) or value < 0 for value in behaviors.values())
+            or item.get("scheduled_intents") != sum(behaviors.values())
+            or not item.get("load_profile_id")
+            or not item.get("load_profile_fingerprint")
+        ):
+            raise DistributedCollectionError("load-intent ledger record is invalid")
+        records.append(item)
+    final_window_end_ns = first_window_start_ns + window_count * 1_000_000_000
+    selected = sorted(
+        (
+            item for item in records
+            if item["interval_end_ns"] > first_window_start_ns
+            and item["interval_start_ns"] < final_window_end_ns
+        ),
+        key=lambda item: item["interval_start_ns"],
+    )
+    if not selected:
+        raise DistributedCollectionError("load-intent ledger does not cover dataset")
+    if selected[0]["interval_start_ns"] > first_window_start_ns \
+            or selected[-1]["interval_end_ns"] < final_window_end_ns:
+        raise DistributedCollectionError("load-intent ledger has incomplete coverage")
+    if any(
+        left["interval_end_ns"] != right["interval_start_ns"]
+        for left, right in zip(selected, selected[1:])
+    ):
+        raise DistributedCollectionError("load-intent ledger has a time gap or overlap")
+    identities = {
+        (item["load_profile_id"], item["load_profile_fingerprint"])
+        for item in selected
+    }
+    if len(identities) != 1:
+        raise DistributedCollectionError("load profile changed during dataset")
+    destination = output_root / "load-intent"
+    destination.mkdir()
+    ledger_output = destination / "behavior-intents.jsonl"
+    encoded = "".join(
+        json.dumps(item, sort_keys=True, separators=(",", ":")) + "\n"
+        for item in selected
+    )
+    ledger_output.write_text(encoded, encoding="utf-8")
+    profile_id, profile_fingerprint = next(iter(identities))
+    manifest = {
+        "schema_version": "probeRCA-load-intent-manifest-v1",
+        "dataset_id": dataset_id,
+        "dataset_start_ns": first_window_start_ns,
+        "dataset_end_ns": final_window_end_ns,
+        "covered_start_ns": selected[0]["interval_start_ns"],
+        "covered_end_ns": selected[-1]["interval_end_ns"],
+        "record_count": len(selected),
+        "load_profile_id": profile_id,
+        "load_profile_fingerprint": profile_fingerprint,
+        "ledger_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+    }
+    (destination / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    return manifest
+
+
 def _ssh(node: dict[str, Any], known_hosts: Path) -> list[str]:
     return [
         "ssh", "-T", "-p", str(int(node["port"])),
@@ -54,6 +141,7 @@ def collect_distributed_dataset(
     output_root: Path,
     first_window_start_ns: int | None = None,
     on_capture_started: Callable[[int, str], None] | None = None,
+    load_intent_ledger: Path | None = None,
 ) -> dict[str, Any]:
     """Collect on all Workers; the callback may schedule an independent injector."""
 
@@ -182,6 +270,13 @@ def collect_distributed_dataset(
         shutil.move(str(source), str(primitive_root / worker))
         source = output / "workers" / worker / dataset_id / "raw-events"
         shutil.move(str(source), str(raw_event_root / worker))
+    load_intent = None
+    if load_intent_ledger is not None:
+        load_intent = _capture_load_intents(
+            ledger_path=load_intent_ledger, output_root=output,
+            dataset_id=dataset_id, first_window_start_ns=first_window_start_ns,
+            window_count=window_count,
+        )
     shutil.rmtree(output / "workers")
     # Only after all local archives have been copied, verified, merged, and
     # rearranged may the bounded remote staging copy be removed.
@@ -195,6 +290,7 @@ def collect_distributed_dataset(
         "first_window_start_ns": first_window_start_ns,
         "window_count": window_count, "worker_results": worker_results,
         "merge": merge,
+        "load_intent": load_intent,
     }
     (output / "distributed-collection-report.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8",

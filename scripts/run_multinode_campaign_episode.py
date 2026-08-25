@@ -63,6 +63,9 @@ def run_episode(
     profile_id: str | None = None,
     allow_candidate_registry: bool = False,
     private_evidence_output: Path | None = None,
+    load_intent_ledger: Path | None = Path(
+        "/var/lib/proberca-campaign/load-intents/behavior-intents.jsonl"
+    ),
 ) -> dict[str, Any]:
     """Run one case while keeping Test target semantics outside dataset_root."""
 
@@ -127,6 +130,7 @@ def run_episode(
             repository=repository, node_inventory=nodes_path,
             case_id=case_id, window_count=window_count,
             output_root=output, on_capture_started=started,
+            load_intent_ledger=load_intent_ledger,
         )
         injection = injection_future.result() if injection_future else None
     finally:
@@ -172,6 +176,10 @@ def main() -> int:
     parser.add_argument("--profile-id")
     parser.add_argument("--allow-candidate-registry", action="store_true")
     parser.add_argument("--private-evidence-output", type=Path)
+    parser.add_argument(
+        "--load-intent-ledger", type=Path,
+        default=Path("/var/lib/proberca-campaign/load-intents/behavior-intents.jsonl"),
+    )
     arguments = parser.parse_args()
     coordinate = None
     if arguments.coordinate is not None:
@@ -192,6 +200,7 @@ def main() -> int:
             arguments.private_evidence_output.resolve()
             if arguments.private_evidence_output else None
         ),
+        load_intent_ledger=arguments.load_intent_ledger,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0

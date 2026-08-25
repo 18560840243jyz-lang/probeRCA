@@ -57,6 +57,15 @@ _SECONDARY_SIGNAL_POLICY_FIELDS = frozenset({
     "forbidden_direct_controls", "incidental_status",
 })
 
+_TERMINAL_FAILURE_POLICY_FIELDS = frozenset({
+    "drain_grace_seconds", "initial_confirmation_seconds",
+    "initial_attempts_min", "initial_positive_windows_min",
+    "initial_failure_ratio_min", "direct_failure_delta_min",
+    "demand_interval_seconds", "minimum_target_intents_per_interval",
+    "recovery_consecutive_exposure_windows", "edge_behavior_intents",
+    "pass_status",
+})
+
 
 def load_injector_registry(path: Path, *, require_frozen: bool) -> dict[str, Any]:
     payload = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
@@ -131,6 +140,35 @@ def load_injector_registry(path: Path, *, require_frozen: bool) -> dict[str, Any
             ):
                 raise InjectorRegistryError(
                     "secondary signal forbidden controls are invalid"
+                )
+        terminal = item.get("terminal_failure_policy")
+        if terminal is not None:
+            if mechanism != "tcp_failure" or not isinstance(terminal, dict) \
+                    or set(terminal) != _TERMINAL_FAILURE_POLICY_FIELDS:
+                raise InjectorRegistryError("terminal failure policy fields mismatch")
+            if (
+                int(terminal["drain_grace_seconds"]) < 0
+                or int(terminal["initial_confirmation_seconds"]) <=
+                int(terminal["drain_grace_seconds"])
+                or int(terminal["initial_attempts_min"]) <= 0
+                or int(terminal["initial_positive_windows_min"]) <= 0
+                or not 0.0 <= float(terminal["initial_failure_ratio_min"]) <= 1.0
+                or int(terminal["direct_failure_delta_min"]) <= 0
+                or int(terminal["demand_interval_seconds"]) <= 0
+                or int(terminal["minimum_target_intents_per_interval"]) <= 0
+                or int(terminal["recovery_consecutive_exposure_windows"]) <= 0
+                or terminal["pass_status"] !=
+                "PASS_TERMINAL_FAILURE_WITH_EXPECTED_BACKOFF"
+            ):
+                raise InjectorRegistryError("terminal failure policy is invalid")
+            behavior_map = terminal["edge_behavior_intents"]
+            if not isinstance(behavior_map, dict) or not behavior_map or any(
+                "->" not in edge or not isinstance(behaviors, list) or not behaviors
+                or any(not isinstance(value, str) or not value for value in behaviors)
+                for edge, behaviors in behavior_map.items()
+            ):
+                raise InjectorRegistryError(
+                    "terminal failure edge behavior map is invalid"
                 )
         if status == "frozen" and not item.get("pilot_evidence"):
             raise InjectorRegistryError(

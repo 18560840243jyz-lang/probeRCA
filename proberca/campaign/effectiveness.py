@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import statistics
 from pathlib import Path
 from typing import Any
@@ -124,6 +126,177 @@ def _longest_consecutive(sequences: list[int]) -> int:
     return longest
 
 
+def _load_intent_records(
+    root: Path | None, *, dataset_id: str,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    if root is None:
+        return None, []
+    manifest_path = root / "manifest.json"
+    ledger_path = root / "behavior-intents.jsonl"
+    if not manifest_path.is_file() or not ledger_path.is_file():
+        return None, []
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    encoded = ledger_path.read_bytes()
+    if (
+        manifest.get("schema_version") != "probeRCA-load-intent-manifest-v1"
+        or manifest.get("dataset_id") != dataset_id
+        or manifest.get("ledger_sha256") != hashlib.sha256(encoded).hexdigest()
+    ):
+        raise EffectivenessError("load-intent manifest integrity mismatch")
+    records = [json.loads(line) for line in encoded.decode("utf-8").splitlines() if line]
+    if len(records) != int(manifest.get("record_count", -1)):
+        raise EffectivenessError("load-intent record count mismatch")
+    return manifest, records
+
+
+def _longest_recovery_run(
+    rows: list[dict[str, Any]], *, healthy_failure_upper: float,
+) -> int:
+    eligible = []
+    for item in rows:
+        request = item["request_count"]
+        if (
+            request is not None and request > 0
+            and item["valid"] and item["value"] <= healthy_failure_upper
+        ):
+            eligible.append(int(item["sequence"]))
+    return _longest_consecutive(eligible)
+
+
+def _evaluate_terminal_tcp_failure(
+    *, policy: dict[str, Any], coordinate: dict[str, Any],
+    rows: dict[str, list[dict[str, Any]]], lifecycle: FaultLifecycle,
+    counters_before: dict[str, float], counters_after: dict[str, float],
+    filter_hit: bool, load_intent_manifest: dict[str, Any] | None,
+    load_intent_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Evaluate terminal connection failure without rewriting no-exposure data."""
+
+    edge_id = str(coordinate["entity_id"])
+    behaviors = policy["edge_behavior_intents"].get(edge_id)
+    if not behaviors:
+        raise EffectivenessError("terminal failure target has no demand-intent mapping")
+    initial_start = lifecycle.effect_confirmed_ns + int(
+        policy["drain_grace_seconds"]
+    ) * 1_000_000_000
+    initial_end = initial_start + int(
+        policy["initial_confirmation_seconds"]
+    ) * 1_000_000_000
+    initial = [
+        item for item in rows["FAULT_ACTIVE"]
+        if item["window_start_ns"] >= initial_start
+        and item["window_end_ns"] <= initial_end
+    ]
+    attempts = sum(
+        item["request_count"] for item in initial
+        if item["request_count"] is not None
+    )
+    estimated_failures = sum(
+        item["request_count"] * item["value"] for item in initial
+        if item["request_count"] is not None and item["valid"]
+    )
+    positive_sequences = [
+        int(item["sequence"]) for item in initial
+        if item["valid"] and item["value"] > 0
+    ]
+    failure_ratio = estimated_failures / attempts if attempts > 0 else 0.0
+    direct_failure_delta = (
+        float(counters_after.get("edge_error", 0.0))
+        - float(counters_before.get("edge_error", 0.0))
+        + float(counters_after.get("edge_timeout", 0.0))
+        - float(counters_before.get("edge_timeout", 0.0))
+    )
+
+    demand_start = initial_end
+    demand_end = lifecycle.cleanup_command_start_ns
+    demand_intervals = [
+        item for item in load_intent_records
+        if item["interval_start_ns"] >= demand_start
+        and item["interval_end_ns"] <= demand_end
+    ]
+    demand_counts = [
+        sum(int(item["behavior_intents"].get(name, 0)) for name in behaviors)
+        for item in demand_intervals
+    ]
+    expected_interval_ns = int(policy["demand_interval_seconds"]) * 1_000_000_000
+    expected_demand_start = (
+        (demand_start + expected_interval_ns - 1) // expected_interval_ns
+    ) * expected_interval_ns
+    expected_demand_end = (demand_end // expected_interval_ns) * expected_interval_ns
+    demand_contiguous = bool(demand_intervals) and all(
+        int(item["interval_end_ns"]) - int(item["interval_start_ns"])
+        == expected_interval_ns
+        for item in demand_intervals
+    ) and all(
+        left["interval_end_ns"] == right["interval_start_ns"]
+        for left, right in zip(demand_intervals, demand_intervals[1:])
+    ) and demand_intervals[0]["interval_start_ns"] == expected_demand_start \
+        and demand_intervals[-1]["interval_end_ns"] == expected_demand_end
+    demand_sufficient = (
+        load_intent_manifest is not None and demand_contiguous
+        and all(
+            count >= int(policy["minimum_target_intents_per_interval"])
+            for count in demand_counts
+        )
+    )
+    unexpected_invalid = [
+        item for item in rows["FAULT_ACTIVE"]
+        if not item["valid"] and item["invalid_reason"] != "no_exposure"
+    ]
+    pre_values = [item["value"] for item in rows["HEALTHY_PRE"] if item["valid"]]
+    healthy_failure_upper = max(pre_values) if pre_values else 0.0
+    recovery_run = _longest_recovery_run(
+        rows["RECOVERY"], healthy_failure_upper=healthy_failure_upper,
+    )
+    failures = []
+    if not filter_hit:
+        failures.append("terminal_rst_filter_not_hit")
+    if direct_failure_delta < float(policy["direct_failure_delta_min"]):
+        failures.append("terminal_direct_failure_counter_insufficient")
+    if attempts < int(policy["initial_attempts_min"]):
+        failures.append("terminal_initial_attempts_insufficient")
+    if len(positive_sequences) < int(policy["initial_positive_windows_min"]):
+        failures.append("terminal_initial_positive_windows_insufficient")
+    if failure_ratio < float(policy["initial_failure_ratio_min"]):
+        failures.append("terminal_initial_failure_ratio_insufficient")
+    if unexpected_invalid:
+        failures.append("terminal_unexpected_invalid_observation")
+    if recovery_run < int(policy["recovery_consecutive_exposure_windows"]):
+        failures.append("terminal_recovery_insufficient")
+    not_evaluable = not demand_sufficient
+    if not_evaluable:
+        failures.append("terminal_target_demand_not_evaluable")
+    return {
+        "policy": dict(policy),
+        "target_behaviors": list(behaviors),
+        "drain_grace_end_ns": initial_start,
+        "initial_confirmation_end_ns": initial_end,
+        "initial_attempts": attempts,
+        "initial_estimated_failures": estimated_failures,
+        "initial_failure_ratio": failure_ratio,
+        "initial_positive_windows": len(positive_sequences),
+        "initial_longest_consecutive_positive_windows": _longest_consecutive(
+            positive_sequences
+        ),
+        "direct_failure_counter_delta": direct_failure_delta,
+        "rst_filter_hit": filter_hit,
+        "backoff_no_exposure_windows": sum(
+            not item["valid"] and item["invalid_reason"] == "no_exposure"
+            for item in rows["FAULT_ACTIVE"]
+        ),
+        "unexpected_invalid_windows": len(unexpected_invalid),
+        "demand_ledger_present": load_intent_manifest is not None,
+        "demand_interval_count": len(demand_intervals),
+        "target_intents_by_interval": demand_counts,
+        "demand_sufficient": demand_sufficient,
+        "healthy_pre_failure_upper": healthy_failure_upper,
+        "recovery_consecutive_exposure_windows": recovery_run,
+        "not_evaluable": not_evaluable,
+        "passed": not failures,
+        "failures": failures,
+    }
+
+
 def _evaluate_secondary_signal(
     *,
     policy: dict[str, Any],
@@ -214,12 +387,15 @@ def evaluate_fault_effectiveness(
     injection_session: dict[str, Any],
     contamination: dict[str, bool],
     minimum_phase_samples: int = 10,
+    load_intent_root: Path | None = None,
 ) -> dict[str, Any]:
     """Use only measured metric/counter/filter evidence; never alert or RCA."""
 
     normal = CollectionArchive.load(normal_root)
     lifecycle = _lifecycle(injection_session)
     values = {"HEALTHY_PRE": [], "FAULT_ACTIVE": [], "RECOVERY": []}
+    terminal_policy = profile.get("terminal_failure_policy")
+    terminal_rows = {"HEALTHY_PRE": [], "FAULT_ACTIVE": [], "RECOVERY": []}
     policy = profile.get("secondary_signal_policy")
     secondary_records = {
         "HEALTHY_PRE": [], "FAULT_ACTIVE": [], "RECOVERY": [],
@@ -236,8 +412,33 @@ def evaluate_fault_effectiveness(
         ]
         if len(records) != 1:
             raise EffectivenessError("target metric does not resolve uniquely")
-        if records[0].valid:
-            values[phase].append(float(records[0].value))
+        target_record = records[0]
+        if target_record.valid:
+            values[phase].append(float(target_record.value))
+        if terminal_policy is not None:
+            request_records = [
+                item for item in window.edge_metrics
+                if _record_matches(
+                    item, coordinate, metric_name="edge_request_count",
+                )
+            ]
+            if len(request_records) != 1:
+                raise EffectivenessError(
+                    "terminal failure request count does not resolve uniquely"
+                )
+            request = request_records[0]
+            request_count = float(request.value) if request.valid else None
+            terminal_rows[phase].append({
+                "sequence": int(getattr(window, "sequence", fallback_sequence)),
+                "window_start_ns": int(window.window_start_ns),
+                "window_end_ns": int(window.window_end_ns),
+                "valid": bool(target_record.valid),
+                "value": (
+                    float(target_record.value) if target_record.valid else None
+                ),
+                "invalid_reason": getattr(target_record, "invalid_reason", None),
+                "request_count": request_count,
+            })
         if policy is not None:
             secondary = [
                 item for item in (*window.node_metrics, *window.edge_metrics)
@@ -255,11 +456,16 @@ def evaluate_fault_effectiveness(
                     "value": float(secondary[0].value),
                     "sample_count": int(secondary[0].sample_count),
                 })
-    if len(values["HEALTHY_PRE"]) < minimum_phase_samples \
-            or len(values["FAULT_ACTIVE"]) < minimum_phase_samples:
+    if len(values["HEALTHY_PRE"]) < minimum_phase_samples or (
+        terminal_policy is None
+        and len(values["FAULT_ACTIVE"]) < minimum_phase_samples
+    ):
         raise EffectivenessError("direct target metric lacks phase observations")
     baseline_value = statistics.median(values["HEALTHY_PRE"])
-    active_value = statistics.median(values["FAULT_ACTIVE"])
+    active_value = (
+        statistics.median(values["FAULT_ACTIVE"])
+        if values["FAULT_ACTIVE"] else baseline_value
+    )
     counter_series: dict[str, list[tuple[int, float]]] = {
         key: [] for key in _COUNTER_COMPONENTS
     }
@@ -367,6 +573,20 @@ def evaluate_fault_effectiveness(
     passed, failures = evaluate_effectiveness_criterion(
         profile["effectiveness_criterion"], baseline, active,
     )
+    terminal_failure = None
+    if terminal_policy is not None:
+        load_manifest, load_records = _load_intent_records(
+            load_intent_root, dataset_id=normal.dataset_id,
+        )
+        terminal_failure = _evaluate_terminal_tcp_failure(
+            policy=terminal_policy, coordinate=coordinate,
+            rows=terminal_rows, lifecycle=lifecycle,
+            counters_before=counters_before, counters_after=counters_after,
+            filter_hit=filter_hit, load_intent_manifest=load_manifest,
+            load_intent_records=load_records,
+        )
+        passed = passed and terminal_failure["passed"]
+        failures = list(failures) + list(terminal_failure["failures"])
     required_contamination = profile.get("contamination_checks", [])
     missing = sorted(set(required_contamination) - set(effective_contamination))
     contaminated = sorted(
@@ -391,6 +611,7 @@ def evaluate_fault_effectiveness(
         "contaminated_dimensions": contaminated,
         "cleanup_passed": injection_session.get("cleanup_passed") is True,
         "secondary_signal_evidence": secondary_signal,
+        "terminal_failure_evidence": terminal_failure,
     }
     report["accepted"] = (
         report["criterion_passed"]
@@ -399,10 +620,14 @@ def evaluate_fault_effectiveness(
     )
     if report["accepted"]:
         report["status"] = (
-            policy["incidental_status"]
+            terminal_policy["pass_status"]
+            if terminal_failure is not None
+            else policy["incidental_status"]
             if secondary_signal is not None and secondary_signal["incidental"]
             else "PASS"
         )
+    elif terminal_failure is not None and terminal_failure["not_evaluable"]:
+        report["status"] = "NOT_EVALUABLE_INSUFFICIENT_DEMAND"
     elif not report["criterion_passed"]:
         report["status"] = "INVALID_INEFFECTIVE"
     elif not report["contamination_passed"]:
@@ -465,6 +690,9 @@ def build_real_pilot_report(
         "active_evidence": effectiveness_report.get("active_evidence"),
         "secondary_signal_evidence": effectiveness_report.get(
             "secondary_signal_evidence"
+        ),
+        "terminal_failure_evidence": effectiveness_report.get(
+            "terminal_failure_evidence"
         ),
         "status": effectiveness_report.get("status"),
         "execution_error": injection_session.get("execution_error"),

@@ -61,6 +61,9 @@ def main() -> int:
         primitive_roots=sorted((dataset / "primitives").iterdir()),
         coordinate=coordinate, profile=profile,
         injection_session=session, contamination=contamination,
+        load_intent_root=(
+            dataset / "load-intent" if (dataset / "load-intent").is_dir() else None
+        ),
     )
     pilot = build_real_pilot_report(
         effectiveness_report=effectiveness, injection_session=session,

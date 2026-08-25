@@ -678,14 +678,14 @@ def test_open_loop_arrival_axis_does_not_depend_on_request_completion(monkeypatc
     first_clock = Clock()
     first = load.run_open_loop(
         config, clock=first_clock, sleeper=first_clock.sleep,
-        arrival_hook=lambda _index, target: first_targets.append(target),
+        arrival_hook=lambda _index, target, _behavior: first_targets.append(target),
         event_sink=lambda _event: None,
     )
     second_clock = Clock()
     second_targets = []
     second = load.run_open_loop(
         config, clock=second_clock, sleeper=second_clock.sleep,
-        arrival_hook=lambda _index, target: second_targets.append(target),
+        arrival_hook=lambda _index, target, _behavior: second_targets.append(target),
         event_sink=lambda _event: None,
     )
     assert first_targets == second_targets
@@ -740,6 +740,82 @@ def test_open_loop_pending_queue_fails_closed_instead_of_dropping_arrivals():
             config, clock=clock, sleeper=clock.sleep,
             executor_factory=Executor, event_sink=lambda _event: None,
         )
+
+
+def test_open_loop_seals_five_second_behavior_intent_ledger(monkeypatch):
+    load = _script_module("multinode_open_loop_load_intent", "multinode_open_loop_load.py")
+
+    class Clock:
+        value = 0.0
+
+        def __call__(self):
+            return self.value
+
+        def sleep(self, seconds):
+            self.value += seconds
+
+    config = load.LoadConfig(
+        base_url="http://frontend:80", target_arrival_rate_rps=10,
+        workers=2, maximum_pending=1000, request_timeout_sec=1,
+        duration_sec=10, seed=77,
+        behavior_weights={
+            "browse_search_list": 40,
+            "detail_recommendation_ad_currency": 25,
+            "cart": 20, "checkout": 15,
+        },
+        load_profile_id="frozen-55", load_profile_fingerprint="a" * 64,
+    )
+    monkeypatch.setattr(
+        load, "BEHAVIORS",
+        {name: (lambda *_args: None) for name in load.EXPECTED_BEHAVIORS},
+    )
+    records = []
+    clock = Clock()
+    summary = load.run_open_loop(
+        config, clock=clock, sleeper=clock.sleep,
+        wall_clock_ns=lambda: 100_000_000_000,
+        intent_sink=records.append, intent_interval_sec=5,
+        event_sink=lambda _event: None,
+    )
+    assert [(item["interval_start_ns"], item["interval_end_ns"]) for item in records] == [
+        (100_000_000_000, 105_000_000_000),
+        (105_000_000_000, 110_000_000_000),
+    ]
+    assert all(set(item["behavior_intents"]) == set(load.EXPECTED_BEHAVIORS) for item in records)
+    assert sum(item["scheduled_intents"] for item in records) == summary["submitted"]
+    assert all(item["load_profile_fingerprint"] == "a" * 64 for item in records)
+
+
+def test_distributed_dataset_captures_one_profile_intent_coverage(tmp_path):
+    from proberca.campaign.distributed import _capture_load_intents
+
+    source = tmp_path / "source.jsonl"
+    records = [{
+        "schema_version": "probeRCA-load-behavior-intent-v1",
+        "interval_start_ns": start,
+        "interval_end_ns": start + 5_000_000_000,
+        "load_profile_id": "frozen-55",
+        "load_profile_fingerprint": "a" * 64,
+        "scheduled_intents": 4,
+        "behavior_intents": {
+            "browse_search_list": 1,
+            "detail_recommendation_ad_currency": 1,
+            "cart": 1, "checkout": 1,
+        },
+    } for start in range(0, 20_000_000_000, 5_000_000_000)]
+    source.write_text("".join(
+        json.dumps(item) + "\n" for item in records
+    ), encoding="utf-8")
+    output = tmp_path / "dataset"
+    output.mkdir()
+    manifest = _capture_load_intents(
+        ledger_path=source, output_root=output, dataset_id="d" * 64,
+        first_window_start_ns=2_000_000_000, window_count=10,
+    )
+    assert manifest["record_count"] == 3
+    assert manifest["covered_start_ns"] == 0
+    assert manifest["covered_end_ns"] == 15_000_000_000
+    assert (output / "load-intent/behavior-intents.jsonl").is_file()
 
 
 def test_multinode_load_installer_uses_one_formal_source_and_profile(monkeypatch, tmp_path):
@@ -1730,39 +1806,173 @@ def test_tcp_failure_evidence_and_cleanup_are_exact_and_counter_aware(
     assert result["restored_state_fingerprint"] == fingerprint(baseline)
 
 
-def test_tcp_failure_effectiveness_requires_hits_errors_and_sustained_lift():
-    criterion = {
-        "metric": "edge_failure_rate",
-        "filter_hit_and_failure_lift_required": True,
-        "edge_error_delta_min": 1,
-        "active_valid_windows_min": 48,
-        "active_positive_windows_min": 30,
-        "active_median_min": 0.3,
-    }
-    baseline = {"primary_value": 0.0, "counters": {"edge_error": 4}}
-    active = {
-        "metric": "edge_failure_rate", "primary_value": 0.75,
-        "valid_window_count": 55, "positive_window_count": 54,
-        "counters": {"edge_error": 120},
-        "conditions": {"filter_hit_and_failure_lift_required": True},
-    }
-    passed, failures = evaluate_effectiveness_criterion(
-        criterion, baseline, active,
+def test_tcp_failure_profile_uses_episode_terminal_policy_not_sustained_windows():
+    registry = load_injector_registry(
+        REPOSITORY / "configs/final_multinode_injector_candidates.yaml",
+        require_frozen=False,
     )
-    assert passed is True
-    assert failures == []
-    for key, value in (
-        ("valid_window_count", 47),
-        ("positive_window_count", 29),
-        ("primary_value", 0.29),
-    ):
-        failed = dict(active)
-        failed[key] = value
-        passed, failures = evaluate_effectiveness_criterion(
-            criterion, baseline, failed,
+    profile = next(item for item in registry["profiles"] if item["mechanism"] == "tcp_failure")
+    serialized = json.dumps(profile)
+    assert "active_valid_windows_min" not in serialized
+    assert "active_positive_windows_min" not in serialized
+    assert "active_median_min" not in serialized
+    assert profile["terminal_failure_policy"]["pass_status"] == \
+        "PASS_TERMINAL_FAILURE_WITH_EXPECTED_BACKOFF"
+    assert profile["terminal_failure_policy"]["drain_grace_seconds"] == 2
+
+
+def test_terminal_tcp_failure_accepts_grpc_backoff_and_requires_demand_ledger(
+    monkeypatch, tmp_path,
+):
+    dataset_id = "9" * 64
+    normal_windows = []
+    raw_windows = []
+    request_total = error_total = timeout_total = 0.0
+    for sequence in range(1, 181):
+        start = (sequence - 1) * 1_000_000_000
+        end = start + 1_000_000_000
+        if sequence <= 60:
+            request_delta, error_delta = 10.0, 0.0
+        elif sequence in {64, 65, 66}:
+            request_delta, error_delta = 2.0, 2.0
+        elif sequence >= 122:
+            request_delta, error_delta = 5.0, 0.0
+        else:
+            request_delta, error_delta = 0.0, 0.0
+        request = SimpleNamespace(
+            metric_name="edge_request_count", src_service="frontend",
+            dst_service="productcatalogservice", protocol="tcp",
+            valid=True, value=request_delta, invalid_reason=None,
         )
-        assert passed is False
-        assert failures
+        if request_delta:
+            failure = SimpleNamespace(
+                metric_name="edge_failure_rate", src_service="frontend",
+                dst_service="productcatalogservice", protocol="tcp",
+                valid=True, value=error_delta / request_delta,
+                invalid_reason=None,
+            )
+        else:
+            failure = SimpleNamespace(
+                metric_name="edge_failure_rate", src_service="frontend",
+                dst_service="productcatalogservice", protocol="tcp",
+                valid=False, value=None, invalid_reason="no_exposure",
+            )
+        normal_windows.append(SimpleNamespace(
+            sequence=sequence, window_start_ns=start, window_end_ns=end,
+            node_metrics=(), edge_metrics=(request, failure),
+        ))
+        samples = []
+        for component, before, after in (
+            ("edge_request_total", request_total, request_total + request_delta),
+            ("edge_error_total", error_total, error_total + error_delta),
+            ("edge_timeout_total", timeout_total, timeout_total),
+        ):
+            for timestamp, value in ((start, before), (end, after)):
+                samples.append(SimpleNamespace(
+                    component=component, entity_type="edge",
+                    service_name=None, node_name=None,
+                    src_service="frontend", dst_service="productcatalogservice",
+                    protocol="tcp", timestamp_ns=timestamp, value=value,
+                ))
+        request_total += request_delta
+        error_total += error_delta
+        raw_windows.append(SimpleNamespace(
+            sequence=sequence, window_start_ns=start, window_end_ns=end,
+            samples=tuple(samples),
+        ))
+
+    class FakeNormal:
+        @staticmethod
+        def iter_windows():
+            return iter(normal_windows)
+    FakeNormal.dataset_id = dataset_id
+
+    class FakeRaw:
+        @staticmethod
+        def iter_windows():
+            return iter(raw_windows)
+    FakeRaw.manifest = {"dataset_id": dataset_id}
+
+    monkeypatch.setattr(
+        "proberca.campaign.effectiveness.CollectionArchive.load",
+        lambda _path: FakeNormal(),
+    )
+    monkeypatch.setattr(
+        "proberca.campaign.effectiveness.RawPrimitiveArchive",
+        lambda _path: FakeRaw(),
+    )
+    load_root = tmp_path / "load-intent"
+    load_root.mkdir()
+    intent_records = []
+    for start in range(0, 180_000_000_000, 5_000_000_000):
+        intent_records.append({
+            "schema_version": "probeRCA-load-behavior-intent-v1",
+            "interval_start_ns": start,
+            "interval_end_ns": start + 5_000_000_000,
+            "load_profile_id": "frozen-55",
+            "load_profile_fingerprint": "a" * 64,
+            "scheduled_intents": 4,
+            "behavior_intents": {
+                "browse_search_list": 1,
+                "detail_recommendation_ad_currency": 1,
+                "cart": 1, "checkout": 1,
+            },
+        })
+    encoded = "".join(json.dumps(item, sort_keys=True, separators=(",", ":")) + "\n" for item in intent_records)
+    (load_root / "behavior-intents.jsonl").write_text(encoded, encoding="utf-8")
+    (load_root / "manifest.json").write_text(json.dumps({
+        "schema_version": "probeRCA-load-intent-manifest-v1",
+        "dataset_id": dataset_id,
+        "record_count": len(intent_records),
+        "ledger_sha256": hashlib.sha256(encoded.encode()).hexdigest(),
+    }), encoding="utf-8")
+    profile = next(item for item in load_injector_registry(
+        REPOSITORY / "configs/final_multinode_injector_candidates.yaml",
+        require_frozen=False,
+    )["profiles"] if item["mechanism"] == "tcp_failure")
+    session = {
+        "planned_apply_ns": 60_000_000_000,
+        "apply_command_start_ns": 60_000_000_000,
+        "apply_confirmed_ns": 61_000_000_000,
+        "planned_cleanup_ns": 120_000_000_000,
+        "cleanup_command_start_ns": 120_000_000_000,
+        "cleanup_confirmed_ns": 121_000_000_000,
+        "cleanup_passed": True,
+        "cleanup_result": {"packet_filter_evidence": {
+            "matched_filter_present": True, "packets": 10,
+        }},
+    }
+    arguments = dict(
+        normal_root=tmp_path / "normal",
+        primitive_roots=[tmp_path / "worker-1"],
+        coordinate={
+            "entity_kind": "tcp_edge",
+            "entity_id": "frontend->productcatalogservice",
+            "metric": "edge_failure_rate",
+        },
+        profile=profile, injection_session=session,
+        contamination={
+            "reverse_direction": False, "non_target_edge": False,
+            "added_delay": False,
+        },
+    )
+    report = evaluate_fault_effectiveness(
+        **arguments, load_intent_root=load_root,
+    )
+    evidence = report["terminal_failure_evidence"]
+    assert report["accepted"] is True
+    assert report["status"] == "PASS_TERMINAL_FAILURE_WITH_EXPECTED_BACKOFF"
+    assert evidence["initial_attempts"] == 6
+    assert evidence["initial_failure_ratio"] == 1.0
+    assert evidence["initial_positive_windows"] == 3
+    assert evidence["backoff_no_exposure_windows"] > 30
+    assert evidence["recovery_consecutive_exposure_windows"] >= 30
+    assert evidence["demand_sufficient"] is True
+
+    without_demand = evaluate_fault_effectiveness(**arguments)
+    assert without_demand["accepted"] is False
+    assert without_demand["status"] == "NOT_EVALUABLE_INSUFFICIENT_DEMAND"
+    assert "terminal_target_demand_not_evaluable" in without_demand["criterion_failures"]
 
 
 def test_label_side_target_resolver_binds_formal_edge_without_hardcoding():

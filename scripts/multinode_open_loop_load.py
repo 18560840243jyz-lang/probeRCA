@@ -41,6 +41,8 @@ class LoadConfig:
     duration_sec: float
     seed: int
     behavior_weights: dict[str, int]
+    load_profile_id: str = "development-unfrozen"
+    load_profile_fingerprint: str = "development-unfrozen"
 
     def __post_init__(self) -> None:
         if not self.base_url.startswith(("http://", "https://")):
@@ -55,6 +57,23 @@ class LoadConfig:
             raise ValueError("behavior mix is incomplete")
         if sum(self.behavior_weights.values()) != 100:
             raise ValueError("behavior weights must sum to 100")
+        if not self.load_profile_id or not self.load_profile_fingerprint:
+            raise ValueError("load profile identity is incomplete")
+
+
+class IntentLedgerWriter:
+    """Append and durably flush immutable, interval-level demand intentions."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+
+    def __call__(self, record: dict[str, object]) -> None:
+        encoded = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        with open(self.path, "a", encoding="utf-8") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
 
 
 def _session() -> requests.Session:
@@ -131,10 +150,14 @@ def run_open_loop(
     executor_factory=concurrent.futures.ThreadPoolExecutor,
     event_sink=print,
     arrival_hook=None,
+    intent_sink=None,
+    intent_interval_sec: int = 5,
+    wall_clock_ns=time.time_ns,
 ) -> dict[str, int | float]:
     """Schedule Poisson arrivals independently of request completion."""
     scheduler_rng = random.Random(config.seed)
     start = clock()
+    start_wall_ns = int(wall_clock_ns())
     deadline = start + config.duration_sec if config.duration_sec else None
     next_arrival = start
     submitted = 0
@@ -142,6 +165,29 @@ def run_open_loop(
     failed = 0
     pending: set[concurrent.futures.Future] = set()
     lock = threading.Lock()
+    if intent_interval_sec <= 0:
+        raise ValueError("intent interval must be positive")
+    intent_interval_ns = int(intent_interval_sec) * 1_000_000_000
+    intent_bucket_start_ns = (
+        start_wall_ns // intent_interval_ns
+    ) * intent_interval_ns
+    intent_counts = {name: 0 for name in EXPECTED_BEHAVIORS}
+
+    def emit_completed_intent_buckets(target_epoch_ns: int) -> None:
+        nonlocal intent_bucket_start_ns, intent_counts
+        while intent_bucket_start_ns + intent_interval_ns <= target_epoch_ns:
+            if intent_sink is not None:
+                intent_sink({
+                    "schema_version": "probeRCA-load-behavior-intent-v1",
+                    "interval_start_ns": intent_bucket_start_ns,
+                    "interval_end_ns": intent_bucket_start_ns + intent_interval_ns,
+                    "load_profile_id": config.load_profile_id,
+                    "load_profile_fingerprint": config.load_profile_fingerprint,
+                    "scheduled_intents": sum(intent_counts.values()),
+                    "behavior_intents": dict(intent_counts),
+                })
+            intent_bucket_start_ns += intent_interval_ns
+            intent_counts = {name: 0 for name in EXPECTED_BEHAVIORS}
 
     def invoke(index: int, behavior_name: str) -> None:
         nonlocal completed, failed
@@ -171,8 +217,13 @@ def run_open_loop(
                     "open_loop_pending_limit_exceeded"
                 )
             behavior = _choose_behavior(config, scheduler_rng)
+            target_epoch_ns = start_wall_ns + int(
+                round((next_arrival - start) * 1_000_000_000)
+            )
+            emit_completed_intent_buckets(target_epoch_ns)
+            intent_counts[behavior] += 1
             if arrival_hook is not None:
-                arrival_hook(submitted, next_arrival)
+                arrival_hook(submitted, next_arrival, behavior)
             pending.add(executor.submit(invoke, submitted, behavior))
             submitted += 1
             next_arrival += scheduler_rng.expovariate(
@@ -180,6 +231,10 @@ def run_open_loop(
             )
         for future in concurrent.futures.as_completed(pending):
             future.result()
+    if deadline is not None:
+        emit_completed_intent_buckets(
+            start_wall_ns + int(round(config.duration_sec * 1_000_000_000))
+        )
     elapsed = max(0.0, clock() - start)
     scheduling_elapsed = config.duration_sec if config.duration_sec else elapsed
     summary = {
@@ -224,6 +279,18 @@ def build_parser() -> argparse.ArgumentParser:
         "BEHAVIOR_WEIGHTS_JSON",
         '{"browse_search_list":40,"detail_recommendation_ad_currency":25,"cart":20,"checkout":15}',
     )))
+    parser.add_argument("--load-profile-id", default=os.environ.get(
+        "LOAD_PROFILE_ID", "development-unfrozen",
+    ))
+    parser.add_argument("--load-profile-fingerprint", default=os.environ.get(
+        "LOAD_PROFILE_FINGERPRINT", "development-unfrozen",
+    ))
+    parser.add_argument("--intent-ledger", default=os.environ.get(
+        "LOAD_INTENT_LEDGER", "",
+    ))
+    parser.add_argument("--intent-interval", type=int, default=int(os.environ.get(
+        "LOAD_INTENT_INTERVAL_SEC", "5",
+    )))
     return parser
 
 
@@ -238,8 +305,13 @@ def main(argv=None) -> int:
         duration_sec=args.duration,
         seed=args.seed,
         behavior_weights=args.behavior_weights,
+        load_profile_id=args.load_profile_id,
+        load_profile_fingerprint=args.load_profile_fingerprint,
     )
-    run_open_loop(config)
+    intent_sink = IntentLedgerWriter(args.intent_ledger) if args.intent_ledger else None
+    run_open_loop(
+        config, intent_sink=intent_sink, intent_interval_sec=args.intent_interval,
+    )
     return 0
 
 

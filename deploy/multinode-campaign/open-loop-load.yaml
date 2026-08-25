@@ -17,6 +17,9 @@ spec:
     spec:
       nodeSelector:
         proberca.io/node-role: control
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       tolerations:
       - key: node-role.kubernetes.io/control-plane
         operator: Exists
@@ -34,8 +37,13 @@ spec:
         - {name: LOAD_SEED, value: "20260824"}
         - name: BEHAVIOR_WEIGHTS_JSON
           value: '{"browse_search_list":40,"detail_recommendation_ad_currency":25,"cart":20,"checkout":15}'
+        - {name: LOAD_PROFILE_ID, value: "development-unfrozen"}
+        - {name: LOAD_PROFILE_FINGERPRINT, value: "development-unfrozen"}
+        - {name: LOAD_INTENT_INTERVAL_SEC, value: "5"}
+        - {name: LOAD_INTENT_LEDGER, value: "/var/lib/proberca-load-intents/behavior-intents.jsonl"}
         volumeMounts:
         - {name: script, mountPath: /opt/proberca-load, readOnly: true}
+        - {name: load-intents, mountPath: /var/lib/proberca-load-intents}
         resources:
           requests: {cpu: 500m, memory: 256Mi}
           limits: {cpu: "2", memory: 1Gi}
@@ -43,3 +51,7 @@ spec:
       - name: script
         configMap:
           name: proberca-multinode-open-loop-load
+      - name: load-intents
+        hostPath:
+          path: /var/lib/proberca-campaign/load-intents
+          type: DirectoryOrCreate
