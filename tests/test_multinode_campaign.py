@@ -1854,6 +1854,28 @@ def test_multinode_workload_source_hash_is_newline_stable(tmp_path):
     )
 
 
+def test_block_completion_tracepoint_uses_kernel_event_class_context():
+    for relative in (
+        "bpf/final_burst/final_burst.bpf.c",
+        "bpf/block/block.bpf.c",
+    ):
+        source = (REPOSITORY / relative).read_text(encoding="utf-8")
+        assert "struct trace_event_raw_block_rq_completion *" in source
+        assert "struct trace_event_raw_block_rq_complete *" not in source
+
+
+def test_burst_checkpoint_counters_are_initialized_before_loss_map_lookup():
+    source = (
+        REPOSITORY / "bpf/user/proberca_final_burst_loader.c"
+    ).read_text(encoding="utf-8")
+    checkpoint = source.split("static int write_checkpoint(", 1)[1].split(
+        "static int expire_dns(", 1,
+    )[0]
+    assert "uint64_t emitted = 0;" in checkpoint
+    assert "uint64_t reserve_failed = 0;" in checkpoint
+    assert "if (result != 0)\n        return result;" in checkpoint
+
+
 def test_multinode_cluster_installer_uses_rendered_workloads_and_worker_beyla(
     monkeypatch, tmp_path,
 ):

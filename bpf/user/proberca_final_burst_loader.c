@@ -316,8 +316,8 @@ static int write_checkpoint(
     int loss_fd,
     size_t program_count)
 {
-    uint64_t emitted;
-    uint64_t reserve_failed;
+    uint64_t emitted = 0;
+    uint64_t reserve_failed = 0;
     uint64_t epoch_ns = clock_ns(CLOCK_REALTIME);
     uint64_t monotonic_ns = clock_ns(CLOCK_MONOTONIC);
     int result = read_loss(loss_fd, &emitted, &reserve_failed);

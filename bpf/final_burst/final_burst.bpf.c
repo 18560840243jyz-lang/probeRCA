@@ -455,7 +455,7 @@ int final_burst_block_issue(struct trace_event_raw_block_rq *context)
 
 SEC("tracepoint/block/block_rq_complete")
 int final_burst_block_complete(
-    struct trace_event_raw_block_rq_complete *context)
+    struct trace_event_raw_block_rq_completion *context)
 {
     struct block_key key = {
         .device = context->dev,

@@ -46,7 +46,7 @@ int block_issue(struct trace_event_raw_block_rq *ctx)
 }
 
 SEC("tracepoint/block/block_rq_complete")
-int block_complete(struct trace_event_raw_block_rq_complete *ctx)
+int block_complete(struct trace_event_raw_block_rq_completion *ctx)
 {
     struct block_key key = { .dev = ctx->dev, .sector = ctx->sector };
     struct block_state *state = bpf_map_lookup_elem(&block_requests, &key);
