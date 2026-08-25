@@ -249,6 +249,43 @@ def test_source_parser_warmup_is_read_only_and_uses_frozen_inventory():
         == "http://node/metrics"
 
 
+def test_host_exporter_reads_beyla_from_its_frozen_monitored_node():
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.config = SimpleNamespace(
+        runtime_mode="host", monitored_node_name="worker-2", beyla_port=9400,
+    )
+    inventory = SimpleNamespace(
+        node_names=("s0", "worker-1", "worker-2", "worker-3"),
+        node_internal_ips={
+            "s0": "10.0.0.1", "worker-1": "10.0.0.2",
+            "worker-2": "10.0.0.3", "worker-3": "10.0.0.4",
+        },
+    )
+    calls = []
+    exporter._fetch_url = lambda url, **kwargs: calls.append(
+        (url, kwargs["metric_names"])
+    ) or ()
+
+    assert exporter._beyla(inventory) == ()
+    assert calls == [
+        ("http://10.0.0.3:9400/metrics", primitive_module._BEYLA_REQUEST_METRICS)
+    ]
+
+
+def test_host_exporter_fails_closed_when_monitored_node_is_absent():
+    exporter = FinalPrimitiveExporter.__new__(FinalPrimitiveExporter)
+    exporter.config = SimpleNamespace(
+        runtime_mode="host", monitored_node_name="worker-2", beyla_port=9400,
+    )
+    inventory = SimpleNamespace(
+        node_names=("s0", "worker-1"),
+        node_internal_ips={"s0": "10.0.0.1", "worker-1": "10.0.0.2"},
+    )
+
+    with pytest.raises(RawCollectionError, match="monitored Kubernetes node"):
+        exporter._beyla(inventory)
+
+
 def test_final_bpf_normal_path_is_map_aggregated_and_window_safe():
     bpf = Path(
         "bpf/final_normal/final_normal.bpf.c"

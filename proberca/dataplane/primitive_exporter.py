@@ -1032,11 +1032,22 @@ class FinalPrimitiveExporter:
     def _beyla(
         self, inventory: Inventory,
     ) -> tuple[PrometheusSample, ...]:
-        if len(inventory.node_names) != 1:
-            raise RawCollectionError(
-                "single-VM exporter requires exactly one Kubernetes node"
-            )
-        node = inventory.node_names[0]
+        if self.config.runtime_mode == "host":
+            node = self.config.monitored_node_name
+            if (
+                not node
+                or node not in inventory.node_names
+                or node not in inventory.node_internal_ips
+            ):
+                raise RawCollectionError(
+                    "monitored Kubernetes node is absent from inventory"
+                )
+        else:
+            if len(inventory.node_names) != 1:
+                raise RawCollectionError(
+                    "single-VM exporter requires exactly one Kubernetes node"
+                )
+            node = inventory.node_names[0]
         url = (
             f"http://{inventory.node_internal_ips[node]}:"
             f"{self.config.beyla_port}/metrics"
