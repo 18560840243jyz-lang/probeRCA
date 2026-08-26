@@ -27,10 +27,6 @@ EXPECTED_BEHAVIORS = (
 _THREAD_LOCAL = threading.local()
 
 
-class LoadBackpressureError(RuntimeError):
-    pass
-
-
 @dataclass(frozen=True)
 class LoadConfig:
     base_url: str
@@ -154,13 +150,20 @@ def run_open_loop(
     intent_interval_sec: int = 5,
     wall_clock_ns=time.time_ns,
 ) -> dict[str, int | float]:
-    """Schedule Poisson arrivals independently of request completion."""
+    """Schedule Poisson demand independently of bounded request execution.
+
+    When the executor is full, the immutable demand intention is retained and
+    explicitly classified as backpressure-rejected.  It is never submitted as
+    a request, and it is never misreported as a completed observation.
+    """
     scheduler_rng = random.Random(config.seed)
     start = clock()
     start_wall_ns = int(wall_clock_ns())
     deadline = start + config.duration_sec if config.duration_sec else None
     next_arrival = start
     submitted = 0
+    scheduled = 0
+    backpressure_rejected = 0
     completed = 0
     failed = 0
     pending: set[concurrent.futures.Future] = set()
@@ -172,9 +175,12 @@ def run_open_loop(
         start_wall_ns // intent_interval_ns
     ) * intent_interval_ns
     intent_counts = {name: 0 for name in EXPECTED_BEHAVIORS}
+    admitted_intent_counts = {name: 0 for name in EXPECTED_BEHAVIORS}
+    rejected_intent_counts = {name: 0 for name in EXPECTED_BEHAVIORS}
 
     def emit_completed_intent_buckets(target_epoch_ns: int) -> None:
         nonlocal intent_bucket_start_ns, intent_counts
+        nonlocal admitted_intent_counts, rejected_intent_counts
         while intent_bucket_start_ns + intent_interval_ns <= target_epoch_ns:
             if intent_sink is not None:
                 intent_sink({
@@ -185,9 +191,23 @@ def run_open_loop(
                     "load_profile_fingerprint": config.load_profile_fingerprint,
                     "scheduled_intents": sum(intent_counts.values()),
                     "behavior_intents": dict(intent_counts),
+                    "admitted_intents": sum(admitted_intent_counts.values()),
+                    "admitted_behavior_intents": dict(admitted_intent_counts),
+                    "backpressure_rejected_intents": sum(
+                        rejected_intent_counts.values()
+                    ),
+                    "backpressure_rejected_behavior_intents": dict(
+                        rejected_intent_counts
+                    ),
                 })
             intent_bucket_start_ns += intent_interval_ns
             intent_counts = {name: 0 for name in EXPECTED_BEHAVIORS}
+            admitted_intent_counts = {
+                name: 0 for name in EXPECTED_BEHAVIORS
+            }
+            rejected_intent_counts = {
+                name: 0 for name in EXPECTED_BEHAVIORS
+            }
 
     def invoke(index: int, behavior_name: str) -> None:
         nonlocal completed, failed
@@ -212,10 +232,6 @@ def run_open_loop(
                 sleeper(next_arrival - now)
             done = {future for future in pending if future.done()}
             pending.difference_update(done)
-            if len(pending) >= config.maximum_pending:
-                raise LoadBackpressureError(
-                    "open_loop_pending_limit_exceeded"
-                )
             behavior = _choose_behavior(config, scheduler_rng)
             target_epoch_ns = start_wall_ns + int(
                 round((next_arrival - start) * 1_000_000_000)
@@ -223,9 +239,15 @@ def run_open_loop(
             emit_completed_intent_buckets(target_epoch_ns)
             intent_counts[behavior] += 1
             if arrival_hook is not None:
-                arrival_hook(submitted, next_arrival, behavior)
-            pending.add(executor.submit(invoke, submitted, behavior))
-            submitted += 1
+                arrival_hook(scheduled, next_arrival, behavior)
+            if len(pending) >= config.maximum_pending:
+                rejected_intent_counts[behavior] += 1
+                backpressure_rejected += 1
+            else:
+                admitted_intent_counts[behavior] += 1
+                pending.add(executor.submit(invoke, scheduled, behavior))
+                submitted += 1
+            scheduled += 1
             next_arrival += scheduler_rng.expovariate(
                 config.target_arrival_rate_rps
             )
@@ -239,12 +261,17 @@ def run_open_loop(
     scheduling_elapsed = config.duration_sec if config.duration_sec else elapsed
     summary = {
         "event": "load_finished",
+        "scheduled_intents": scheduled,
         "submitted": submitted,
+        "backpressure_rejected_intents": backpressure_rejected,
         "completed": completed,
         "failed": failed,
         "duration_sec": elapsed,
         "achieved_arrival_rate_rps": (
             submitted / scheduling_elapsed if scheduling_elapsed else 0.0
+        ),
+        "achieved_intent_rate_rps": (
+            scheduled / scheduling_elapsed if scheduling_elapsed else 0.0
         ),
     }
     event_sink(json.dumps(summary, sort_keys=True))

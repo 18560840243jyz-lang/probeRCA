@@ -694,7 +694,7 @@ def test_open_loop_arrival_axis_does_not_depend_on_request_completion(monkeypatc
     assert first["failed"] == second["failed"] == 0
 
 
-def test_open_loop_pending_queue_fails_closed_instead_of_dropping_arrivals():
+def test_open_loop_pending_queue_records_rejected_intents_without_exiting(monkeypatch):
     load = _script_module("multinode_open_loop_load_backpressure", "multinode_open_loop_load.py")
 
     class Clock:
@@ -735,11 +735,27 @@ def test_open_loop_pending_queue_fails_closed_instead_of_dropping_arrivals():
         },
     )
     clock = Clock()
-    with pytest.raises(load.LoadBackpressureError, match="pending_limit"):
-        load.run_open_loop(
-            config, clock=clock, sleeper=clock.sleep,
-            executor_factory=Executor, event_sink=lambda _event: None,
-        )
+    records = []
+    monkeypatch.setattr(load.concurrent.futures, "as_completed", lambda _items: ())
+    summary = load.run_open_loop(
+        config, clock=clock, sleeper=clock.sleep,
+        executor_factory=Executor, event_sink=lambda _event: None,
+        wall_clock_ns=lambda: 100_000_000_000,
+        intent_sink=records.append, intent_interval_sec=1,
+    )
+    assert summary["scheduled_intents"] > summary["submitted"] == 1
+    assert summary["backpressure_rejected_intents"] > 0
+    assert summary["scheduled_intents"] == (
+        summary["submitted"] + summary["backpressure_rejected_intents"]
+    )
+    assert len(records) == 1
+    assert records[0]["scheduled_intents"] == summary["scheduled_intents"]
+    assert records[0]["admitted_intents"] == summary["submitted"]
+    assert records[0]["backpressure_rejected_intents"] == (
+        summary["backpressure_rejected_intents"]
+    )
+    assert records[0]["interval_start_ns"] == 100_000_000_000
+    assert records[0]["interval_end_ns"] == 101_000_000_000
 
 
 def test_open_loop_seals_five_second_behavior_intent_ledger(monkeypatch):
@@ -783,6 +799,8 @@ def test_open_loop_seals_five_second_behavior_intent_ledger(monkeypatch):
     ]
     assert all(set(item["behavior_intents"]) == set(load.EXPECTED_BEHAVIORS) for item in records)
     assert sum(item["scheduled_intents"] for item in records) == summary["submitted"]
+    assert all(item["backpressure_rejected_intents"] == 0 for item in records)
+    assert all(item["admitted_intents"] == item["scheduled_intents"] for item in records)
     assert all(item["load_profile_fingerprint"] == "a" * 64 for item in records)
 
 

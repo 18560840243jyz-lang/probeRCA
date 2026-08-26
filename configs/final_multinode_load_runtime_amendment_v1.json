@@ -1,0 +1,18 @@
+{
+  "amendment_id": "formal-load-runtime-backpressure-accounting-v1",
+  "effective_from_case": "V000014-attempt-2",
+  "reason": "A target-service memory fault exhausted the bounded request queue and the load process exited, creating a 25-second demand-intent ledger gap.",
+  "scope": "load-generator operational continuity only",
+  "semantics": {
+    "admitted_arrivals": "Arrivals submitted to the bounded request executor.",
+    "backpressure_rejected_arrivals": "Demand intentions not submitted because the bounded executor was full.",
+    "scheduled_arrivals": "All deterministic open-loop demand intentions, equal to admitted plus backpressure-rejected arrivals."
+  },
+  "invariants": [
+    "The target arrival schedule, behavior weights, load profile identity, request timeout, worker count, and maximum pending bound are unchanged.",
+    "Backpressure never fabricates a completed request or metric observation.",
+    "Backpressure accounting remains explicit in each immutable five-second intent record.",
+    "The load process and intent ledger remain continuous while a target service is unavailable.",
+    "The failed V000014 attempt-1 remains preserved and excluded from the accepted campaign datasets."
+  ]
+}

@@ -47,6 +47,12 @@ def _capture_load_intents(
         start = item.get("interval_start_ns")
         end = item.get("interval_end_ns")
         behaviors = item.get("behavior_intents")
+        admitted = item.get("admitted_intents")
+        admitted_behaviors = item.get("admitted_behavior_intents")
+        rejected = item.get("backpressure_rejected_intents")
+        rejected_behaviors = item.get(
+            "backpressure_rejected_behavior_intents"
+        )
         if (
             not isinstance(start, int) or not isinstance(end, int) or end <= start
             or not isinstance(behaviors, dict)
@@ -56,6 +62,37 @@ def _capture_load_intents(
             or not item.get("load_profile_fingerprint")
         ):
             raise DistributedCollectionError("load-intent ledger record is invalid")
+        optional_execution_fields = (
+            admitted, admitted_behaviors, rejected, rejected_behaviors,
+        )
+        if any(value is not None for value in optional_execution_fields):
+            if (
+                not isinstance(admitted, int) or admitted < 0
+                or not isinstance(rejected, int) or rejected < 0
+                or not isinstance(admitted_behaviors, dict)
+                or not isinstance(rejected_behaviors, dict)
+                or set(admitted_behaviors) != set(behaviors)
+                or set(rejected_behaviors) != set(behaviors)
+                or any(
+                    not isinstance(value, int) or value < 0
+                    for value in admitted_behaviors.values()
+                )
+                or any(
+                    not isinstance(value, int) or value < 0
+                    for value in rejected_behaviors.values()
+                )
+                or admitted != sum(admitted_behaviors.values())
+                or rejected != sum(rejected_behaviors.values())
+                or item["scheduled_intents"] != admitted + rejected
+                or any(
+                    behaviors[name]
+                    != admitted_behaviors[name] + rejected_behaviors[name]
+                    for name in behaviors
+                )
+            ):
+                raise DistributedCollectionError(
+                    "load-intent execution accounting is invalid"
+                )
         records.append(item)
     final_window_end_ns = first_window_start_ns + window_count * 1_000_000_000
     selected = sorted(
