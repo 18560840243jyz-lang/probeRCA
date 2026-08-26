@@ -129,7 +129,13 @@ does not use the final Healthy control-plane model, Soft/Hard, or RCA output.
 Generate public/private manifests only after the load and injector registries
 are frozen.  Stream the private manifest into CMS encryption.  Keep the private
 key off-cluster.  The public manifest and `CampaignState` fix the exact order;
-failed cases retry the same case ID with a new attempt and cannot skip ahead.
+failed attempts are never accepted. A case may move to the deferred tail only
+after an independent report proves exact cleanup, unchanged Pod/runtime
+identity and restart counts, and all business Pods Ready. Remaining cases keep
+their original relative order; deferred cases retry in their original order
+under the same case ID with a new attempt. Any unproved cleanup stops the
+campaign, and rented nodes cannot be released until every deferred case is
+completed and the real count is 135/135.
 
 For Test cases, the trusted off-cluster controller reads the private coordinate
 only to invoke `run_multinode_campaign_episode.py`.  It must place private

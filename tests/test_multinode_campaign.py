@@ -312,6 +312,31 @@ def test_campaign_state_resumes_same_order_and_retries_same_case(tmp_path):
         CampaignState(path, "a" * 64, ["A", "B"])
 
 
+def test_campaign_state_defers_cleaned_failure_until_other_cases_finish(tmp_path):
+    path = tmp_path / "state.json"
+    state = CampaignState(path, "a" * 64, ["A", "B", "C"])
+    assert state.start("A") == 1
+    state.fail("A", "engineering failure")
+    state.defer("A", "cleanup verified")
+    assert state.next_case_id() == "B"
+    assert state.start("B") == 1
+    state.finish("B", dataset_id="dataset-b", sha256="b" * 64)
+    assert state.start("C") == 1
+    state.finish("C", dataset_id="dataset-c", sha256="c" * 64)
+    assert state.next_case_id() == "A"
+    assert state.start("A") == 2
+    state.finish("A", dataset_id="dataset-a", sha256="d" * 64)
+    assert state.next_case_id() is None
+    resumed = CampaignState(path, "a" * 64, ["A", "B", "C"])
+    assert resumed.next_case_id() is None
+
+
+def test_campaign_state_only_defers_failed_cases(tmp_path):
+    state = CampaignState(tmp_path / "state.json", "a" * 64, ["A"])
+    with pytest.raises(CampaignStateError, match="only a failed case"):
+        state.defer("A", "not failed")
+
+
 def test_campaign_collection_gates_do_not_include_soft_hard_ready_or_rca():
     config = load_campaign_config(CONFIG)
     qualification = config["load_qualification"]

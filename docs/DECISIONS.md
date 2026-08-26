@@ -513,8 +513,15 @@ scored.
 Phase labels use actual lifecycle timestamps, not the plan alone. Windows fully
 inside effect-confirmed through cleanup-start are `FAULT_ACTIVE`; application and
 cleanup boundary windows are transitions and are excluded from primary accuracy.
-Campaign resume is bound to the public manifest fingerprint and immutable order;
-a failed case may retry only under the same case ID with a new attempt number.
+Campaign resume is bound to the public manifest fingerprint and immutable
+original order. A failed attempt is never accepted or counted complete. When an
+independent safety report proves exact injector cleanup, unchanged Pod UIDs and
+container restart counts, and all business Pods Ready, the controller may mark
+that attempt `DEFERRED`, continue the remaining original-order cases, and retry
+all deferred cases in original order at the tail under the same case ID and a
+new attempt number. If restoration cannot be proved, collection stops. Deferred
+cases remain mandatory for the final real `135/135`; three failures of the same
+case still stop the campaign for operator review.
 
 The four-node implementation uses Worker-local primitive exporter, Beyla,
 eBPF/Burst, and node exporter processes. S0 Prometheus scrapes all three Workers;

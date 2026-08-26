@@ -63,7 +63,9 @@ class CampaignState:
         })
         if self._value.get("state_fingerprint") != expected_fingerprint:
             raise CampaignStateError("campaign state fingerprint mismatch")
-        valid_statuses = {"pending", "running", "failed", "complete"}
+        valid_statuses = {
+            "pending", "running", "failed", "deferred", "complete",
+        }
         if any(
             not isinstance(record, dict)
             or record.get("status") not in valid_statuses
@@ -82,14 +84,26 @@ class CampaignState:
         _atomic_json(self.path, value)
 
     def next_case_id(self) -> str | None:
+        # Preserve the frozen order among cases that have not failed. A
+        # safely-cleaned engineering failure may be deferred so that one
+        # coordinate cannot idle an expensive one-time campaign. Deferred
+        # cases are revisited, in their original order, only after every
+        # remaining non-deferred case has been attempted.
         for case_id in self.case_ids:
-            if self._value["cases"][case_id]["status"] != "complete":
+            if self._value["cases"][case_id]["status"] not in {
+                "complete", "deferred",
+            }:
+                return case_id
+        for case_id in self.case_ids:
+            if self._value["cases"][case_id]["status"] == "deferred":
                 return case_id
         return None
 
     def start(self, case_id: str) -> int:
         if case_id != self.next_case_id():
-            raise CampaignStateError("campaign cases must execute in frozen order")
+            raise CampaignStateError(
+                "campaign cases must execute in deterministic campaign order"
+            )
         record = self._value["cases"][case_id]
         if record["status"] == "running":
             raise CampaignStateError("case is already running")
@@ -114,4 +128,16 @@ class CampaignState:
         if not record or record["status"] != "running":
             raise CampaignStateError("only the running case can fail")
         record.update({"status": "failed", "reason": str(reason)})
+        self._write()
+
+    def defer(self, case_id: str, reason: str) -> None:
+        record = self._value["cases"].get(case_id)
+        if not record or record["status"] != "failed":
+            raise CampaignStateError("only a failed case can be deferred")
+        record.update({
+            "status": "deferred",
+            "last_failed_attempt": int(record["attempts"]),
+            "last_failure_reason": str(reason),
+        })
+        record.pop("reason", None)
         self._write()

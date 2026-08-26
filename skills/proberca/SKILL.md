@@ -2477,8 +2477,13 @@ TCP边独立告警
 - 在线campaign只因Normal/Burst错位、窗口/时间戳损坏、Pod重启、意外拓扑/运行身份变化、
   注入无直接证据、非目标污染、清理失败、SHA失败、存储不足或采集服务退出而作废重采。
   当前Soft/Hard/READY、A_s/A_v状态、FISTA排名和RCA正确性不是采集停止条件。
-- Campaign状态绑定不可变manifest fingerprint和顺序。失败只允许同一case ID增加attempt
-  后重采，不允许跳到后续case、重新随机或覆盖已封存Dataset ID/SHA。
+- Campaign状态绑定不可变manifest fingerprint和原始case顺序。失败attempt不得标记完成，
+  不得覆盖已封存Dataset ID/SHA，也不得改变case ID、标签或随机划分。为了避免一个工程
+  故障长期占用一次性租用集群，只有在故障注入精确清理、Pod UID与container restart计数
+  未变化、全部业务Pod恢复Ready均有独立证据时，才允许将该attempt标记为`DEFERRED`并继续
+  原始顺序中其余未完成case；清理或运行身份无法证明时仍必须停止。所有`DEFERRED` case在
+  其余case完成后按原始顺序、使用同一case ID和递增attempt补采。延期不计入完成数，释放
+  服务器前仍必须达到真实`135/135`；同一case累计3次失败仍停止并详细报告。
 - TCP failure正式注入保持持续、有向、端口级TCP RST。gRPC初始失败后进入退避造成的
   `no_exposure`必须保持`value=null/valid=false`，不得改写为failure或0。其Pilot按episode
   判定：固定2秒在途排空后的15秒内至少3次尝试且分布在3个failure正值窗、累计失败比例

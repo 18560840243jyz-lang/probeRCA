@@ -19,7 +19,12 @@ class SealedCaseResult:
 
 
 class CampaignExecutor:
-    """Execute exactly one frozen case at a time and retry in place on failure."""
+    """Execute one deterministic campaign case at a time.
+
+    The generic executor fails closed. An operational controller may explicitly
+    defer a failed attempt only after separately proving cleanup and runtime
+    restoration, using :meth:`CampaignState.defer`.
+    """
 
     def __init__(
         self, public_manifest: dict[str, Any], state: CampaignState,
