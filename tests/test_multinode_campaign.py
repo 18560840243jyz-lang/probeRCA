@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -1394,6 +1395,23 @@ def test_service_cpu_actor_receives_frozen_bounded_duty_cycle(monkeypatch, tmp_p
     }, {})
     assert commands[0][commands[0].index("--workers") + 1] == "1"
     assert commands[0][commands[0].index("--duty-cycle") + 1] == "0.3"
+
+
+def test_multinode_futex_actor_completes_waits_throughout_active_phase():
+    actor = _script_module(
+        "multinode_fault_actor_futex_test", "multinode_fault_actor.py",
+    )
+    actor.STOP.clear()
+    started = time.monotonic()
+    completed = actor._futex(4, started + 0.8)
+    elapsed = time.monotonic() - started
+
+    # A one-shot continuously held lock would complete only four waits at
+    # cleanup.  Periodic wake/reblock must produce multiple completed cycles
+    # per waiter during FAULT_ACTIVE without extending the bounded deadline.
+    assert completed >= 8
+    assert elapsed < 1.5
+    assert not actor.STOP.is_set()
 
 
 def test_service_cpu_mechanism_records_but_never_mutates_cpu_max(monkeypatch, tmp_path):

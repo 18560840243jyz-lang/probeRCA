@@ -96,27 +96,60 @@ def _io(
                     STOP.wait(remaining)
 
 
-def _futex(threads: int, deadline: float) -> None:
-    lock = threading.Lock()
-    lock.acquire()
-    started = [threading.Event() for _ in range(threads)]
+def _futex(threads: int, deadline: float) -> int:
+    """Maintain observable futex contention without busy spinning.
 
-    def wait(index: int) -> None:
-        started[index].set()
-        lock.acquire()
-        lock.release()
+    A single lock held for the whole fault interval only completes its futex
+    waits during cleanup.  The normal BPF counter is cumulative over completed
+    waits, so that shape incorrectly makes the intervention look inactive for
+    almost the entire FAULT_ACTIVE phase.  Condition waiters are therefore
+    woken together at a bounded cadence and immediately re-enter their wait.
+    At least one real futex wait cycle completes throughout the active phase,
+    while the actor remains sleeping rather than consuming a CPU core.
+    """
+    condition = threading.Condition()
+    ready = 0
+    completed_waits = 0
 
-    workers = [threading.Thread(target=wait, args=(index,)) for index in range(threads)]
+    def wait() -> None:
+        nonlocal ready, completed_waits
+        with condition:
+            ready += 1
+            condition.notify_all()
+            while not STOP.is_set() and time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                condition.wait(timeout=min(0.5, remaining))
+                completed_waits += 1
+
+    workers = [threading.Thread(target=wait) for _ in range(threads)]
     for worker in workers:
         worker.start()
-    for event in started:
-        if not event.wait(2):
-            raise RuntimeError("futex actor waiter did not start")
+    startup_deadline = time.monotonic() + 2.0
+    with condition:
+        while ready < threads:
+            remaining = startup_deadline - time.monotonic()
+            if remaining <= 0:
+                STOP.set()
+                condition.notify_all()
+                break
+            condition.wait(timeout=remaining)
+    if ready < threads:
+        for worker in workers:
+            worker.join(timeout=2)
+        raise RuntimeError("futex actor waiter did not start")
     while not STOP.is_set() and time.monotonic() < deadline:
-        STOP.wait(0.25)
-    lock.release()
+        STOP.wait(min(0.25, max(0.0, deadline - time.monotonic())))
+        with condition:
+            condition.notify_all()
+    with condition:
+        condition.notify_all()
     for worker in workers:
         worker.join(timeout=2)
+        if worker.is_alive():
+            raise RuntimeError("futex actor waiter did not stop")
+    return completed_waits
 
 
 def _local_socket(threads: int, deadline: float) -> None:
