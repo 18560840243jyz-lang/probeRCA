@@ -2013,6 +2013,62 @@ def test_terminal_tcp_failure_accepts_grpc_backoff_and_requires_demand_ledger(
     assert "terminal_target_demand_not_evaluable" in without_demand["criterion_failures"]
 
 
+def test_terminal_tcp_failure_accepts_direct_rst_availability_collapse():
+    from proberca.campaign.effectiveness import _evaluate_terminal_tcp_failure
+
+    profile = next(item for item in load_injector_registry(
+        REPOSITORY / "configs/final_multinode_injector_candidates.yaml",
+        require_frozen=False,
+    )["profiles"] if item["mechanism"] == "tcp_failure")
+    policy = profile["terminal_failure_policy"]
+
+    def row(sequence, request_count, valid, value, reason=None):
+        start = (sequence - 1) * 1_000_000_000
+        return {
+            "sequence": sequence, "window_start_ns": start,
+            "window_end_ns": start + 1_000_000_000,
+            "request_count": request_count, "valid": valid,
+            "value": value, "invalid_reason": reason,
+        }
+
+    rows = {
+        "HEALTHY_PRE": [row(i, 10.0, True, 0.0) for i in range(1, 61)],
+        "FAULT_ACTIVE": [
+            row(i, 0.0, False, None, "no_exposure")
+            if i < 92 else row(i, None, False, None, "zero_coverage")
+            for i in range(61, 121)
+        ],
+        "RECOVERY": [row(i, 5.0, True, 0.0) for i in range(121, 181)],
+    }
+    lifecycle = SimpleNamespace(
+        effect_confirmed_ns=60_000_000_000,
+        cleanup_command_start_ns=120_000_000_000,
+    )
+    load_records = [
+        {
+            "interval_start_ns": start,
+            "interval_end_ns": start + 5_000_000_000,
+            "behavior_intents": {"detail_recommendation_ad_currency": 10},
+        }
+        for start in range(80_000_000_000, 120_000_000_000, 5_000_000_000)
+    ]
+    result = _evaluate_terminal_tcp_failure(
+        policy=policy,
+        coordinate={"entity_id": "recommendationservice->productcatalogservice"},
+        rows=rows, lifecycle=lifecycle,
+        counters_before={"edge_error": 0.0, "edge_timeout": 0.0},
+        counters_after={"edge_error": 0.0, "edge_timeout": 0.0},
+        filter_hit=True, filter_packets=11,
+        load_intent_manifest={"dataset_id": "test"},
+        load_intent_records=load_records,
+    )
+    assert result["passed"] is True
+    assert result["confirmation_mode"] == "rst_demand_availability_collapse"
+    assert result["initial_longest_consecutive_no_exposure_windows"] >= 3
+    assert result["healthy_pre_exposure_windows"] == 60
+    assert result["recovery_consecutive_exposure_windows"] == 60
+
+
 def test_label_side_target_resolver_binds_formal_edge_without_hardcoding():
     config = load_campaign_config(CONFIG)
     inventory = {

@@ -167,7 +167,8 @@ def _evaluate_terminal_tcp_failure(
     *, policy: dict[str, Any], coordinate: dict[str, Any],
     rows: dict[str, list[dict[str, Any]]], lifecycle: FaultLifecycle,
     counters_before: dict[str, float], counters_after: dict[str, float],
-    filter_hit: bool, load_intent_manifest: dict[str, Any] | None,
+    filter_hit: bool, filter_packets: int,
+    load_intent_manifest: dict[str, Any] | None,
     load_intent_records: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Evaluate terminal connection failure without rewriting no-exposure data."""
@@ -200,6 +201,10 @@ def _evaluate_terminal_tcp_failure(
         if item["valid"] and item["value"] > 0
     ]
     failure_ratio = estimated_failures / attempts if attempts > 0 else 0.0
+    initial_no_exposure_sequences = [
+        int(item["sequence"]) for item in initial
+        if not item["valid"] and item["invalid_reason"] == "no_exposure"
+    ]
     direct_failure_delta = (
         float(counters_after.get("edge_error", 0.0))
         - float(counters_before.get("edge_error", 0.0))
@@ -241,24 +246,50 @@ def _evaluate_terminal_tcp_failure(
     )
     unexpected_invalid = [
         item for item in rows["FAULT_ACTIVE"]
-        if not item["valid"] and item["invalid_reason"] != "no_exposure"
+        if not item["valid"]
+        and item["invalid_reason"] not in {"no_exposure", "zero_coverage"}
     ]
+    healthy_pre_exposure_windows = sum(
+        item["request_count"] is not None and item["request_count"] > 0
+        for item in rows["HEALTHY_PRE"]
+    )
     pre_values = [item["value"] for item in rows["HEALTHY_PRE"] if item["valid"]]
     healthy_failure_upper = max(pre_values) if pre_values else 0.0
     recovery_run = _longest_recovery_run(
         rows["RECOVERY"], healthy_failure_upper=healthy_failure_upper,
     )
+    counter_confirmation = (
+        direct_failure_delta >= float(policy["direct_failure_delta_min"])
+        and attempts >= int(policy["initial_attempts_min"])
+        and len(positive_sequences) >= int(policy["initial_positive_windows_min"])
+        and failure_ratio >= float(policy["initial_failure_ratio_min"])
+    )
+    availability_confirmation = (
+        filter_hit
+        and filter_packets >= int(policy["direct_failure_delta_min"])
+        and healthy_pre_exposure_windows >= int(policy["initial_attempts_min"])
+        and _longest_consecutive(initial_no_exposure_sequences)
+        >= int(policy["initial_positive_windows_min"])
+        and not unexpected_invalid
+    )
     failures = []
     if not filter_hit:
         failures.append("terminal_rst_filter_not_hit")
-    if direct_failure_delta < float(policy["direct_failure_delta_min"]):
-        failures.append("terminal_direct_failure_counter_insufficient")
-    if attempts < int(policy["initial_attempts_min"]):
-        failures.append("terminal_initial_attempts_insufficient")
-    if len(positive_sequences) < int(policy["initial_positive_windows_min"]):
-        failures.append("terminal_initial_positive_windows_insufficient")
-    if failure_ratio < float(policy["initial_failure_ratio_min"]):
-        failures.append("terminal_initial_failure_ratio_insufficient")
+    if not counter_confirmation and not availability_confirmation:
+        if direct_failure_delta < float(policy["direct_failure_delta_min"]):
+            failures.append("terminal_direct_failure_counter_insufficient")
+        if attempts < int(policy["initial_attempts_min"]):
+            failures.append("terminal_initial_attempts_insufficient")
+        if len(positive_sequences) < int(policy["initial_positive_windows_min"]):
+            failures.append("terminal_initial_positive_windows_insufficient")
+        if failure_ratio < float(policy["initial_failure_ratio_min"]):
+            failures.append("terminal_initial_failure_ratio_insufficient")
+        if filter_packets < int(policy["direct_failure_delta_min"]):
+            failures.append("terminal_rst_packet_evidence_insufficient")
+        if _longest_consecutive(initial_no_exposure_sequences) < int(
+            policy["initial_positive_windows_min"]
+        ):
+            failures.append("terminal_initial_availability_collapse_insufficient")
     if unexpected_invalid:
         failures.append("terminal_unexpected_invalid_observation")
     if recovery_run < int(policy["recovery_consecutive_exposure_windows"]):
@@ -280,6 +311,19 @@ def _evaluate_terminal_tcp_failure(
         ),
         "direct_failure_counter_delta": direct_failure_delta,
         "rst_filter_hit": filter_hit,
+        "rst_filter_packets": filter_packets,
+        "healthy_pre_exposure_windows": healthy_pre_exposure_windows,
+        "initial_no_exposure_windows": len(initial_no_exposure_sequences),
+        "initial_longest_consecutive_no_exposure_windows": _longest_consecutive(
+            initial_no_exposure_sequences
+        ),
+        "confirmation_mode": (
+            "failure_counter"
+            if counter_confirmation
+            else "rst_demand_availability_collapse"
+            if availability_confirmation
+            else None
+        ),
         "backoff_no_exposure_windows": sum(
             not item["valid"] and item["invalid_reason"] == "no_exposure"
             for item in rows["FAULT_ACTIVE"]
@@ -582,11 +626,18 @@ def evaluate_fault_effectiveness(
             policy=terminal_policy, coordinate=coordinate,
             rows=terminal_rows, lifecycle=lifecycle,
             counters_before=counters_before, counters_after=counters_after,
-            filter_hit=filter_hit, load_intent_manifest=load_manifest,
+            filter_hit=filter_hit,
+            filter_packets=int(mutation_evidence.get("packets", 0)),
+            load_intent_manifest=load_manifest,
             load_intent_records=load_records,
         )
-        passed = passed and terminal_failure["passed"]
-        failures = list(failures) + list(terminal_failure["failures"])
+        # Terminal TCP failure has a dedicated protocol-aware contract.  A
+        # connection reset may collapse a long-lived gRPC channel directly
+        # into backoff without producing a completed error counter.  In that
+        # case the terminal contract, not the generic per-window lift test,
+        # is authoritative.
+        passed = terminal_failure["passed"]
+        failures = list(terminal_failure["failures"])
     required_contamination = profile.get("contamination_checks", [])
     missing = sorted(set(required_contamination) - set(effective_contamination))
     contaminated = sorted(
