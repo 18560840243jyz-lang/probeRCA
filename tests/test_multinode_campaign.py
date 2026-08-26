@@ -1710,6 +1710,171 @@ def test_tcp_injector_evidence_uses_dedicated_netem_qdisc_packets(
     assert any("qdisc show" in " ".join(item) for item in commands)
 
 
+def _mq_fq_codel_qdiscs() -> list[dict]:
+    options = {
+        "limit": 10240, "flows": 1024, "quantum": 1514,
+        "target": 4999, "interval": 99999,
+        "memory_limit": 33554432, "ecn": True, "drop_batch": 64,
+    }
+    return [
+        {"kind": "mq", "handle": "0:", "root": True, "options": {}},
+        *[
+            {
+                "kind": "fq_codel", "handle": "0:",
+                "parent": f":{index}", "options": dict(options),
+            }
+            for index in range(8, 0, -1)
+        ],
+    ]
+
+
+def test_host_nic_injector_replaces_every_mq_leaf_without_deleting_root(
+    monkeypatch, tmp_path,
+):
+    from proberca.campaign.worker_agent import LinuxWorkerBackend
+
+    backend = LinuxWorkerBackend(
+        node_id="worker-1", state_root=tmp_path / "state",
+        work_root=tmp_path / "work",
+    )
+    commands = []
+    monkeypatch.setattr(
+        backend, "_run",
+        lambda arguments, **_kwargs: commands.append(tuple(arguments)) or "",
+    )
+    journal = {
+        "baseline_state": {
+            "traffic_control": {
+                "qdisc": _mq_fq_codel_qdiscs(),
+                "filters": {"ingress": [], "egress": []},
+            },
+        },
+    }
+    backend._apply_tc("host_nic", {
+        "session_id": "3" * 64,
+        "target": {"attributes": {"interface": "eth0"}},
+        "intensity": {"drop_percent": 5},
+    }, journal)
+    rendered = [" ".join(item) for item in commands]
+    assert journal["tc_mode"] == "mq_leaf_netem"
+    assert len(journal["tc_mq_leaf_baseline"]) == 8
+    assert len(rendered) == 8
+    assert all("qdisc replace dev eth0 parent" in item for item in rendered)
+    assert all("netem loss 5%" in item for item in rendered)
+    assert all("qdisc del dev eth0 root" not in item for item in rendered)
+    assert {item.split(" parent ", 1)[1].split()[0] for item in rendered} == {
+        f":{index}" for index in range(1, 9)
+    }
+
+
+def test_host_nic_mq_cleanup_restores_every_fq_codel_leaf_exactly(
+    monkeypatch, tmp_path,
+):
+    from proberca.campaign.worker_agent import LinuxWorkerBackend
+
+    backend = LinuxWorkerBackend(
+        node_id="worker-1", state_root=tmp_path / "state",
+        work_root=tmp_path / "work",
+    )
+    baseline = {
+        "runtime_identity": "r" * 64,
+        "traffic_control": {
+            "qdisc": _mq_fq_codel_qdiscs(),
+            "filters": {"ingress": [], "egress": []},
+        },
+    }
+    session_id = "4" * 64
+    target = {
+        "attributes": {
+            "interface": "eth0", "cgroup_path": "/sys/fs/cgroup/example",
+        },
+    }
+    journal = {
+        "schema_version": "probeRCA-worker-mutation-journal-v1",
+        "session_id": session_id, "mechanism": "host_nic",
+        "target": target, "baseline_state": baseline, "status": "active",
+        "tc_interface": "eth0", "tc_mode": "mq_leaf_netem",
+        "tc_preference": 40001, "tc_prefix": [],
+        "tc_mq_leaf_baseline": _mq_fq_codel_qdiscs()[1:],
+    }
+    path = backend._journal_path(session_id)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(journal), encoding="utf-8")
+    commands = []
+
+    def run(arguments, **_kwargs):
+        commands.append(tuple(arguments))
+        if "-s" in arguments:
+            return json.dumps([
+                {"kind": "mq", "handle": "0:", "root": True},
+                *[
+                    {
+                        "kind": "netem", "parent": f":{index}",
+                        "packets": 100, "drops": 5, "overlimits": 0,
+                    }
+                    for index in range(1, 9)
+                ],
+            ])
+        return ""
+
+    monkeypatch.setattr(backend, "_run", run)
+    monkeypatch.setattr(backend, "_cgroup_path", lambda _target: tmp_path)
+    monkeypatch.setattr(backend, "_state", lambda *_args: baseline)
+    result = backend.cleanup({"session_id": session_id, "target": target})
+    rendered = [" ".join(item) for item in commands]
+    restore = [item for item in rendered if " qdisc replace " in f" {item} "]
+    assert result["cleaned"] is True
+    assert result["traffic_control_evidence"]["drops"] == 40
+    assert len(restore) == 8
+    assert all("fq_codel limit 10240 flows 1024 quantum 1514" in item for item in restore)
+    assert all("target 4999us interval 99999us" in item for item in restore)
+    assert all("qdisc del dev eth0 root" not in item for item in rendered)
+
+
+def test_host_nic_rejects_unrestorable_mq_leaf_options(monkeypatch, tmp_path):
+    from proberca.campaign.worker_agent import LinuxWorkerBackend
+
+    backend = LinuxWorkerBackend(
+        node_id="worker-1", state_root=tmp_path / "state",
+        work_root=tmp_path / "work",
+    )
+    qdiscs = _mq_fq_codel_qdiscs()
+    qdiscs[1]["options"]["unknown_option"] = 1
+    with pytest.raises(WorkerAgentError, match="exactly restorable"):
+        backend._apply_tc("host_nic", {
+            "session_id": "5" * 64,
+            "target": {"attributes": {"interface": "eth0"}},
+            "intensity": {"drop_percent": 5},
+        }, {
+            "baseline_state": {
+                "traffic_control": {
+                    "qdisc": qdiscs,
+                    "filters": {"ingress": [], "egress": []},
+                },
+            },
+        })
+
+
+def test_remote_agent_reports_structured_worker_failure_from_stdout(tmp_path):
+    key = tmp_path / "key"
+    known_hosts = tmp_path / "known_hosts"
+    key.write_text("key", encoding="utf-8")
+    known_hosts.write_text("host key", encoding="utf-8")
+
+    def runner(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[], returncode=1,
+            stdout=b'{"ok":false,"error":"mq qdisc is unsupported"}',
+            stderr=b"",
+        )
+
+    client = SSHAgentClient([
+        RemoteNode("worker-1", "host", "ubuntu", 22, key),
+    ], known_hosts_file=known_hosts, runner=runner)
+    with pytest.raises(RemoteAgentError, match="mq qdisc is unsupported"):
+        client.invoke("worker-1", "snapshot", {})
+
+
 def test_tcp_failure_profile_uses_terminal_rst_not_random_loss():
     registry = load_injector_registry(
         REPOSITORY / "configs/final_multinode_injector_candidates.yaml",

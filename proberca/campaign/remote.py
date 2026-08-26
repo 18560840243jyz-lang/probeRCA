@@ -99,6 +99,12 @@ class SSHAgentClient:
             raise RemoteAgentError("worker agent operation timed out") from error
         if completed.returncode != 0:
             message = completed.stderr.decode("utf-8", errors="replace").strip()
+            if not message:
+                try:
+                    failed_response = json.loads(completed.stdout.decode("utf-8"))
+                    message = str(failed_response.get("error", "")).strip()
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    pass
             raise RemoteAgentError(f"worker agent failed closed: {message}")
         try:
             response = json.loads(completed.stdout.decode("utf-8"))
