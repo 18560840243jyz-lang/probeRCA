@@ -218,21 +218,6 @@ class LinuxWorkerBackend:
                 item for item in qdisc_payload
                 if item.get("handle") == "30:"
             ]
-        elif journal["tc_mode"] == "mq_leaf_netem":
-            raw = self._run(prefix + [
-                "tc", "-s", "-j", "qdisc", "show",
-                "dev", journal["tc_interface"],
-            ], tolerate_missing=True)
-            filter_payload = None
-            qdisc_payload = json.loads(raw or "[]")
-            parents = {
-                item["parent"] for item in journal["tc_mq_leaf_baseline"]
-            }
-            payload = [
-                item for item in qdisc_payload
-                if item.get("kind") == "netem"
-                and item.get("parent") in parents
-            ]
         else:
             raw = self._run(prefix + [
                 "tc", "-s", "-j", "qdisc", "show",
@@ -586,9 +571,11 @@ class LinuxWorkerBackend:
         mq_mode = (
             mechanism == "host_nic"
             and len(roots) == 1 and roots[0].get("kind") == "mq"
+            and roots[0].get("handle") == "0:"
             and len(mq_leaves) >= 1
             and len(qdiscs) == len(mq_leaves) + 1
             and len({item.get("parent") for item in mq_leaves}) == len(mq_leaves)
+            and all(item.get("handle") == "0:" for item in mq_leaves)
         )
         if any(before["filters"].values()) or not (noqueue_mode or mq_mode):
             raise WorkerAgentError(
@@ -599,7 +586,7 @@ class LinuxWorkerBackend:
                 self._fq_codel_restore_arguments(item)
         preference = 40000 + int(payload["session_id"][:4], 16) % 20000
         if mq_mode:
-            tc_mode = "mq_leaf_netem"
+            tc_mode = "mq_root_netem"
         else:
             tc_mode = "root_prio_netem" if mechanism == "tcp_latency" \
                 else "root_netem"
@@ -610,18 +597,18 @@ class LinuxWorkerBackend:
             "tc_preference": preference, "tc_prefix": prefix,
         })
         if mq_mode:
-            journal["tc_mq_leaf_baseline"] = mq_leaves
             percent = float(payload["intensity"]["drop_percent"])
-            ordered = sorted(
-                mq_leaves, key=lambda item: int(str(item["parent"])[1:]),
-            )
-            for index, item in enumerate(ordered, start=1):
-                handle = f"{0x3000 + index:x}:"
-                self._run(prefix + [
-                    "tc", "qdisc", "replace", "dev", interface,
-                    "parent", str(item["parent"]), "handle", handle,
-                    "netem", "loss", f"{percent:g}%",
-                ])
+            # Kernel-created mq leaves use anonymous handles and cannot be
+            # addressed safely by ``tc qdisc replace parent ...``. Replace
+            # the mq root for the bounded fault interval instead. Cleanup
+            # deletes this explicit root, which makes the kernel recreate its
+            # default ``mq handle 0:`` plus fq_codel leaves; the exact-state
+            # comparison below still fails closed if that reconstruction ever
+            # differs from the captured baseline.
+            self._run(prefix + [
+                "tc", "qdisc", "replace", "dev", interface, "root",
+                "handle", "30:", "netem", "loss", f"{percent:g}%",
+            ])
             return
         if mechanism == "tcp_latency":
             self._run(prefix + [
@@ -803,18 +790,10 @@ class LinuxWorkerBackend:
                 and "tc_preference" in journal:
             traffic_control_evidence = self._tc_filter_evidence(journal)
             prefix = list(journal["tc_prefix"])
-            if journal["tc_mode"] == "mq_leaf_netem":
-                for item in journal["tc_mq_leaf_baseline"]:
-                    self._run(prefix + [
-                        "tc", "qdisc", "replace", "dev",
-                        journal["tc_interface"],
-                        *self._fq_codel_restore_arguments(item),
-                    ])
-            else:
-                self._run(prefix + [
-                    "tc", "qdisc", "del", "dev",
-                    journal["tc_interface"], "root",
-                ], tolerate_missing=True)
+            self._run(prefix + [
+                "tc", "qdisc", "del", "dev",
+                journal["tc_interface"], "root",
+            ], tolerate_missing=True)
         if mechanism == "tcp_failure" \
                 and "packet_filter_chain" in journal:
             packet_filter_evidence = self._packet_filter_evidence(journal)

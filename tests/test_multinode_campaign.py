@@ -1728,7 +1728,7 @@ def _mq_fq_codel_qdiscs() -> list[dict]:
     ]
 
 
-def test_host_nic_injector_replaces_every_mq_leaf_without_deleting_root(
+def test_host_nic_injector_replaces_kernel_mq_root_for_fault_interval(
     monkeypatch, tmp_path,
 ):
     from proberca.campaign.worker_agent import LinuxWorkerBackend
@@ -1756,18 +1756,13 @@ def test_host_nic_injector_replaces_every_mq_leaf_without_deleting_root(
         "intensity": {"drop_percent": 5},
     }, journal)
     rendered = [" ".join(item) for item in commands]
-    assert journal["tc_mode"] == "mq_leaf_netem"
-    assert len(journal["tc_mq_leaf_baseline"]) == 8
-    assert len(rendered) == 8
-    assert all("qdisc replace dev eth0 parent" in item for item in rendered)
-    assert all("netem loss 5%" in item for item in rendered)
-    assert all("qdisc del dev eth0 root" not in item for item in rendered)
-    assert {item.split(" parent ", 1)[1].split()[0] for item in rendered} == {
-        f":{index}" for index in range(1, 9)
-    }
+    assert journal["tc_mode"] == "mq_root_netem"
+    assert rendered == [
+        "tc qdisc replace dev eth0 root handle 30: netem loss 5%",
+    ]
 
 
-def test_host_nic_mq_cleanup_restores_every_fq_codel_leaf_exactly(
+def test_host_nic_mq_cleanup_reinstates_kernel_default_topology_exactly(
     monkeypatch, tmp_path,
 ):
     from proberca.campaign.worker_agent import LinuxWorkerBackend
@@ -1793,9 +1788,8 @@ def test_host_nic_mq_cleanup_restores_every_fq_codel_leaf_exactly(
         "schema_version": "probeRCA-worker-mutation-journal-v1",
         "session_id": session_id, "mechanism": "host_nic",
         "target": target, "baseline_state": baseline, "status": "active",
-        "tc_interface": "eth0", "tc_mode": "mq_leaf_netem",
+        "tc_interface": "eth0", "tc_mode": "mq_root_netem",
         "tc_preference": 40001, "tc_prefix": [],
-        "tc_mq_leaf_baseline": _mq_fq_codel_qdiscs()[1:],
     }
     path = backend._journal_path(session_id)
     path.parent.mkdir(parents=True)
@@ -1806,14 +1800,10 @@ def test_host_nic_mq_cleanup_restores_every_fq_codel_leaf_exactly(
         commands.append(tuple(arguments))
         if "-s" in arguments:
             return json.dumps([
-                {"kind": "mq", "handle": "0:", "root": True},
-                *[
-                    {
-                        "kind": "netem", "parent": f":{index}",
-                        "packets": 100, "drops": 5, "overlimits": 0,
-                    }
-                    for index in range(1, 9)
-                ],
+                {
+                    "kind": "netem", "handle": "30:", "root": True,
+                    "packets": 800, "drops": 40, "overlimits": 0,
+                },
             ])
         return ""
 
@@ -1822,13 +1812,9 @@ def test_host_nic_mq_cleanup_restores_every_fq_codel_leaf_exactly(
     monkeypatch.setattr(backend, "_state", lambda *_args: baseline)
     result = backend.cleanup({"session_id": session_id, "target": target})
     rendered = [" ".join(item) for item in commands]
-    restore = [item for item in rendered if " qdisc replace " in f" {item} "]
     assert result["cleaned"] is True
     assert result["traffic_control_evidence"]["drops"] == 40
-    assert len(restore) == 8
-    assert all("fq_codel limit 10240 flows 1024 quantum 1514" in item for item in restore)
-    assert all("target 4999us interval 99999us" in item for item in restore)
-    assert all("qdisc del dev eth0 root" not in item for item in rendered)
+    assert "tc qdisc del dev eth0 root" in rendered
 
 
 def test_host_nic_rejects_unrestorable_mq_leaf_options(monkeypatch, tmp_path):
